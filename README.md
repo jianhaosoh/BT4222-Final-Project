@@ -15,3 +15,8 @@ This project uses the **EB-NeRD LARGE** dataset from Ekstra Bladet, a Danish new
 Each shown article is a candidate: clicked articles receive a positive label, while shown but unclicked articles receive a negative label. 
 
 Dataset source: [EB-NeRD dataset and documentation](https://recsys.eb.dk/dataset/).
+
+## Feature engineering
+
+See [Feature Engineering/README.md](Feature%20Engineering/README.md) for the
+candidate feature schema and model input choices. The linked notebook shows how to run the pipeline.
