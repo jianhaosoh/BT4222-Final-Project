@@ -20,3 +20,7 @@ Dataset source: [EB-NeRD dataset and documentation](https://recsys.eb.dk/dataset
 
 See [Feature Engineering/README.md](Feature%20Engineering/README.md) for the
 candidate feature schema and model input choices. The linked notebook shows how to run the pipeline.
+
+## Local data location
+
+Raw dataset files are stored in `data/articles.parquet`, `data/train/`, and `data/validation/`. The `data/` folder is excluded from Git. The baseline notebook and training script automatically detect this location.
