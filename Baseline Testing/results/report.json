@@ -1,0 +1,106 @@
+{
+  "config": {
+    "root": "/Users/maximus/Downloads/SCHOOL/bt4222/project",
+    "output": "baseline/results",
+    "train_impressions": 50000,
+    "validation_impressions": 10000,
+    "seed": 42
+  },
+  "sampling": {
+    "train_population_impressions": 12063890,
+    "validation_population_impressions": 12566385,
+    "method": "Uniform random-priority impression sampling; no candidate sampling",
+    "recorded_run_used_saved_samples": true
+  },
+  "splits": {
+    "train": {
+      "impressions": 50000,
+      "candidate_pairs": 554696,
+      "time_min": "2023-05-18 07:00:02",
+      "time_max": "2023-05-25 06:59:59",
+      "click_rate_in_sampled_slates": 0.09048379652999121,
+      "history_cutoff_exclusive": "2023-05-18 07:00:02",
+      "history_events_excluded_at_or_after_cutoff_or_missing_time": 0,
+      "missing_article_pairs": 0,
+      "missing_age_pairs": 0,
+      "future_publication_pairs": 129,
+      "feature_table_megabytes": 82.241603
+    },
+    "validation": {
+      "impressions": 10000,
+      "candidate_pairs": 118731,
+      "time_min": "2023-05-25 07:02:58",
+      "time_max": "2023-06-01 06:59:14",
+      "click_rate_in_sampled_slates": 0.08451036376346531,
+      "history_cutoff_exclusive": "2023-05-25 07:02:58",
+      "history_events_excluded_at_or_after_cutoff_or_missing_time": 0,
+      "missing_article_pairs": 0,
+      "missing_age_pairs": 0,
+      "future_publication_pairs": 2,
+      "feature_table_megabytes": 17.609337
+    }
+  },
+  "fit_seconds": 8.059859375003725,
+  "solver_iterations": 59,
+  "metrics": {
+    "random_expected": {
+      "mean_impression_auc": 0.5,
+      "auc_evaluable_impressions": 10000,
+      "impressions": 10000,
+      "candidate_pairs": 118731,
+      "ndcg@5": 0.34692391234179204,
+      "older_than_24h_share@5": 0.24848314399941918,
+      "ndcg@10": 0.43127573925247986,
+      "older_than_24h_share@10": 0.2581880794528165,
+      "older_than_24h_candidate_share": 0.26677110442934027,
+      "older_than_24h_click_share": 0.07893163244967112
+    },
+    "freshness": {
+      "mean_impression_auc": 0.5038189223708076,
+      "auc_evaluable_impressions": 10000,
+      "impressions": 10000,
+      "candidate_pairs": 118731,
+      "ndcg@5": 0.33838226190968607,
+      "older_than_24h_share@5": 0.09532,
+      "ndcg@10": 0.42263795226666406,
+      "older_than_24h_share@10": 0.1693250773993808,
+      "older_than_24h_candidate_share": 0.26677110442934027,
+      "older_than_24h_click_share": 0.07893163244967112
+    },
+    "category_affinity": {
+      "mean_impression_auc": 0.5594632118754451,
+      "auc_evaluable_impressions": 10000,
+      "impressions": 10000,
+      "candidate_pairs": 118731,
+      "ndcg@5": 0.3967674567561645,
+      "older_than_24h_share@5": 0.23185637075368074,
+      "ndcg@10": 0.47159316394711603,
+      "older_than_24h_share@10": 0.24612109825062906,
+      "older_than_24h_candidate_share": 0.26677110442934027,
+      "older_than_24h_click_share": 0.07893163244967112
+    },
+    "logistic_regression": {
+      "mean_impression_auc": 0.7072633139253348,
+      "auc_evaluable_impressions": 10000,
+      "impressions": 10000,
+      "candidate_pairs": 118731,
+      "ndcg@5": 0.5395389652359247,
+      "older_than_24h_share@5": 0.09878,
+      "ndcg@10": 0.5849375561850384,
+      "older_than_24h_share@10": 0.17207430340557275,
+      "older_than_24h_candidate_share": 0.26677110442934027,
+      "older_than_24h_click_share": 0.07893163244967112
+    }
+  },
+  "total_seconds": 75.97640141588636,
+  "peak_rss_megabytes": 1004.58496,
+  "notes": [
+    "Evaluation uses whole sampled validation slates, not the full validation population unless sample size is 0.",
+    "No model selection or hyperparameter tuning on the supplied validation period.",
+    "Probabilities refer to the supplied logged candidate population; they are not site-wide CTR estimates.",
+    "History snapshots are fixed before the earliest sampled impression of each split.",
+    "No candidate age cutoff, post-impression features, catalog totals, or candidate-list position features.",
+    "Session continuity and diversity are deferred until a click-ranking baseline is established.",
+    "The recorded run reused the exact saved uniform samples after optimizing history processing. Total runtime excludes regenerating those samples from the full source files."
+  ]
+}
