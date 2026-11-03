@@ -1,5 +1,10 @@
 # 2.1_lstm — LSTM with target-aware attention (Stage 1)
 
+> **Draft structure preview on main.** Training/evaluation results are pending.
+> The AUC-based selection described below still needs migration to catalogue
+> Recall@100; use the [shared experiment contract](../README.md) for the intended
+> evaluation protocol. Follow-up fixes will update this same folder.
+
 This model learns personal click relevance from recorded shown/clicked pairs. It then scores every catalogue article eligible at each request's timestamp and exports a top-100 shortlist per request for Stage 2 reranking.
 
 The model has three parts:

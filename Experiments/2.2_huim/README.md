@@ -1,5 +1,10 @@
 # 2.2_huim — HUIM-inspired Stage 1 relevance model and catalogue shortlist
 
+> **Draft structure preview on main.** Follow-up fixes are pending for catalogue
+> Recall@100 model selection and the full-file vector fallback reader. The
+> [shared experiment contract](../README.md) defines the intended evaluation
+> protocol; the AUC-based selection described below reflects this draft.
+
 **Status:** the implementation is prepared and has passed static and synthetic checks. It has **not** been
 executed on the shared data. No training, metric, export, persistence or reload result exists yet. The
 executed Colab notebook and its review bundle will be the first evidence.
