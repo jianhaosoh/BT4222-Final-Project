@@ -100,7 +100,7 @@ As an alternative, set `WRITE_COMPATIBLE_VECTORS = True`. This writes verified c
 
 Local outputs go to `/content/bt4222_outputs/2.1_lstm/<run_id>/` in Colab, or `outputs/` locally. Both are ignored by Git.
 
-Each run is copied to `OUTPUT_ROOT/Experiments/2.1_lstm/<run_id>/` and verified there with sha256 hashes. By default, `OUTPUT_ROOT` is `MyDrive/BT4222 Experiment Outputs`, a folder you own and separate from the shared inputs. Setting it to the shared folder also works if you have edit access. The notebook checks write access before it trains.
+Each run is copied to the shared project folder at `DATA_ROOT/Experiments/2.1_lstm/<run_id>/` and verified there with sha256 hashes. `OUTPUT_ROOT` is resolved to `DATA_ROOT`; there is no separate personal-Drive output setting. You need edit access to the shared folder, which the notebook checks before training. Earlier runs under `MyDrive/BT4222 Experiment Outputs` can be moved into this shared experiment folder without retraining.
 
 The run folder contains (export schema v3):
 
