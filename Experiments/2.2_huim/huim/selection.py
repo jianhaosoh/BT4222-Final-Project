@@ -31,7 +31,7 @@ class CatalogueSelector:
         self.ctx_cpu, self.art_cpu, self.ctx_dev, self.art_dev = ctx_cpu, art_cpu, ctx_dev, art_dev
         self.positions = np.asarray(positions, dtype=np.int64)
         self.device, self.cfg = device, cfg
-        clicks = C.click_eligibility(ctx_cpu, art_cpu)
+        clicks = C.click_eligibility(ctx_cpu, art_cpu, self.positions)
         self.clicks = [clicks[p] for p in self.positions]
         if any(c is None for c in self.clicks):
             raise ValueError("selection requires a labelled split (validation)")

@@ -419,7 +419,7 @@ def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, re
     results = {}
     for s, positions in request_sets.items():
         scorer = C.CatalogueScorer(model, ctx[s], art, device, cfg["pair_chunk"], cfg["inference_amp"])
-        clicks = C.click_eligibility(ws.ctx[s], ws.art) if s in D.LABELLED_SPLITS else None
+        clicks = C.click_eligibility(ws.ctx[s], ws.art, positions) if s in D.LABELLED_SPLITS else None
         progress = C.export_split(scorer, out_root, positions, write_full_scores=full_scores[s], click_info=clicks,
                                   recorded_counts=_recorded_bad_counts(ws, s), request_block=cfg["request_block"],
                                   log=log, model_digest=model_digest(model))

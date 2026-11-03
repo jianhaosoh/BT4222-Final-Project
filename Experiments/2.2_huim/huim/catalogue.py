@@ -67,26 +67,33 @@ def catalogue_eligibility(ctx, art) -> dict:
             "catalogue_published_after_last_request": int((pub_sorted > req_s.max()).sum()) if len(pub_sorted) else 0}
 
 
-def click_eligibility(ctx, art) -> list[dict]:
+def click_eligibility(ctx, art, positions=None) -> list[dict | None]:
     """Per request: clicked IDs split into eligible / not in catalogue / missing
-    pub / future. Original clicked IDs stay in the recall denominator."""
-    out = []
-    catalogue_ids = art.ids[ctx.catalogue_idx]
+    pub / future. Original clicked IDs stay in the recall denominator.
+
+    Returns a list indexed by request position; only `positions` (default: all)
+    are computed, others are None. Membership uses a boolean mask over the global
+    article index (O(clicks log N) per request), not a scan of the ~10^5-article pool."""
+    n = len(ctx.requests)
+    out: list[dict | None] = [None] * n
+    in_pool = np.zeros(len(art.ids), dtype=bool)
+    in_pool[ctx.catalogue_idx] = True
+    in_pool[0] = False  # unknown article index
     pub = art.tensors["pub_s"].numpy()
     req_s = ctx.tensors["req_s"].numpy()
     clicked = ctx.requests["article_ids_clicked"]
-    for i in range(len(ctx.requests)):
+    for i in (range(n) if positions is None else np.asarray(positions, dtype=np.int64)):
         ids = clicked.iloc[i]
         if ids is None:
-            out.append(None)
             continue
         ids = np.unique(np.asarray(ids, dtype=np.int64))  # a clicked article counts once
-        in_cat = np.isin(ids, catalogue_ids)
-        p = pub[art.lookup(ids)]
+        idx = art.lookup(ids)
+        in_cat = in_pool[idx]
+        p = pub[idx]
         missing = in_cat & (p == NO_PUB)
         future = in_cat & ~missing & (p > req_s[i])
         eligible = in_cat & ~missing & ~future
-        out.append({"ids": ids, "eligible": eligible, "not_in_catalogue": ~in_cat, "missing": missing, "future": future})
+        out[i] = {"ids": ids, "eligible": eligible, "not_in_catalogue": ~in_cat, "missing": missing, "future": future}
     return out
 
 
