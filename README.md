@@ -2,7 +2,19 @@
 
 ## Machine learning problem
 
-We aim to recommend Ekstra Bladet news articles that readers are likely to engage with. For each user impression, a model predicts the probability of a click for every article shown and ranks the candidates accordingly. A later re-ranking step considers continued reading, article freshness, and topic diversity.
+We aim to recommend relevant Ekstra Bladet news while supporting continued
+reading, freshness and topic diversity. Stage 1 learns personal relevance from
+recorded shown/clicked article pairs. For recommendations, it scores the article
+catalogue eligible at the request timestamp and selects up to 100 articles.
+Stage 2 applies business priorities within that shortlist to produce the final
+top 5 recommendations.
+
+Recorded-slate validation measures labelled click ranking; catalogue shortlist
+validation measures recovery of known clicked articles. Unshown article outcomes
+are unknown, so these offline results do not establish catalogue-wide CTR,
+retention or profit. See the experiment guide for the separate evaluation pools
+and export contracts. Existing slate-only experiments still need a catalogue
+inference path before they implement this intended pipeline.
 
 ## Dataset
 
@@ -12,7 +24,9 @@ This project uses the **EB-NeRD SMALL** dataset from Ekstra Bladet, a Danish new
 - `history.parquet`: Each user's prior article clicks, with timestamps and reading interactions.
 - `articles.parquet`: Article information such as title, category, topics, publication time, and premium status.
 
-Each shown article is a candidate: clicked articles receive a positive label, while shown but unclicked articles receive a negative label. 
+For training, each shown article is a candidate: clicked articles receive a
+positive label, while shown but unclicked articles receive a negative label.
+Do not expand training to all catalogue articles and label unshown articles zero.
 
 Dataset source: [EB-NeRD dataset and documentation](https://recsys.eb.dk/dataset/).
 
@@ -30,4 +44,5 @@ notebook structure, business-linked explainability, prediction CSV formats and
 saved-model handoff requirements. Keep preprocessing shared, model training and
 validation development in the experiment notebooks, and cross-model comparison,
 reranking/ensembling and final evaluation together in one shared stage. Each model
-exports train, validation and test predictions for that handoff.
+exports full eligible-catalogue scores and top-100 shortlists for train,
+validation and test requests, alongside separate recorded-slate diagnostics.
