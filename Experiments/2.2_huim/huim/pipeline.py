@@ -37,7 +37,7 @@ BASE_CONFIG = {
     "fusion": "concat", "feature_hidden": 64, "head_hidden": [128, 64], "dropout": 0.2, "modality_dropout": 0.15,
     # optimisation
     "lr": 1e-3, "weight_decay": 1e-4, "batch_size": 4096, "max_epochs": 4, "early_stopping_patience": 1,
-    "grad_clip": 1.0, "amp": True, "checkpoint_every_steps": 2000, "log_every_steps": 200,
+    "grad_clip": 1.0, "amp": True, "checkpoint_every_steps": 200, "log_every_steps": 200,
     # training subset (None = all supplied train pairs); whole impressions only
     "train_impression_limit": None,
     # catalogue scoring/export
@@ -277,7 +277,7 @@ def _recorded_bad_counts(ws, s):
 
 
 def recompute_shortlist_check(scorer, ws: Workspace, split: str, out_root: Path, positions: np.ndarray, seed: int,
-                              n: int = 32) -> dict:
+                              n: int = 32, block: int = 16) -> dict:
     """Without a full score file, re-score sampled requests over the full eligible
     catalogue and compare the exported shortlist with the reference ranking."""
     import json as _json
@@ -287,10 +287,14 @@ def recompute_shortlist_check(scorer, ws: Workspace, split: str, out_root: Path,
     rng = np.random.default_rng(seed + 7)
     pick = np.sort(rng.choice(len(positions), size=min(n, len(positions)), replace=False)) if len(positions) else []
     mismatches = 0
+    rb = block
     for j in pick:
         pos = positions[j]
-        logits = scorer.logits(np.array([pos]))[0]
-        elig = scorer.eligible_mask(np.array([pos]))[0]
+        # Re-score the exact export block so matrix shapes (and GPU kernels) match the export.
+        start = (j // rb) * rb
+        blk = positions[start:start + rb]
+        logits = scorer.logits(blk)[j - start]
+        elig = scorer.eligible_mask(blk)[j - start]
         ids = ws.art.ids[ws.ctx[split].catalogue_idx][elig.cpu().numpy()]
         if not np.array_equal(ids, eligible_ids(ws.ctx[split], ws.art, pos)):
             mismatches += 1
@@ -298,6 +302,12 @@ def recompute_shortlist_check(scorer, ws: Workspace, split: str, out_root: Path,
         if expected_top(ids, logits[elig].cpu().numpy()) != _json.loads(ranks.article_ids.iloc[j]):
             mismatches += 1
     return {"requests_checked": int(len(pick)), "mismatches": int(mismatches), "passed": mismatches == 0}
+
+
+def model_digest(model) -> str:
+    """SHA-256 of the state dict: ties a resumable export to the exact weights."""
+    from .train import params_digest
+    return params_digest(model)
 
 
 def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, request_sets: dict,
@@ -310,13 +320,13 @@ def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, re
         clicks = C.click_eligibility(ws.ctx[s], ws.art) if s in D.LABELLED_SPLITS else None
         progress = C.export_split(scorer, out_root, positions, write_full_scores=full_scores[s], click_info=clicks,
                                   recorded_counts=_recorded_bad_counts(ws, s), request_block=cfg["request_block"],
-                                  log=log)
+                                  log=log, model_digest=model_digest(model))
         validation = validate_export(ws.ctx[s], ws.art, out_root, positions, full_scores=full_scores[s],
                                      check_blocks=check_blocks, seed=cfg["seed"],
                                      recorded_logits=None if recorded_logits is None else recorded_logits[s])
         if not full_scores[s]:
             validation["checks"]["recomputed_shortlist_check"] = recompute_shortlist_check(
-                scorer, ws, s, Path(out_root), positions, cfg["seed"])
+                scorer, ws, s, Path(out_root), positions, cfg["seed"], block=cfg["request_block"])
             if not validation["checks"]["recomputed_shortlist_check"]["passed"]:
                 validation["passed"] = False
                 validation["errors"].append("shortlist != top-100 of recomputed full catalogue scores")
@@ -431,16 +441,26 @@ REQUIRED_RUN_FILES = ["run_config.json", "metrics.json", "requirements.txt", "ex
 
 
 def persist_run(run_dir: Path, persist_dir: Path, log=print) -> dict:
-    """Copy + verify every file, then write the completion marker last."""
+    """Copy + verify every file. No completion marker yet: see mark_run_complete."""
     records = mirror_tree(run_dir, persist_dir)
     required = [r for r in REQUIRED_RUN_FILES if (Path(run_dir) / r).is_file()]
     missing = sorted(set(REQUIRED_RUN_FILES) - set(required))
     if missing:
         raise FileNotFoundError(f"run bundle incomplete; missing {missing}")
-    marker = write_completion_marker(persist_dir, "_COMPLETE_RUN.json", required,
-                                     {"files_copied": len(records)})
-    log(f"persisted {len(records)} files to {persist_dir}; completion marker written last")
-    return {"files": len(records), "marker": marker}
+    log(f"persisted {len(records)} files to {persist_dir} (not yet marked complete)")
+    return {"files": len(records)}
+
+
+def mark_run_complete(run_dir: Path, persist_dir: Path, reload_result: dict, log=print) -> dict:
+    """Write _COMPLETE_RUN.json LAST, only after the reload check from the
+    persistent copy passed; re-mirrors any files written since persist_run."""
+    if not reload_result.get("passed"):
+        raise RuntimeError("reload check did not pass; the run is NOT marked complete")
+    mirror_tree(run_dir, persist_dir)
+    required = [r for r in REQUIRED_RUN_FILES if (Path(run_dir) / r).is_file()] + ["reload_check.json"]
+    marker = write_completion_marker(persist_dir, "_COMPLETE_RUN.json", required, {"reload_check_passed": True})
+    log(f"completion marker written last: {persist_dir / '_COMPLETE_RUN.json'}")
+    return marker
 
 
 def run_is_complete(persist_dir: Path) -> bool:
@@ -502,5 +522,5 @@ def requirements_text() -> str:
 
 
 __all__ = ["make_config", "prepare_inputs", "preflight", "train_model", "export_recorded", "export_catalogue",
-           "full_score_gate", "persist_run", "run_is_complete", "reload_check", "requirements_text",
+           "full_score_gate", "persist_run", "mark_run_complete", "run_is_complete", "reload_check", "requirements_text",
            "METRIC_DEFINITIONS", "parameter_counts", "git_info", "environment_info", "evaluate_recorded"]

@@ -22,8 +22,10 @@ SEARCH_SPACE = {
 
 
 def snapshot(db_path: Path, dst_dir: Path) -> None:
+    """Consistent SQLite backup made on LOCAL disk, then a verified copy to Drive
+    (SQLite on the Drive mount is unreliable)."""
     dst_dir.mkdir(parents=True, exist_ok=True)
-    tmp = dst_dir.parent / f".{db_path.name}.snapshot"
+    tmp = db_path.parent / f".{db_path.name}.snapshot"
     src = sqlite3.connect(db_path)
     dst = sqlite3.connect(tmp)
     with dst:

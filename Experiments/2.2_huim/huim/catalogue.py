@@ -203,14 +203,21 @@ def _csv_bytes(table: pa.Table, header: bool) -> bytes:
 
 
 def _truncate_or_create(path: Path, size: int) -> None:
+    """Cut a partial file back to the last checkpointed size. Never extend it:
+    a file shorter than recorded means it was lost or partly copied."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    current = path.stat().st_size if path.exists() else 0
+    if current < size:
+        raise RuntimeError(f"{path} has {current} bytes but the export progress records {size}; "
+                           "the partial export is damaged — remove its progress file to restart this split.")
     with open(path, "a+b") as handle:
         handle.truncate(size)
 
 
 def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.ndarray, *, write_full_scores: bool,
                  click_info: list | None, recorded_counts: tuple | None, request_block: int = 16,
-                 checkpoint_every_blocks: int = 50, log=print, max_blocks: int | None = None) -> dict:
+                 checkpoint_every_blocks: int = 50, log=print, max_blocks: int | None = None,
+                 model_digest: str | None = None) -> dict:
     """Stream rankings (+ optional full scores) for the given requests, resumably.
 
     Files under out_root:
@@ -234,7 +241,8 @@ def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.
     request_positions = np.asarray(request_positions, dtype=np.int64)
     signature = {"split": split, "n_requests": int(len(request_positions)),
                  "requests_sha": str(pd.util.hash_array(request_positions).sum()),
-                 "write_full_scores": bool(write_full_scores), "request_block": int(request_block)}
+                 "write_full_scores": bool(write_full_scores), "request_block": int(request_block),
+                 "model_digest": model_digest, "catalogue_sha": str(pd.util.hash_array(ctx.catalogue_idx).sum())}
     progress = None
     if progress_path.is_file():
         progress = read_json(progress_path)

@@ -61,8 +61,15 @@ def to_seconds(values) -> np.ndarray:
 
 
 def _nominal(value):
-    if value is None or (isinstance(value, float) and np.isnan(value)) or value is pd.NA:
+    """Nominal token as Step 3 writes it; integral floats (nullable int columns
+    loaded as float) map to '2', not '2.0'."""
+    if value is None or value is pd.NA:
         return None
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value):
+            return None
+        if float(value).is_integer():
+            return str(int(value))
     return str(value)
 
 
@@ -93,7 +100,7 @@ class Preprocessor:
         state["device_vocab"] = list(vocabulary["device_type"])
         # Additional vocabularies fitted on train-referenced articles only.
         used = articles[articles.article_id.isin(set(map(int, train_article_ids)))]
-        subcats = sorted({str(s) for v in used.subcategory for s in _as_list(v)})
+        subcats = sorted({_nominal(s) for v in used.subcategory for s in _as_list(v) if _nominal(s) is not None})
         sentiments = sorted({s for s in used.sentiment_label.map(_nominal) if s is not None})
         state["subcategory_vocab"], state["sentiment_vocab"] = subcats, sentiments
         body = np.log1p(used.body_word_count.dropna().to_numpy(dtype="float64"))
@@ -231,7 +238,7 @@ def build_article_table(articles: pd.DataFrame, pre: Preprocessor, text_ids: np.
     sp = np.zeros((n, s["max_subcats"]), dtype=np.int64)
     for i, v in enumerate(articles.subcategory, start=1):
         for j, sub in enumerate(_as_list(v)[: s["max_subcats"]]):
-            sp[i, j] = sub_lookup.get(str(sub), 1)
+            sp[i, j] = sub_lookup.get(_nominal(sub), 1)
     t["subcats_pad"] = torch.from_numpy(sp)
     # Cross-feature columns over the full value sets (exact Step 3 semantics).
     cat_cross = {v: i for i, v in enumerate(s["cross_categories"])}
@@ -330,11 +337,12 @@ def build_split_context(split: str, behaviours: pd.DataFrame, events: pd.DataFra
     H = s["history_len"]
     req = behaviours.reset_index(drop=True).copy()
     R = len(req)
-    users = np.asarray(history_users, dtype=np.int64)
-    missing_users = np.setdiff1d(req.user_id.to_numpy(np.int64), users)
-    if missing_users.size:
-        # Not dropped: these requests get an empty history (with an explicit flag).
-        users = np.union1d(users, missing_users)
+    request_users = np.unique(req.user_id.to_numpy(np.int64))
+    missing_users = np.setdiff1d(request_users, np.asarray(history_users, dtype=np.int64))
+    # Only users with requests are needed; users without a history row are kept
+    # (empty history, explicit flag), never dropped.
+    users = request_users
+    events = events[events.user_id.isin(users)]
     U = len(users)
     user_row = np.searchsorted(users, req.user_id.to_numpy(np.int64))
     req_s = to_seconds(req.impression_time)

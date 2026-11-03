@@ -160,7 +160,7 @@ def input_manifest(paths: DataPaths, hash_limit_bytes: int | None = 2 * 1024 ** 
 
 # ---------------------------------------------------------------- articles ---
 
-def load_articles(paths: DataPaths, catalogue_names: Iterable[str]) -> tuple[pd.DataFrame, dict]:
+def load_articles(paths: DataPaths, catalogue_names: list[str]) -> tuple[pd.DataFrame, dict]:
     """Union of the named article catalogues. Overlapping IDs keep the first
     catalogue's row (as Step 3 does); differences in published_time are reported.
 
@@ -187,8 +187,12 @@ def load_articles(paths: DataPaths, catalogue_names: Iterable[str]) -> tuple[pd.
     if len(frames) > 1:
         first, second = frames[0].set_index("article_id"), frames[1].set_index("article_id")
         common = first.index.intersection(second.index)
-        diff_pub = (first.loc[common, "published_time"] != second.loc[common, "published_time"]).sum()
-        report["overlap"] = {"ids_in_both": int(len(common)), "published_time_differs": int(diff_pub)}
+        a = first.loc[common, "published_time"]
+        b = second.loc[common, "published_time"]
+        diff_pub = ~((a == b) | (a.isna() & b.isna()))
+        report["overlap"] = {"ids_in_both": int(len(common)), "published_time_differs": int(diff_pub.sum()),
+                             "policy": f"overlapping IDs use the '{catalogue_names[0]}' row (metadata and "
+                                       "published_time) in every catalogue, as Step 3 does"}
     union = union.drop_duplicates("article_id", keep="first").sort_values("article_id").reset_index(drop=True)
     # Word count of the snapshot body; body text itself is not a model input.
     union["body_word_count"] = union["body"].map(

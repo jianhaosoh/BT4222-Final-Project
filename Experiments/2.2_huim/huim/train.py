@@ -132,7 +132,12 @@ class Trainer:
         return self.run_dir / "recovery" / "last.pt"
 
     def save_recovery(self) -> None:
+        selected = self.run_dir / "model" / "weights.pt"
         payload = {"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict(),
+                   # the selected (best-AUC) inference weights travel with the recovery state, so a
+                   # crash between saving them and saving recovery cannot mislabel them
+                   "selected_weights": torch.load(selected, map_location="cpu", weights_only=True)
+                   if selected.is_file() else None,
                    "scheduler": self.scheduler.state_dict(), "grad_scaler": self.scaler.state_dict(),
                    "amp": self.amp, "state": copy.deepcopy(self.state), "rng": rng_state(),
                    "train_cfg": {k: v for k, v in self.cfg.items() if k != "train_pair_indices"}}
@@ -149,6 +154,8 @@ class Trainer:
         self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["grad_scaler"])
         self.state = payload["state"]
+        if payload.get("selected_weights") is not None:
+            atomic_torch_save(payload["selected_weights"], self.run_dir / "model" / "weights.pt")
         restore_rng_state(payload["rng"])
         self.log(f"Resumed from {path}: epoch {self.state['epoch']}, step {self.state['step_in_epoch']}, "
                  f"best AUC {self.state['best_auc']}")
@@ -234,7 +241,13 @@ def interruption_check(build_trainer: Callable[[Path], "Trainer"], scratch: Path
     """Optional, bounded resume check (prepared; must be executed in Colab).
 
     A: train 2*steps continuously. B: train `steps`, save recovery, rebuild a
-    fresh trainer, load it, train `steps` more. Compare parameters."""
+    fresh trainer, load it, train `steps` more. Compare parameters. The epoch
+    must contain more than 2*steps steps so the resume is genuinely mid-epoch."""
+    probe = build_trainer(scratch / "probe")
+    n_steps = math.ceil(len(probe.train_idx) / probe.cfg["batch_size"])
+    del probe
+    if n_steps <= 2 * steps:
+        raise ValueError(f"epoch has only {n_steps} steps; use a larger training subset or fewer steps")
     a = build_trainer(scratch / "A")
     a.train_steps(0, 0, 2 * steps)
     digest_a = params_digest(a.model)
@@ -244,10 +257,11 @@ def interruption_check(build_trainer: Callable[[Path], "Trainer"], scratch: Path
     b.save_recovery()
     c = build_trainer(scratch / "C")
     c.load_recovery(scratch / "B" / "recovery" / "last.pt")
+    assert c.state["step_in_epoch"] == steps, "resume did not restore the mid-epoch position"
     c.train_steps(0, c.state["step_in_epoch"], 2 * steps)
     params_c = {k: v.detach().cpu() for k, v in c.model.state_dict().items()}
     max_diff = max(float((params_a[k].float() - params_c[k].float()).abs().max()) for k in params_a)
-    return {"steps_each_half": steps, "digest_continuous": digest_a, "digest_resumed": params_digest(c.model),
+    return {"steps_each_half": steps, "steps_per_epoch": n_steps, "digest_continuous": digest_a, "digest_resumed": params_digest(c.model),
             "bitwise_identical": digest_a == params_digest(c.model), "max_abs_param_diff": max_diff,
             "note": "GPU kernels (e.g. embedding backward/index_add) may be nondeterministic; "
                     "a tiny nonzero diff is possible without a resume bug."}

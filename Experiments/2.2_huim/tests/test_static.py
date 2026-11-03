@@ -231,6 +231,15 @@ class TestModel(unittest.TestCase):
             for rel in ("predictions/validation/submission_click_probabilities.csv",
                         "rankings/validation/submission_top_100.csv"):
                 self.assertEqual((Path(a) / rel).read_bytes(), (Path(b) / rel).read_bytes())
+            # a file SHORTER than the recorded progress must not be zero-padded
+            prog = Path(b) / "diagnostics/catalogue/validation_export_progress.json"
+            state = json.loads(prog.read_text())
+            state["finished"] = False
+            prog.write_text(json.dumps(state))
+            (Path(b) / "rankings/validation/submission_top_100.csv").write_bytes(b"x")
+            with self.assertRaises(RuntimeError):
+                C.export_split(scorer, Path(b), positions, write_full_scores=True, click_info=None,
+                               recorded_counts=None, request_block=3, checkpoint_every_blocks=1, log=lambda *_: None)
 
     def test_pair_features_match_definitions(self):
         raw = F.pair_dense(self.ctx.tensors, self.art.tensors, torch.from_numpy(self.ctx.recorded["req_pos"]),
@@ -281,6 +290,7 @@ class TestPersistence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as persist:
             tr = Trainer(model, art, ctx, ctx, torch.device("cpu"), cfg, Path(tmp), Path(persist), log=lambda *_: None)
             tr.state["step_in_epoch"] = 7
+            tr.save_selected()  # selected weights travel inside the recovery payload
             cpu_state = torch.get_rng_state().clone()
             tr.save_recovery()
             self.assertTrue((Path(persist) / "recovery/last.pt").is_file())
@@ -291,6 +301,9 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(tr2.state["step_in_epoch"], 7)
             self.assertTrue(torch.equal(torch.get_rng_state(), cpu_state))
             tr.save_selected()
+            (Path(tmp) / "model/weights.pt").unlink()
+            tr2.load_recovery(Path(tmp) / "recovery/last.pt")
+            self.assertTrue((Path(tmp) / "model/weights.pt").is_file())  # restored from recovery
             hashes = save_model_files(Path(tmp), model, model.cfg, pre, art, {"selected_epoch": 0})
             self.assertEqual(len(hashes), 4)
             loaded, cfg2, pre2, meta = load_model(Path(tmp), torch.device("cpu"))
@@ -365,9 +378,14 @@ class TestPipelineSynthetic(unittest.TestCase):
             self.assertTrue(gate["validation"]["write"])
             self.assertFalse(gate["train"]["write"])
             P.persist_run(run, persist, log=lambda *_: None)
-            self.assertTrue(P.run_is_complete(persist))
+            self.assertFalse(P.run_is_complete(persist))  # no marker before the reload check
             reload = P.reload_check(persist, ws, cfg, dev, n_requests=2)
             self.assertTrue(reload["passed"], reload)
+            atomic_write_json(run / "reload_check.json", reload)
+            with self.assertRaises(RuntimeError):
+                P.mark_run_complete(run, persist, {"passed": False}, log=lambda *_: None)
+            P.mark_run_complete(run, persist, reload, log=lambda *_: None)
+            self.assertTrue(P.run_is_complete(persist))
 
 
 if __name__ == "__main__":

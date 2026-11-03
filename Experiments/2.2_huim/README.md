@@ -99,7 +99,7 @@ The notebook's preflight compares our pair features with the shared Step 3 featu
 On the attached mini fixture, this static inspection gave:
 
 * history size and the category/type preferences match exactly;
-* topic preference matches within 1e-4;
+* topic preference matches within 3e-8;
 * 7-day clicks match within 4e-5;
 * article age matches to about 0.03 h. This difference comes from float32 log round-trip, and future-published candidates are clipped to 0.
 
@@ -186,7 +186,7 @@ Proposals for the group, if full score files remain infeasible. None is implemen
 4. Run with `RUN_MODE = "smoke"` end to end. Then use `"development"`. Use `"full"` only after reading the preflight and refined estimates.
 5. **Resume.** Rerun with the same `RUN_ID`.
    * Training resumes from `PERSIST_DIR/recovery/last.pt`. It holds the model, optimiser, scheduler, GradScaler, progress and RNG states; the CPU RNG state is restored as a CPU tensor.
-   * Export resume uses the progress file in the local run folder. To survive a lost runtime, set `LOCAL_ROOT` to a Drive folder for long full exports.
+   * Export resume uses the progress file in the local run folder. Each resume is tied to a weights digest and a catalogue hash. A file shorter than its recorded progress raises an error and is never padded. To survive a lost runtime, set `LOCAL_ROOT` to a Drive folder for long full exports.
    * Optional bounded resume check: `RUN_INTERRUPTION_CHECK = True`.
 6. **Load-only.** Set `TRAIN_MODEL = False` and `LOAD_RUN_DIR = <persisted run folder>`. Preprocessing and reconstruction settings come from the bundle, and nothing is refitted.
 
@@ -196,8 +196,10 @@ The run bundle is written to `PERSIST_DIR = OUTPUT_ROOT/<run_id>/`. It contains:
 * `run_config.json`, `metrics.json`, `export_manifest.json`, `requirements.txt` and `training_history.json`;
 * `recovery/`, the exports, the logs, and `_COMPLETE_RUN.json`.
 
-Every file is copied and verified by SHA-256 before the marker is written, and the marker is written last. A
-summary file alone never marks a run complete.
+Every file is copied and verified by SHA-256. `_COMPLETE_RUN.json` is written last, and only after the reload
+check from the persistent copy has passed. Load-only mode accepts only a valid marker, so a summary file alone
+never marks a run complete. The selected weights are also stored inside the recovery checkpoint, so a crash
+between the two saves cannot mislabel them.
 
 ## What to return for review
 
