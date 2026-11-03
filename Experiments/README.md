@@ -9,13 +9,12 @@ predictions and models without rerunning training notebooks.
 - [HUIM-inspired attention network](2.2_huim/experiment.ipynb)
 - [Pretrained similarity experiment](3.1_pretrained_similarity/experiment.ipynb)
 
-These notebooks and their supporting modules are published on `main` for sharing
-the current structure. They have not been trained/evaluated in the committed
-notebooks. Follow-up implementation fixes are in progress: both still select by
-recorded-slate AUC and must adopt the catalogue Recall@100 protocol below; the
-HUIM full-file vector fallback also needs its reader-to-table fix. The shared
-protocol below is the intended contract, not a claim that these drafts already
-implement every requirement. Later fixes can update the same experiment folders.
+The latest neural notebooks and matching helpers are published on `main` for
+Colab execution. They include catalogue Recall@100 selection and the shared
+union-pool workflow, with small request-sampled smoke settings for the first run.
+Committed notebook outputs do not yet establish training/evaluation results.
+Run results will guide subsequent changes and the final notebook cleanup; later
+updates can use these same experiment folders.
 
 The 3.1 implementation supplies the reference workflow for catalogue construction,
 request sampling and audit-first development below. Its current development run
