@@ -270,7 +270,7 @@ The saved files retain both raw and log alternatives for traceability; the loade
 
 [`embedding_pipeline.py`](embedding_pipeline.py) is a standalone regular-API example.
 It combines each article's Danish title, subtitle, and body into one text document,
-requests one Gemini Embedding 2 vector, and joins the supplied image vectors by
+generates one Gemini Embedding 2 vector per article, and joins supplied image vectors by
 `article_id`. Text and image vectors are saved separately.
 
 ### Setup and run
@@ -324,13 +324,20 @@ articles from the official test catalogue need vectors generated from that file.
 Use a left join when adding vectors to candidates so missing vectors never remove
 candidate rows.
 
-The script uses the regular API, one document per request. Successful text vectors
+The script uses the regular API, one document or long-document chunk per request. Successful text vectors
 are checkpointed every 100 rows and on interruption. A separate local
 `text_cache.parquet` keeps all successful vectors even after a limited or interrupted
 rerun. Repeating the command reuses
 vectors with the same prepared text, model and dimension, including identical text
-on different article IDs. Documents longer than 8,192 tokens receive an explicit
-`input_too_long` status. Temporary rate-limit/server errors are retried.
+on different article IDs. Documents longer than 8,192 tokens are split near the
+middle at paragraph/newline boundaries, falling back to spaces or character
+boundaries. Every chunk is token-counted and split again if necessary, preserving
+all text without overlap or truncation. Chunk vectors are averaged with token-count
+weights, then L2-normalised to produce one vector of the configured dimension.
+Short documents use their API vector directly. Pooling is an approximation to
+whole-document embedding and does not change the downstream vector shape.
+Temporary rate-limit/server errors are retried. A rerun also processes previously
+oversized articles, since only successful vectors are cached.
 
 ### Files and model inputs
 
