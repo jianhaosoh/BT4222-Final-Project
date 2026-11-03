@@ -1,153 +1,167 @@
-# 2.1_lstm — LSTM with target-aware attention (Stage 1)
+# 2.1 LSTM with target-aware attention
 
-> **Status.** Selection uses catalogue Recall@100. Pools and request sampling follow 3.1's `published_at_or_before_request_v1` workflow. The implementation has been checked statically, on the mini sample and against 3.1's own helper functions. No training or evaluation results exist yet.
+**Owner:** Winston Ho Rui Wei. A previous L4 smoke run completed successfully.
+The final tuned, all-request schema-v4 workflow below has **not yet been run**.
+The updated code passed syntax checks and tiny synthetic input-preparation,
+scoring, export, metric and saved-copy reload checks without training or Optuna.
+Those checks establish code behaviour on the fixture, not full-data results.
 
-This model learns personal click relevance from recorded shown/clicked pairs. It then scores every catalogue article eligible at each request's timestamp and exports a top-100 shortlist per request for Stage 2 reranking.
+The model learns personal click relevance from recorded slates, then scores every
+eligible article and retains the genuine top 200 for Stage 2 business reranking
+to five recommendations. Unshown article outcomes remain unknown.
 
-The model has three parts:
+## Model and course connection
 
-- **History:** the reader's chronological fixed pre-period clicks, encoded by an LSTM.
-- **Attention:** each candidate article is projected into a query over the LSTM states, giving a candidate-specific history context.
-- **Head:** an MLP that predicts a click logit from that context, the article and the request context.
+The course Week 8 concepts are chronological LSTM history encoding, embeddings
+and candidate-specific attention. Each reader's fixed pre-period history retains
+its latest 50 events in chronological order, with masked padding. Each candidate
+queries the LSTM states; an MLP combines the resulting history representation,
+article features, candidate age and pre-request context to produce a click logit.
 
-It adapts the course Week 8 recipe from rating regression to binary clicks, using BCE on logits.
+The rating-regression recipe becomes binary click prediction: BCE on logits fits
+clicked = 1 and shown but unclicked = 0 within each original recorded slate.
+There are no catalogue-wide negative labels. Frozen text/image vectors are
+projected alongside metadata embeddings and train-standardised numeric features.
+Missing vectors use zero placeholders plus explicit availability flags, and 20%
+training-only candidate text dropout teaches this fallback. Missing vectors never
+exclude an otherwise eligible article. Fitted transformations use training
+requests/history only and are reused unchanged at inference.
 
-**Training.** Training uses each selected request's complete recorded `article_ids_inview` slate: clicked = 1, shown but unclicked = 0. No catalogue negatives are created, and unshown outcomes stay unknown.
+## Run the notebook
 
-**Catalogue pool (shared with 3.1).** The pool policy is `published_at_or_before_request_v1`. Every split's requests use the **same** article pool:
+1. Open `experiment.ipynb` in a Colab L4 GPU runtime.
+2. Upload `lstm_data.py` and `lstm_model.py` to `/content`, beside the notebook.
+   Locally, keep both helpers beside the notebook and use that working directory.
+3. Add the shared Drive folder shortcut at
+   `/content/drive/MyDrive/Colab Notebooks/BT4222 Shared Final Folder`.
+   This is `DATA_ROOT`; local execution can set it to the local shared-data copy.
+4. Run the cells in order. Setup mounts Drive, imports the uploaded helpers and
+   installs DuckDB/Optuna if missing. It uses the runtime's core scientific stack.
 
-1. **Catalogue:** the ordered union of `train_val/articles.parquet` then `test/articles.parquet`, keeping the first record per article ID with its missing fields.
-2. **Eligibility:** an article is eligible when its publication time is known and at or before the request time, compared exactly to the microsecond.
-3. **No other filters:** there is no age or access cutoff and no embedding requirement. An article without vectors stays eligible, with missing flags.
-4. **Vector overlaps:** where both vector sources have the same article ID, the first source record wins (train_val, then test), even if its vector is missing. A later source never backfills it.
+The 26-cell notebook follows the nine shared experiment sections. Its single
+path is **Optuna → apply winning parameters → fit on all training requests →
+restore the selected checkpoint → export all three splits → reload from the
+persistent copy**. No Git checkout or credentials are required.
 
-Each selected request is scored against **all** of its eligible articles. The inputs a catalogue request cannot have were removed: recorded slate size and within-slate age rank. Article age is computed from the catalogue and checked against the shared `article_age_h`.
-
-**Request sampling (shared with 3.1).** Only requests are sampled, never articles.
-
-- **Identifier:** `behaviour_id = f"{user_id}:{impression_id}"`.
-- **Priority:** `blake2b(f"{seed}:{split}:{behaviour_id}", digest_size=8)`, with seed 42.
-- **Selection:** the N smallest by (priority, behaviour_id), taken from the **complete** request population.
-- **Processing order:** (timestamp, user_id, impression_id).
-
-Training, selection-validation and export limits are independent. The IDs are saved under `selection/`. Optionally, `REFERENCE_INPUT_AUDIT` and `REFERENCE_TRAINING_IDS` point to 3.1's saved IDs, and the notebook asserts they are identical.
-
-| `RUN_SCOPE` | Training requests | Selection requests | Export requests per split |
-| --- | --- | --- | --- |
-| `smoke` (default) | 500 | 20 | 5 |
-| `aligned_dev` (3.1's limits) | 5,000 | 100 | 25 |
-| `full` | all | 100 | all |
-
-**Selection.** Checkpoints are evaluated once per epoch, the declared interval. For the validation selection requests, the model's top 100 is computed over each request's full eligible union catalogue. The selected checkpoint has the highest macro known-click Recall@100. Ties are broken by observed-click nDCG@100, then by the earlier checkpoint or trial.
-
-- **Early stopping, the learning-rate schedule and Optuna** all use this same objective.
-- **Recorded-slate AUC** is a diagnostic only, and nDCG@5 is left to Stage 2.
-- **Checkpoints record the selection declaration**, including a protocol fingerprint (pool policy, source files, union-ID hash, sample IDs and encoder identity). Resuming a checkpoint selected under a different declaration is refused. That includes legacy AUC selection and the earlier per-split pools.
-- **Load-only runs of an older protocol** may reuse its weights for a new evaluation or export under the current protocol. The original selection provenance is kept, and controls are refused in that case.
-- **Provenance follows the weights.** `weights_selected_under` points back to the training run's protocol and objective, including through a load of a load run. A resume with changed training settings is refused; raising `max_epochs` is still allowed.
-
-**Metric scopes.** Selection-validation metrics (selection requests, at the selected checkpoint) and exported-validation metrics (export requests) are reported separately in `metrics.json`. With these limits, the exported validation requests are a subset of the selection requests. Compare models only on identical request IDs and pools; each scope records its ID hash. Test has no outcome metrics.
-
-| File | Purpose |
+| Stage | Declared budget and scope |
 | --- | --- |
-| `experiment.ipynb` | Colab notebook with the common nine-section structure: configuration, preflight checks, training or loading, diagnostics, exports, persistence and reload check. |
-| `lstm_data.py` | Path resolution, candidate and history loading, vector decoding, and train-fitted preprocessing. Also catalogue eligibility and coverage, impression metrics, known-click recall, and streaming schema-v3 exports and validators. Has no PyTorch dependency. |
-| `lstm_model.py` | Article encoder, LSTM, target-aware attention, head, batching, and training with early stopping and checkpoints. Also the batched catalogue scorer, which gives an exact top-K with ties broken by article ID. |
-| `requirements.txt` | Dependencies. Each run also writes its exact versions. |
+| Optuna | Up to 12 trials, three epochs/trial, at most 60,000 complete training requests/epoch; 150-minute timeout checked between trials, so an active trial can finish later. |
+| Trial selection | Same fixed 100 validation requests, seed 42, with the complete eligible catalogue for each request. Every model/data-order trial seed is 42. |
+| Final fitting | All recorded training requests each epoch; up to eight epochs, patience two, batch size 256, AMP on CUDA. |
+| Export | All requests in train, validation and test; every eligible article scored in chunks of 32,768, retaining a running top 200. |
 
-## Inputs (under the shared `DATA_ROOT`)
+Optuna uses seeded TPE and a median pruner (three startup trials, one warmup step).
+Its search space is LSTM hidden size `{64,128,256}`, attention size `{32,64,128}`,
+article size `{64,128}`, dropout `0.1–0.4`, learning rate `3e-4–3e-3` (log), weight
+decay `1e-6–1e-3` (log), and history dropout `0–0.3`. All seven winning settings
+are applied before final fitting. Exact eligible-pair counts, retained-output
+size estimates and available space are printed before training; export progress
+reports elapsed time and an ETA. Full-run runtime remains unmeasured.
 
-- `feature_engineering/{split}_features.parquet` provides only the candidate keys, labels, impression context, and shared `article_age_h`. The engineered history aggregates are not used.
-- `train_val/{train,validation}/history.parquet` and `test/history.parquet` provide the ordered fixed history: article, time, read time and scroll %.
-- `train_val/articles.parquet` and `test/articles.parquet` provide article metadata. Future article totals are never read.
-- `{train_val,test}/article embeddings/{text,image}_embeddings.parquet` hold the frozen vectors. The canonical `embeddings/{train_val,test}/` locations are also accepted.
-- `feature_engineering/feature_vocabulary.json` is the shared train vocabulary.
+## Inputs, catalogue and selection
 
-Paths are resolved explicitly, in this order:
+Inputs live under `DATA_ROOT`:
 
-1. `PATH_OVERRIDES`
-2. `loader_paths.json`
-3. the documented candidates
+- `feature_engineering/{split}_features.parquet`: existing recorded candidate
+  rows, labels and pre-request context; no re-explosion of those rows.
+- `feature_engineering/feature_vocabulary.json`: shared feature/category vocabulary.
+- `train_val/{train,validation}/history.parquet` and `test/history.parquet`: fixed
+  pre-period histories with article/time/read-time/scroll fields.
+- `train_val/articles.parquet`, then `test/articles.parquet`: ordered metadata union.
+- `embeddings/{train_val,test}/{text,image}_embeddings.parquet`: frozen vectors;
+  the supplied `{train_val,test}/article embeddings/` layout is also accepted.
+- Original behaviour Parquets, when present, are cross-checked against the feature
+  candidates, labels and composite request keys.
 
-A missing required file stops the run.
+The path helper supports the shared folder layouts and supplied `loader_paths.json`.
+For nullable fixed-size-vector Parquets affected by the known PyArrow read error,
+it uses DuckDB's reader while preserving dimensions, row order, IDs and nulls.
 
-The shared folder is owned by another account. Add a Drive shortcut so it appears under `MyDrive`.
+All splits use `published_at_or_before_request_v1`: the ordered union of train_val
+then test, keeping the first article/vector source record, including missing
+values. Known publication time must be at or before the request time, compared
+in microseconds. There is no age/access cutoff or embedding-coverage filter.
+Catalogue features use only metadata, prior history and pre-request context;
+recorded slate size, pool-relative ranks and future article totals are excluded.
 
-## Running
+`behaviour_id = "user_id:impression_id"` uses exact original integer IDs. The
+selection sample is the smallest 100 `(BLAKE2b-64("42:validation:behaviour_id"),
+behaviour_id)` priorities from the complete validation population, processed in
+(timestamp, user_id, impression_id) order, matching the 3.1 sampling rule.
+Only checkpoint/trial selection uses this sample; final fitting and exports use
+all recorded requests.
 
-1. In Colab, choose a GPU runtime and open `experiment.ipynb`.
-2. Code version. The notebook pins `CODE_COMMIT` and the sha256 of both helper modules. It then clones, or fetches into an existing clean clone, and checks out that commit detached. It stops if the hashes or commit differ, or if an existing clone has local changes.
-3. Dependencies are checked before the helpers are imported. DuckDB is installed only if it is missing.
-4. The first execution uses the defaults:
-   - `RUN_SCOPE = "smoke"`
-   - `RUN_ABLATIONS = False`
-   - `RUN_OPTUNA = False`
-   - `RUN_RESUME_CHECK = True`
-5. Aligned development: set `RUN_SCOPE = "aligned_dev"`. For the full run, set `RUN_SCOPE = "full"`, but only after inspecting the Section 7 feasibility table.
-6. Controls without retraining the main model:
-   - set `TRAIN_MODEL = False`, `LOAD_RUN_ID = "<main run>"` and `RUN_ABLATIONS = True`;
-   - the controls reuse the saved hyperparameters;
-   - the run ID ends in `_load_controls`.
-7. Resume after a disconnect: set `RESUME_RUN_ID = "<run id>"`. This continues a training run from the Drive recovery checkpoint (not guaranteed to be bitwise exact). With `TRAIN_MODEL = False` and `LOAD_RUN_ID`, it continues a load or controls run, reusing finished controls and catalogue splits.
+Selection maximises macro **known-click Recall@100**, then **observed-click
+nDCG@100**, then preserves the earlier checkpoint/trial. Recorded-slate mean
+impression AUC is diagnostic. Final export reports the selected model on full
+validation at both K=100 and K=200; export size does not change the selection
+objective. Recall denominators and nDCG ideals retain all original known clicks,
+including missed/ineligible clicks. Unshown articles' zero observed gain is
+retrieval bookkeeping, not a non-click label. Validation is repeatedly used
+**development** data. Official test labels and test outcome metrics are unavailable.
 
-## Vector files
+## Outputs and persistent model bundle
 
-Some pyarrow versions (18–20) cannot read nullable fixed-size-list vector columns. They fail with `Expected all lists to be of size=768 but index … had size=0`. For exactly that error, the loader falls back to DuckDB's Parquet reader, which keeps values, dimensions, IDs, row order and nulls. `run_config.json` records the reader used for each file.
+Local Colab outputs are `/content/lstm_outputs/<run_id>/` (locally,
+`outputs/<run_id>/` beside the helpers). The persistent destination is
+`DATA_ROOT/Experiments/2.1_lstm/<run_id>/`. Completed study snapshots and epoch
+checkpoints are copied during the run; the selected inference bundle is persisted
+before the long catalogue export. Exact interruption resumption is not claimed.
 
-As an alternative, set `WRITE_COMPATIBLE_VECTORS = True`. This writes verified copies with variable-length lists under `OUTPUT_ROOT/compatible_vectors/` and uses them in place of the originals. Each copy is compared exactly with its source before it is accepted, and the originals are never modified.
+Schema v4 exports the following compressed Parquets for **every request**:
 
-## Outputs
+| File | Contents |
+| --- | --- |
+| `predictions/{split}/submission_article_scores.parquet` | Genuine retained top-200 pairs: string `behaviour_id`, int64 `article_id`, 1-based integer `rank`, float32 `score` (click logit). |
+| `rankings/{split}/submission_top_200.parquet` | One row/request with string `behaviour_id` and native `list<int64>` `article_ids` in identical rank order; empty pools are `[]`. |
+| `predictions/{split}/eligibility_manifest.parquet` | Every request's ID, exact timestamp, eligible count and shortlist length. |
+| `diagnostics/recorded_slates/{split}_scores.parquet` | Every original recorded candidate, including non-clicks and ineligible candidates: `behaviour_id`, `article_id`, `score`. Original labels are joined separately. |
 
-Local outputs go to `/content/bt4222_outputs/2.1_lstm/<run_id>/` in Colab, or `outputs/` locally. Both are ignored by Git.
+Rank by descending score, then ascending original article ID. Return
+`min(200, eligible_count)` unique IDs without padding or inserting clicked/slate
+articles. Pair scores contain **only the top 200**, not all eligible articles.
+No exhaustive score matrix is exported. `selection_k=100`, `export_k=200`,
+`shortlist_size=200`, and `final_display_size=5` are saved explicitly.
+Training predictions are in-sample diagnostics, not out-of-fold stacking inputs.
+Scores are uncalibrated logits; no calibrated probabilities are claimed.
 
-Each run is copied to the shared project folder at `DATA_ROOT/Experiments/2.1_lstm/<run_id>/` and verified there with sha256 hashes. `OUTPUT_ROOT` is resolved to `DATA_ROOT`; there is no separate personal-Drive output setting. You need edit access to the shared folder, which the notebook checks before training. Earlier runs under `MyDrive/BT4222 Experiment Outputs` can be moved into this shared experiment folder without retraining.
+The reloadable `model/` folder contains:
 
-The run folder contains (export schema v3):
+- `model_state.pt`, `model_config.json`: selected inference weights and architecture.
+- `preprocessing.json`: fitted transformations, vocabulary and feature settings.
+- `feature_dictionary.json`: ordered human-readable features, category/type/topic
+  index meanings, missing-value conventions and history/score semantics.
+- `article_inputs.npz`: frozen article metadata/vector lookup, including missingness.
+- `mappings.npz`: article-row/original-ID mapping and training-referenced IDs.
+- `catalogue_policy.json` and `code/{lstm_data,lstm_model}.py`: policy and source helpers.
 
-- `rankings/{split}/submission_top_100.csv`: one row per request with its top `min(100, pool)` eligible article IDs as a JSON array. An empty pool is written as `[]`.
-- `predictions/{split}/eligibility_manifest.csv`: per-request pool size and shortlist length.
-- `predictions/{split}/submission_click_probabilities.csv`: full catalogue scores (`score` = logit, `click_probability` = uncalibrated sigmoid). This file is written only if the estimated size fits `FULL_SCORE_EXPORT_MAX_GB` and the free space. Otherwise the scores of a declared, seeded request sample go to `predictions/{split}/score_sample/`, and `export_manifest.json` records that the full export is incomplete.
-- A request-limited run, such as the smoke run, writes all of the above under `rankings/{split}/sampled_requests/` and `predictions/{split}/sampled_requests/`.
-- `diagnostics/recorded_slates/{split}_scores.csv`: every recorded candidate of the split's export requests, for the labelled AUC/nDCG diagnostics. Sampled scopes write it under `sampled_requests/`.
-- `model/`:
-  - `model_state.pt` (state_dict)
-  - `model_config.json`
-  - `preprocessing.json`
-  - `feature_dictionary.json` (ordered input names, category/topic index mappings and interpretation notes)
-  - `catalogue_policy.json`
-  - `mappings.npz`
-  - `code/` (bundled modules)
-  - `recovery/last_checkpoint.pt`
+Other evidence includes `tuning/{study.db,trials.csv,summary.json}` and trial
+histories; `selection/{declaration.json,validation_requests.parquet}`;
+`model_training/` with selected/recovery checkpoints and training history;
+`training_history.{json,csv}`; `catalogue/{split}.json`; `metrics.json`;
+`run_config.json`; `export_manifest.json`; exact run `requirements.txt`;
+`manifest.json`; and `reload_check.json`. Input path/size/mtime and the catalogue-ID
+fingerprint are recorded; source helpers are bundled, with Git provenance when
+available. Generated run artifacts stay outside Git.
 
-Reload uses the saved preprocessing and original article mappings, never refits
-them, and checks the feature dictionary as well as predictions. This preserves
-feature meaning after loading; vector coordinates are not word-level coefficients.
-When Optuna is enabled, its selected parameters are applied before main training.
-- `metrics.json`, `run_config.json`, `export_manifest.json`, `catalogue_feasibility.json`, `training_history.{json,csv}`, `requirements.txt`, `reload_check.json`, `resume_check.json`, `manifest.json`
-- `ablations/<variant>/`: `summary.json` and `validation_per_impression.npz` (per-request Recall@100 and nDCG@100 on the selection sample, and diagnostic per-impression AUC), plus a `COMPLETE.json` marker that is written last and holds both files' hashes.
-- `selection/`: `validation_requests.csv` (selection requests), `train_requests.csv` (training requests, when sampled) and `{split}_export_requests.csv`.
-- `logs/notebook_log.txt`
-- `review_<run_id>.zip`
+The notebook checks score/ranking consistency, all request IDs/counts and
+persistent file coverage/sizes. It then reloads the helpers, weights, frozen
+article inputs, mappings and fitted transformations from the saved copy and
+compares a small reconstructed batch with the original model at absolute logit
+tolerance `1e-4`, without refitting or retraining. New requests still require the
+documented pre-request context and fixed-history inputs.
 
-## Catalogue scale
+## Handoff and later evaluation
 
-The union pool is larger than the earlier per-split pools. A train or validation request now sees nearly the whole union, because most test-snapshot articles were published before the validation period. Section 4 prints exact eligible-pair counts for the selected requests, and Section 7 prints them for every request in each split, with the measured CSV size.
+The reranking owner receives all splits' genuine top-200 scores/rankings,
+complete recorded-slate diagnostics and the model/run bundle. Join labels by
+original IDs; preserve Stage 1 ranks/scores during business reranking to five.
+Observed-click recovery is affected by exposure bias and catalogue coverage and
+does not establish unseen-article CTR, retention or profit.
 
-As a rough guide:
-
-- A full train export is on the order of 230k requests × 10⁵ articles, about 10¹⁰ pairs.
-- Validation and test are each on the order of 10⁹ pairs.
-- The `aligned_dev` scope is about 10⁷ pairs: 25 export requests per split, plus 100 selection requests per epoch.
-
-- **Scoring the development scopes is cheap on a GPU; a full run must be timed first.** Each request's eligible articles form one contiguous slice of the union sorted by publication time. Article encodings and user LSTM states are computed once, and pairs are scored in chunks.
-- **Storing every score as CSV is not feasible** at about 64 bytes per row, hundreds of GB. Section 7 therefore:
-  1. counts the pairs exactly;
-  2. measures the CSV row size and the scoring speed;
-  3. checks free disk space;
-  4. skips scoring in that session if the estimated time exceeds `MAX_CATALOGUE_HOURS`. The run is still recorded, and the remaining splits can be scored later with `RESUME_RUN_ID` and a smaller `CATALOGUE_SPLITS`. Each finished split writes `catalogue/{split}.json` last, so a resumed run reuses finished splits.
-- **Text-vector coverage is low for the union.** The test snapshot alone has 125,541 articles, but only about 21,000 of the union's articles have text vectors. These articles are kept, with missingness flags, and training hides 20% of candidate text vectors so the model learns to score without them. Section 4 reports pair-weighted coverage, and Section 7 reports the text-vector share inside the shortlists.
-- **The shared policy has no age limit.** An age limit would be a different, separately named policy, and the code rejects one.
-
-Optuna, when enabled, writes `OUTPUT_ROOT/Experiments/2.1_lstm/tuning/<study>/` containing a SQLite snapshot and `trials.csv`.
-
-Validation metrics are **development** results, because validation is used for early stopping and selection. Test labels are unavailable, so no test metric is produced.
+The planned later evaluation notebook described in [the shared experiment
+README](../README.md) will load saved artifacts without retraining and compare
+models on identical validation requests/pools. Learning curves, Optuna plots,
+ablations, history/coverage subgroups, meaningful feature/history explanations and
+Stage 2 trade-offs belong there. Attention weights alone are not causal
+explanations. No SHAP or evaluation notebook is created in this update.

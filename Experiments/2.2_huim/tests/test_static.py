@@ -244,47 +244,53 @@ class TestModel(unittest.TestCase):
         rec_logits = self.logits(model, self.ctx)
         with tempfile.TemporaryDirectory() as tmp:
             clicks = C.click_eligibility(self.ctx, self.art)
-            prog = C.export_split(scorer, Path(tmp), positions, write_full_scores=True, click_info=clicks,
-                                  recorded_counts=None, request_block=5, checkpoint_every_blocks=1, log=lambda *_: None)
+            prog = C.export_split(scorer, Path(tmp), positions, click_info=clicks,
+                                  recorded_counts=None, request_block=5, log=lambda *_: None)
             self.assertTrue(prog["finished"])
-            res = validate_export(self.ctx, self.art, Path(tmp), positions, full_scores=True, check_blocks=None,
-                                  recorded_logits=rec_logits, score_tolerance=1e-4)
+            res = validate_export(self.ctx, self.art, Path(tmp), positions)
             self.assertTrue(res["passed"], res["errors"])
-            self.assertIsNotNone(res["checks"]["recorded_vs_catalogue_max_abs_logit_diff"])
-            ranks = pd.read_csv(Path(tmp) / "rankings/validation/submission_top_100.csv", dtype={"behaviour_id": str})
-            first = json.loads(ranks.article_ids.iloc[0])
+            self.assertTrue(res["checks"]["all_retained_pairs_checked"])
+            ranks = pd.read_parquet(Path(tmp) / "rankings/validation/submission_top_200.parquet")
+            first = ranks.article_ids.iloc[0].tolist()
             self.assertTrue(all(isinstance(a, int) for a in first))
-            path = Path(tmp) / "rec.csv"
+            path = Path(tmp) / "rec.parquet"
             C.write_recorded_slate_scores(path, self.ctx, rec_logits)
             self.assertTrue(validate_recorded(path, self.ctx)["passed"])
 
-    def test_resumed_export_identical(self):
-        model = make_model(self.pre, self.art)
-        scorer = C.CatalogueScorer(model, self.ctx, self.art, torch.device("cpu"), pair_chunk=64)
-        positions = np.arange(len(self.ctx.requests))
-        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
-            C.export_split(scorer, Path(a), positions, write_full_scores=True, click_info=None, recorded_counts=None,
-                           request_block=3, checkpoint_every_blocks=1, log=lambda *_: None)
-            p1 = C.export_split(scorer, Path(b), positions, write_full_scores=True, click_info=None, recorded_counts=None,
-                                request_block=3, checkpoint_every_blocks=1, log=lambda *_: None, max_blocks=2)
-            self.assertFalse(p1["finished"])
-            # simulate a crash after more bytes were written than the last checkpoint recorded
-            with open(Path(b) / "predictions/validation/submission_click_probabilities.csv", "ab") as h:
-                h.write(b"garbage,1,2,3\n")
-            C.export_split(scorer, Path(b), positions, write_full_scores=True, click_info=None, recorded_counts=None,
-                           request_block=3, checkpoint_every_blocks=1, log=lambda *_: None)
-            for rel in ("predictions/validation/submission_click_probabilities.csv",
-                        "rankings/validation/submission_top_100.csv"):
-                self.assertEqual((Path(a) / rel).read_bytes(), (Path(b) / rel).read_bytes())
-            # a file SHORTER than the recorded progress must not be zero-padded
-            prog = Path(b) / "diagnostics/catalogue/validation_export_progress.json"
-            state = json.loads(prog.read_text())
-            state["finished"] = False
-            prog.write_text(json.dumps(state))
-            (Path(b) / "rankings/validation/submission_top_100.csv").write_bytes(b"x")
-            with self.assertRaises(RuntimeError):
-                C.export_split(scorer, Path(b), positions, write_full_scores=True, click_info=None,
-                               recorded_counts=None, request_block=3, checkpoint_every_blocks=1, log=lambda *_: None)
+    def test_chunked_top200_matches_full_reference(self):
+        # More than 200 eligible articles, tied scores across pair chunks, an
+        # empty pool, and a click that must never be injected into the shortlist.
+        articles, beh, events, pairs, pre, art, ctx = synthetic_world(seed=5, n_articles=360)
+        model = make_model(pre, art)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+        ctx.tensors["req_s"][0] = art.tensors["pub_s"][art.tensors["pub_s"] != F.NO_PUB].min() - 1
+        ctx.requests.loc[0, "impression_time"] = pd.to_datetime(int(ctx.tensors["req_s"][0]), unit="s")
+        positions = np.arange(len(ctx.requests))
+        scorer = C.CatalogueScorer(model, ctx, art, torch.device("cpu"), pair_chunk=101)
+        logits = scorer.logits(positions)
+        eligible = scorer.eligible_mask(positions)
+        top = scorer.topk(positions, k=C.EXPORT_K)
+        cat_ids = art.ids[ctx.catalogue_idx]
+        self.assertEqual((C.SELECTION_K, C.EXPORT_K), (100, 200))
+        for j in range(len(positions)):
+            got = cat_ids[top["positions"][j, :int(top["lengths"][j])].numpy()].tolist()
+            expected = cat_ids[eligible[j].numpy()][:200].tolist()
+            self.assertEqual(got, expected)  # all scores tied: ascending original ID
+        with tempfile.TemporaryDirectory() as tmp:
+            C.export_split(scorer, Path(tmp), positions, click_info=C.click_eligibility(ctx, art),
+                           recorded_counts=None, request_block=3, log=lambda *_: None)
+            check = validate_export(ctx, art, Path(tmp), positions)
+            self.assertTrue(check["passed"], check)
+            ranks = pd.read_parquet(Path(tmp) / "rankings/validation/submission_top_200.parquet")
+            manifest = pd.read_parquet(Path(tmp) / "diagnostics/catalogue/validation_requests.parquet")
+            self.assertEqual(len(ranks), len(positions))
+            self.assertTrue(any(len(ids) == 200 for ids in ranks.article_ids))
+            self.assertTrue(any(len(ids) == 0 for ids in ranks.article_ids))
+            for k in (100, 200):
+                metrics = recall_summary(manifest, k=k)
+                self.assertIn(f"known_click_recall@{k}", metrics)
 
     def test_pair_features_match_definitions(self):
         raw = F.pair_dense(self.ctx.tensors, self.art.tensors, torch.from_numpy(self.ctx.recorded["req_pos"]),
@@ -403,27 +409,17 @@ class TestPipelineSynthetic(unittest.TestCase):
             self.assertTrue(all(r["validation"]["passed"] for r in recorded.values()))
             sets = {s: np.arange(len(ctx[s].requests)) for s in ctx}
             dev_root = run / "dev_sample"
-            res = P.export_catalogue(model, ws, cfg, dev_root, dev, sets, {s: True for s in ctx}, logits,
-                                     log=lambda *_: None)
+            res = P.export_catalogue(model, ws, cfg, run, dev, sets, log=lambda *_: None)
             for s, r in res.items():
                 self.assertTrue(r["validation"]["passed"], (s, r["validation"]["errors"]))
             self.assertIn("recall", res["validation"]["summary"])
             self.assertNotIn("recall", res["test"]["summary"])
-            short = P.export_catalogue(model, ws, cfg, run, dev, {"validation": sets["validation"]},
-                                       {"validation": False}, logits, log=lambda *_: None)
-            chk = short["validation"]["validation"]["checks"]["recomputed_shortlist_check"]
-            self.assertTrue(chk["passed"] and chk["requests_checked"] > 0, chk)
-            self.assertFalse((run / "predictions/validation/submission_click_probabilities.csv").exists())
-            atomic_write_json(dev_root / "dev_sample_requests.json", {s: v.tolist() for s, v in sets.items()})
+            self.assertTrue((run / "predictions/validation/submission_article_scores.parquet").is_file())
             atomic_torch_save({k: v.cpu() for k, v in model.state_dict().items()}, run / "model" / "weights.pt")
             save_model_files(run, model, model.cfg, pre, art, {"selected_epoch": 0})
             for name in ("run_config.json", "metrics.json", "export_manifest.json"):
                 atomic_write_json(run / name, {"synthetic": True})
             (run / "requirements.txt").write_text("torch\n")
-            gate = P.full_score_gate({s: {"planned_export": {"full_scores_csv_bytes_estimate": 500}} for s in ctx},
-                                     dict(cfg, full_score_splits=["validation"]), [run])
-            self.assertTrue(gate["validation"]["write"])
-            self.assertFalse(gate["train"]["write"])
             P.persist_run(run, persist, log=lambda *_: None)
             self.assertFalse(P.run_is_complete(persist))  # no marker before the reload check
             reload = P.reload_check(persist, ws, cfg, dev, n_requests=2)
@@ -715,10 +711,9 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(out["requests_evaluated"], 6)
         scorer = C.CatalogueScorer(model, self.ctx, self.art, torch.device("cpu"), pair_chunk=64)
         with tempfile.TemporaryDirectory() as tmp:
-            C.export_split(scorer, Path(tmp), pos, write_full_scores=False,
-                           click_info=C.click_eligibility(self.ctx, self.art), recorded_counts=None,
+            C.export_split(scorer, Path(tmp), pos, click_info=C.click_eligibility(self.ctx, self.art), recorded_counts=None,
                            request_block=4, log=lambda *_: None)
-            man = pd.read_csv(Path(tmp) / "diagnostics/catalogue/validation_requests.csv")
+            man = pd.read_parquet(Path(tmp) / "diagnostics/catalogue/validation_requests.parquet")
         summ = recall_summary(man)
         self.assertAlmostEqual(out["known_click_recall@100"], summ["known_click_recall@100"], places=12)
         self.assertAlmostEqual(out["observed_click_ndcg@100"], summ["observed_click_ndcg@100"], places=9)

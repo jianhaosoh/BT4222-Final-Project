@@ -1,9 +1,8 @@
-# 2.2_huim — the Colab defaults already provide these; the notebook checks minimum
-# versions before importing helpers and does not upgrade the environment.
+# Final Colab training/export and saved-model loading dependencies.
 numpy>=1.24
 pandas>=2.0
 pyarrow>=14.0
 torch>=2.3
-matplotlib>=3.7
-# Optional, only when RUN_TUNING = True (installed by the notebook on demand):
-# optuna>=3.6,<5
+optuna>=3.6,<5
+duckdb>=1.0
+# Optional additional vector decoder fallback: polars>=1.0

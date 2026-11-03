@@ -23,6 +23,11 @@ METRIC_DEFINITIONS = {
                               "metric belongs to Stage 2's final five; it is not a Stage 1 objective.",
 }
 
+for _name in ("known_click_recall", "observed_click_ndcg", "eligible_only_recall"):
+    METRIC_DEFINITIONS[f"{_name}@200"] = METRIC_DEFINITIONS[f"{_name}@100"].replace("100", "200").replace(
+        "PRIMARY (Stage 1 selection)", "EXPORT diagnostic (selection remains Recall@100)").replace(
+        "SECONDARY.", "EXPORT diagnostic (selection tie-break remains nDCG@100).")
+
 
 def request_retrieval(ranked_ids, clicked_ids, k: int = 100) -> tuple[int, int, float, float]:
     """(n_known_clicks, n_in_top_k, DCG@k, ideal DCG@k) for one request.
@@ -100,23 +105,24 @@ def recall_summary(manifest: pd.DataFrame, k: int = 100) -> dict:
            "requests_without_known_clicks": int(len(manifest) - len(m))}
     if not len(m):
         return out
-    recall = m.n_clicked_in_shortlist / m.n_clicked
-    ndcg = np.where(m.ideal_dcg_at_100 > 0, m.observed_dcg_at_100 / m.ideal_dcg_at_100, 0.0)
+    hits = m[f"n_clicked_in_top_{k}"] if f"n_clicked_in_top_{k}" in m else m.n_clicked_in_shortlist
+    recall = hits / m.n_clicked
+    ndcg = np.where(m[f"ideal_dcg_at_{k}"] > 0, m[f"observed_dcg_at_{k}"] / m[f"ideal_dcg_at_{k}"], 0.0)
     el = m[m.n_clicked_eligible > 0]
     out.update({
         f"known_click_recall@{k}": float(recall.mean()),
         f"observed_click_ndcg@{k}": float(np.mean(ndcg)),
-        f"eligible_only_recall@{k}": float((el.n_clicked_in_shortlist / el.n_clicked_eligible).mean()) if len(el) else None,
+        f"eligible_only_recall@{k}": float(((el[f"n_clicked_in_top_{k}"] if f"n_clicked_in_top_{k}" in el else el.n_clicked_in_shortlist) / el.n_clicked_eligible).mean()) if len(el) else None,
         "requests_with_no_eligible_click": int((m.n_clicked_eligible == 0).sum()),
         "empty_pool_requests_with_known_clicks": int((m.eligible_count == 0).sum()),
-        "requests_with_ties_crossing_cutoff": int(m.tie_crosses_cutoff.sum()),
+        "requests_with_ties_crossing_cutoff": int((m[f"tie_crosses_cutoff_{k}"] if f"tie_crosses_cutoff_{k}" in m else m.tie_crosses_cutoff).sum()),
         "clicked_articles_total": int(m.n_clicked.sum()),
         "clicked_articles_eligible": int(m.n_clicked_eligible.sum()),
         "clicked_excluded_not_in_catalogue": int(m.n_clicked_not_in_catalogue.sum()),
         "clicked_excluded_missing_published_time": int(m.n_clicked_missing_pub.sum()),
         "clicked_excluded_published_after_request": int(m.n_clicked_future.sum()),
         "eligibility_coverage_of_clicks": float(m.n_clicked_eligible.sum() / m.n_clicked.sum()),
-        "clicked_articles_in_shortlist": int(m.n_clicked_in_shortlist.sum()),
+        "clicked_articles_in_shortlist": int(hits.sum()),
     })
     return out
 

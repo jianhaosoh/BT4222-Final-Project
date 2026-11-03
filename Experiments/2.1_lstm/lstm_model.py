@@ -580,6 +580,8 @@ def train_model(model, train: SplitTensors, select_fn, selection: dict,
         batches = list(impression_batches(n, cfg.batch_impressions, True, generator))
         if limit:
             batches = batches[: max(1, math.ceil(limit / cfg.batch_impressions))]
+            if batches:
+                batches[-1] = batches[-1][:min(limit, n) - sum(len(b) for b in batches[:-1])]
         for step, imp in enumerate(batches, start=1):
             batch = train.batch(imp, cfg.history_dropout, device_gen)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
@@ -740,7 +742,10 @@ class CatalogueScorer:
                                               data.hist_len[rows])
                     states.append(st)
                     keys.append(model.key(st))
-            self.states, self.keys = torch.cat(states), torch.cat(keys)
+            if states:
+                self.states, self.keys = torch.cat(states), torch.cat(keys)
+            else:
+                self.precomputed = False
 
     def _user(self, u: int):
         slot = int(self.user_slot[u]) if self.precomputed else -1
@@ -753,13 +758,11 @@ class CatalogueScorer:
             return st, self.model.key(st)
 
     @torch.no_grad()
-    def score_request(self, i: int):
-        """(article_ids, logits) for every eligible article of request i, in the
-        snapshot's (publication time, article ID) order."""
+    def iter_score_chunks(self, i: int):
+        """Yield all eligible IDs/logits in bounded chunks, with no label inputs."""
         lo, hi = int(self.lo[i]), int(self.hi[i])
         if hi <= lo:
-            empty = torch.zeros(0, device=self.device)
-            return empty.long(), empty
+            return
         d = self.data
         u = int(d.imp_user_row[i])
         length = int(d.hist_len[u])
@@ -768,16 +771,43 @@ class CatalogueScorer:
         gap_h = (t - d.hist_time[u, :max(length, 1)]).double() / 3600.0
         gap_z = ((torch.log1p(gap_h.clamp(min=0)) - self.model.cfg.gap_mean)
                  / self.model.cfg.gap_std).float()
-        out = torch.empty(hi - lo, dtype=torch.float32, device=self.device)
-        for s in range(lo, hi, self.chunk):
-            e = min(s + self.chunk, hi)
-            age_h = (t - self.pub[s:e]).double() / 3600.0
+        for start in range(lo, hi, self.chunk):
+            end = min(start + self.chunk, hi)
+            age_h = (t - self.pub[start:end]).double() / 3600.0
             log_age = ((torch.log1p(age_h.clamp(min=0)) - self.age_mean) / self.age_std).float()
             cand_feats = torch.stack([log_age, torch.zeros_like(log_age)], dim=1)
-            out[s - lo:e - lo] = self.model.score_one_request(
-                self.enc[s:e], self.q[s:e], states_u, keys_u, length, gap_z,
+            logits = self.model.score_one_request(
+                self.enc[start:end], self.q[start:end], states_u, keys_u, length, gap_z,
                 cand_feats, d.imp_ctx[i])
-        return self.ids[lo:hi], out
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError(f"request {i}: nonfinite catalogue logits")
+            yield self.ids[start:end], logits
+
+    @torch.no_grad()
+    def topk(self, i: int, k: int):
+        """Running exact top-K; retain K+1 only to detect cutoff ties.
+
+        Ties use ascending original article ID, both within and across chunks.
+        No slate/clicked articles are inserted. Memory is O(chunk + K) scores.
+        """
+        ids = torch.empty(0, dtype=torch.long, device=self.device)
+        logits = torch.empty(0, dtype=torch.float32, device=self.device)
+        for chunk_ids, chunk_logits in self.iter_score_chunks(i):
+            ids, logits = select_top_k(torch.cat([logits, chunk_logits]),
+                                      torch.cat([ids, chunk_ids]), k + 1)
+        self.last_ties = {cut: bool(len(logits) > cut and logits[cut - 1] == logits[cut])
+                          for cut in set((100, k))}
+        self.last_tie_at_cutoff = self.last_ties[k]
+        return ids[:k], logits[:k]
+
+    @torch.no_grad()
+    def score_request(self, i: int):
+        """Full scores for a single small consistency check; not an export path."""
+        chunks = list(self.iter_score_chunks(i))
+        if not chunks:
+            empty = torch.empty(0, device=self.device)
+            return empty.long(), empty
+        return torch.cat([c[0] for c in chunks]), torch.cat([c[1] for c in chunks])
 
     def shortlist(self, i: int, k: int):
         """Exact top-k plus ``self.last_tie_at_cutoff``: whether an article outside
@@ -795,7 +825,7 @@ def catalogue_shortlists(scorer: CatalogueScorer, requests, k: int) -> tuple[dic
     """Exact full-pool top-k for each request index; returns ({i: ids}, ties at cutoff)."""
     out, ties = {}, 0
     for i in requests:
-        top_ids, _, _, _ = scorer.shortlist(int(i), k)
+        top_ids, _ = scorer.topk(int(i), k)
         out[int(i)] = top_ids.cpu().numpy()
         ties += int(scorer.last_tie_at_cutoff)
     return out, ties

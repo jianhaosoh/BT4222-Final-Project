@@ -181,7 +181,7 @@ def package_versions(names: Iterable[str]) -> dict:
 
 
 def environment_info(extra_packages: Iterable[str] = ()) -> dict:
-    names = ["numpy", "pandas", "pyarrow", "torch", "scikit-learn", "matplotlib", "optuna", *extra_packages]
+    names = ["numpy", "pandas", "pyarrow", "torch", "scikit-learn", "matplotlib", "optuna", "duckdb", "polars", *extra_packages]
     info = {"python": sys.version, "platform": platform.platform(), "packages": package_versions(names)}
     try:
         import torch

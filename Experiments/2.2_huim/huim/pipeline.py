@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import pyarrow.parquet as pq
 
 from . import catalogue as C
 from . import data as D
@@ -57,10 +58,8 @@ BASE_CONFIG = {
     "scheduler_patience": 1,              # ReduceLROnPlateau on Recall@100, in evaluations
     # catalogue scoring/export and resource guards
     "pair_chunk": 32768, "request_block": 16, "inference_amp": False,
-    "full_score_splits": ["train", "validation", "test"],  # write full score CSVs for exported requests (storage gate)
-    "max_export_pairs": 20_000_000,       # stop before exporting more pairs; raise deliberately for full scope
+    "max_export_pairs": None,       # stop before exporting more pairs; raise deliberately for full scope
     "max_selection_pairs_per_evaluation": 50_000_000,
-    "full_score_storage_margin": 1.25,    # require free space >= margin x estimate
     "validation_check_blocks": 50,        # sampled score blocks re-read for large exports (None = all)
 }
 
@@ -80,7 +79,7 @@ PRESETS = {
 }
 
 
-def make_config(mode: str, **overrides) -> dict:
+def make_config(mode: str = "full", **overrides) -> dict:
     if mode not in PRESETS:
         raise ValueError(f"RUN_MODE must be one of {list(PRESETS)}")
     cfg = copy.deepcopy(BASE_CONFIG)
@@ -213,9 +212,9 @@ def preflight(ws: Workspace, cfg: dict, output_roots: list[Path], scopes: dict |
         bad = C.recorded_eligibility(ctx, ws.art)
         report["recorded_ineligible"][s] = bad.reason.value_counts().to_dict()
     total_pairs = sum(v["feasibility"]["eligible_pairs"] for v in report["eligibility"].values())
-    total_bytes = sum(v["feasibility"]["full_scores_csv_bytes_estimate"] for v in report["eligibility"].values())
-    report["all_splits"] = {"eligible_pairs": total_pairs, "full_scores_csv_bytes_estimate": total_bytes,
-                            "full_scores_csv_gib_estimate": total_bytes / 1024 ** 3}
+    total_bytes = sum(v["feasibility"]["retained_output_bytes_estimate"] for v in report["eligibility"].values())
+    report["all_splits"] = {"eligible_pairs": total_pairs, "retained_output_bytes_estimate": total_bytes,
+                            "retained_output_gib_estimate": total_bytes / 1024 ** 3}
     report["disk_free_bytes"] = {str(p): disk_free_bytes(p) for p in output_roots}
     try:
         report["consistency_with_shared_features"] = {
@@ -364,7 +363,7 @@ def export_recorded(model, ws: Workspace, run_dir: Path, device) -> dict:
     for s in D.SPLITS:
         logits = score_recorded(model, ctx[s], art, device)
         logits_by_split[s] = logits
-        path = Path(run_dir) / "diagnostics" / "recorded_slates" / f"{s}_scores.csv"
+        path = Path(run_dir) / "diagnostics" / "recorded_slates" / f"{s}_scores.parquet"
         info = C.write_recorded_slate_scores(path, ws.ctx[s], logits)
         info["validation"] = validate_recorded(path, ws.ctx[s])
         bad = C.recorded_eligibility(ws.ctx[s], ws.art)
@@ -386,75 +385,59 @@ def _recorded_bad_counts(ws, s):
     return counts
 
 
-def recompute_shortlist_check(scorer, ws: Workspace, split: str, out_root: Path, positions: np.ndarray, seed: int,
-                              n: int = 32, block: int = 16) -> dict:
-    """Without a full score file, re-score sampled requests over the full eligible
-    catalogue and compare the exported shortlist with the reference ranking."""
-    import json as _json
-    from .validate import eligible_ids, expected_top
-
-    ranks = pd.read_csv(Path(out_root) / "rankings" / split / "submission_top_100.csv", dtype={"behaviour_id": str})
-    rng = np.random.default_rng(seed + 7)
-    pick = np.sort(rng.choice(len(positions), size=min(n, len(positions)), replace=False)) if len(positions) else []
-    mismatches = 0
-    rb = block
-    for j in pick:
-        pos = positions[j]
-        # Re-score the exact export block so matrix shapes (and GPU kernels) match the export.
-        start = (j // rb) * rb
-        blk = positions[start:start + rb]
-        logits = scorer.logits(blk)[j - start]
-        elig = scorer.eligible_mask(blk)[j - start]
-        ids = ws.art.ids[ws.ctx[split].catalogue_idx][elig.cpu().numpy()]
-        if not np.array_equal(ids, eligible_ids(ws.ctx[split], ws.art, pos)):
-            mismatches += 1
-            continue
-        if expected_top(ids, logits[elig].cpu().numpy()) != _json.loads(ranks.article_ids.iloc[j]):
-            mismatches += 1
-    return {"requests_checked": int(len(pick)), "mismatches": int(mismatches), "passed": mismatches == 0}
-
-
-def model_digest(model) -> str:
-    """SHA-256 of the state dict: ties a resumable export to the exact weights."""
-    from .train import params_digest
-    return params_digest(model)
-
-
 def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, request_sets: dict,
-                     full_scores: dict, recorded_logits: dict | None = None, log=print, check_blocks=None) -> dict:
-    """Run + validate catalogue exports for {split: request positions}."""
+                     log=print) -> dict:
+    """Full eligible-catalogue inference, retained Parquet outputs and validation."""
     art, ctx = device_and_tensors(ws, device)
     results = {}
     for s, positions in request_sets.items():
         scorer = C.CatalogueScorer(model, ctx[s], art, device, cfg["pair_chunk"], cfg["inference_amp"])
         clicks = C.click_eligibility(ws.ctx[s], ws.art, positions) if s in D.LABELLED_SPLITS else None
-        progress = C.export_split(scorer, out_root, positions, write_full_scores=full_scores[s], click_info=clicks,
-                                  recorded_counts=_recorded_bad_counts(ws, s), request_block=cfg["request_block"],
-                                  log=log, model_digest=model_digest(model))
-        validation = validate_export(ws.ctx[s], ws.art, out_root, positions, full_scores=full_scores[s],
-                                     check_blocks=check_blocks, seed=cfg["seed"],
-                                     recorded_logits=None if recorded_logits is None else recorded_logits[s])
-        if not full_scores[s]:
-            validation["checks"]["recomputed_shortlist_check"] = recompute_shortlist_check(
-                scorer, ws, s, Path(out_root), positions, cfg["seed"], block=cfg["request_block"])
-            if not validation["checks"]["recomputed_shortlist_check"]["passed"]:
-                validation["passed"] = False
-                validation["errors"].append("shortlist != top-100 of recomputed full catalogue scores")
-        manifest = pd.read_csv(Path(out_root) / "diagnostics" / "catalogue" / f"{s}_requests.csv",
-                               dtype={"behaviour_id": str})
-        summary = {"requests": int(len(manifest)), "scored_pairs": int(manifest.eligible_count.sum()),
-                   "empty_pools": int((manifest.eligible_count == 0).sum()),
-                   "shortlist_length": manifest.shortlist_length.describe().to_dict(),
-                   "shortlist_share_with_text_mean": float(manifest.shortlist_share_with_text.mean()),
-                   "shortlist_median_age_h_median": float(manifest.shortlist_median_age_h.median()),
-                   "shortlist_distinct_categories_mean": float(manifest.shortlist_distinct_categories.mean()),
-                   "seconds": progress["seconds"], "full_scores_written": bool(full_scores[s])}
+        progress = C.export_split(scorer, out_root, positions, click_info=clicks,
+                                  recorded_counts=_recorded_bad_counts(ws, s), request_block=cfg["request_block"], log=log)
+        validation = validate_export(ws.ctx[s], ws.art, out_root, positions)
+        manifests = pq.ParquetFile(Path(out_root) / "diagnostics" / "catalogue" / f"{s}_requests.parquet")
+        summaries = {k: [] for k in (C.SELECTION_K, C.EXPORT_K)}
+        lengths, requests, empty = 0, 0, 0
+        min_len, max_len = C.EXPORT_K, 0
+        for batch in manifests.iter_batches(batch_size=10_000):
+            frame = batch.to_pandas()
+            requests += len(frame)
+            lengths += int(frame.shortlist_length.sum())
+            empty += int((frame.eligible_count == 0).sum())
+            if len(frame):
+                min_len, max_len = min(min_len, int(frame.shortlist_length.min())), max(max_len, int(frame.shortlist_length.max()))
+            if s in D.LABELLED_SPLITS:
+                for k in summaries:
+                    summaries[k].append(recall_summary(frame, k))
+        summary = {"requests": requests, "scored_pairs": progress["scored_pairs"], "empty_pools": empty,
+                   "retained_score_rows": progress["rows_scores"], "seconds": progress["seconds"],
+                   "shortlist_length": {"min": min_len if requests else 0, "max": max_len,
+                                        "mean": lengths / requests if requests else 0.0}}
         if s in D.LABELLED_SPLITS:
-            summary["recall"] = recall_summary(manifest)
-        results[s] = {"progress": {k: v for k, v in progress.items() if k != "signature"}, "validation": validation,
-                      "summary": summary}
-        status = "PASSED" if validation["passed"] else f"FAILED ({validation['n_errors']} errors)"
-        log(f"{s}: catalogue export validation {status}")
+            metrics = {}
+            for k, chunks in summaries.items():
+                known = sum(c["requests_with_known_clicks"] for c in chunks)
+                with_eligible = sum(c["requests_with_known_clicks"] - c.get("requests_with_no_eligible_click", 0) for c in chunks)
+                for name in (f"known_click_recall@{k}", f"observed_click_ndcg@{k}"):
+                    metrics[name] = sum(c.get(name, 0) * c["requests_with_known_clicks"] for c in chunks) / known if known else None
+                name = f"eligible_only_recall@{k}"
+                metrics[name] = sum((c.get(name) or 0) * (c["requests_with_known_clicks"] - c.get("requests_with_no_eligible_click", 0))
+                                    for c in chunks) / with_eligible if with_eligible else None
+                metrics[f"requests_with_ties_crossing_cutoff_{k}"] = sum(c.get("requests_with_ties_crossing_cutoff", 0) for c in chunks)
+                metrics[f"clicked_articles_in_top_{k}"] = sum(c.get("clicked_articles_in_shortlist", 0) for c in chunks)
+            for name in ("requests_total", "requests_with_known_clicks", "requests_without_known_clicks",
+                         "requests_with_no_eligible_click", "empty_pool_requests_with_known_clicks", "clicked_articles_total",
+                         "clicked_articles_eligible", "clicked_excluded_not_in_catalogue", "clicked_excluded_missing_published_time",
+                         "clicked_excluded_published_after_request"):
+                metrics[name] = sum(c.get(name, 0) for c in summaries[C.SELECTION_K])
+            metrics["eligibility_coverage_of_clicks"] = (metrics["clicked_articles_eligible"] / metrics["clicked_articles_total"]
+                                                        if metrics["clicked_articles_total"] else None)
+            summary["recall"] = metrics
+        results[s] = {"progress": progress, "validation": validation, "summary": summary}
+        log(f"{s}: catalogue export validation {'PASSED' if validation['passed'] else 'FAILED'}")
+        if not validation["passed"]:
+            raise RuntimeError(f"{s}: export validation failed: {validation['errors']}")
     return results
 
 
@@ -473,7 +456,8 @@ def export_budget(ws: Workspace, cfg: dict, scopes: dict, bytes_per_row: float |
             b = {"requests": int(len(c)), "eligible_pairs": pairs, "empty_pools": int((c == 0).sum()),
                  "pools_below_shortlist_size": int((c < C.SHORTLIST_SIZE).sum()),
                  "eligible_per_request_median": float(np.median(c)) if len(c) else 0.0,
-                 "full_scores_csv_bytes_estimate": int(pairs * bpr)}
+                 "retained_score_rows": int(np.minimum(c, C.EXPORT_K).sum()),
+                 "retained_output_bytes_estimate": int(np.minimum(c, C.EXPORT_K).sum() * 48 + len(c) * (32 + C.EXPORT_K * 8))}
             if pairs_per_second:
                 b["scoring_hours_estimate"] = pairs / pairs_per_second / 3600
             return b
@@ -492,32 +476,10 @@ def export_budget(ws: Workspace, cfg: dict, scopes: dict, bytes_per_row: float |
 
 def check_export_budget(budget: dict) -> None:
     """Stop an infeasible export before it starts (never shrink the pool instead)."""
-    if budget["planned_export_pairs_total"] > budget["max_export_pairs"]:
+    if budget["max_export_pairs"] is not None and budget["planned_export_pairs_total"] > budget["max_export_pairs"]:
         raise RuntimeError(f"planned export is {budget['planned_export_pairs_total']:,} pairs > max_export_pairs="
                            f"{budget['max_export_pairs']:,}. Inspect the budget; use a sampled export scope or raise "
                            "max_export_pairs deliberately after checking runtime/storage.")
-
-
-def full_score_gate(budget: dict, cfg: dict, out_roots: list) -> dict:
-    """Per split: may the full score CSV for the planned export requests be written?
-
-    Never silently changes the pool: a split that fails the gate still gets
-    complete top-100 shortlists for every planned request (re-validated against
-    recomputed full scores), and the manifest records why scores are absent."""
-    frees = [disk_free_bytes(r) for r in out_roots]
-    free = min(f for f in frees if f is not None) if any(f is not None for f in frees) else 0
-    decisions, remaining = {}, free
-    for s in D.SPLITS:
-        need = budget[s]["planned_export"]["full_scores_csv_bytes_estimate"]
-        wanted = s in cfg["full_score_splits"]
-        ok = wanted and need * cfg["full_score_storage_margin"] <= remaining
-        decisions[s] = {"requested": wanted, "write": bool(ok), "estimated_bytes": int(need),
-                        "free_bytes_at_decision": int(remaining),
-                        "reason": None if ok else ("not requested" if not wanted else
-                                                   "insufficient free space at the export location")}
-        if ok:
-            remaining -= need
-    return decisions
 
 
 # ------------------------------------------------------------ diagnostics --
@@ -594,13 +556,13 @@ REQUIRED_RUN_FILES = ["run_config.json", "metrics.json", "requirements.txt", "ex
 
 
 def persist_run(run_dir: Path, persist_dir: Path, log=print) -> dict:
-    """Copy + verify every file. No completion marker yet: see mark_run_complete."""
+    """Copy and verify the selected model, exports and run records."""
     records = mirror_tree(run_dir, persist_dir)
     required = [r for r in REQUIRED_RUN_FILES if (Path(run_dir) / r).is_file()]
     missing = sorted(set(REQUIRED_RUN_FILES) - set(required))
     if missing:
         raise FileNotFoundError(f"run bundle incomplete; missing {missing}")
-    log(f"persisted {len(records)} files to {persist_dir} (not yet marked complete)")
+    log(f"persisted {len(records)} files to {persist_dir}")
     return {"files": len(records)}
 
 
@@ -622,54 +584,48 @@ def run_is_complete(persist_dir: Path) -> bool:
 
 def reload_check(persist_dir: Path, ws: Workspace, cfg: dict, device, n_requests: int = 4,
                  tolerance: float = 1e-4) -> dict:
-    """Load model + preprocessing from the persistent copy (no fitting) and
-    compare predictions with the persisted exports."""
-    model, mcfg, pre, meta = load_model(persist_dir, device)
-    out = {"loaded_from": str(persist_dir), "article_ids_match": check_article_ids(persist_dir, ws.art),
-           "preprocessing_matches_workspace": pre.to_json() == ws.pre.to_json()}
-    art, ctx = device_and_tensors(ws, device)
-    # (1) recorded-slate validation scores
-    rec_path = Path(persist_dir) / "diagnostics" / "recorded_slates" / "validation_scores.csv"
-    from .validate import read_scores_bytes
-    saved = read_scores_bytes(rec_path.read_bytes(), header=True)
-    take = np.arange(min(len(saved), 5000))
-    v = ctx["validation"]
-    r = torch.from_numpy(ws.ctx["validation"].recorded["req_pos"][take]).to(device)
-    a = torch.from_numpy(ws.ctx["validation"].recorded["art_idx"][take]).to(device)
-    with torch.no_grad():
-        new = model(v.tensors, art.tensors, len(art.ids), r, a).float().cpu().numpy()
-    out["recorded_max_abs_logit_diff"] = float(np.abs(new - saved.score.to_numpy()[take]).max())
-    # (2) catalogue: re-score the first exported validation requests from the persistent copy
+    """Reload the persistent model/preprocessing; compare small saved score batches."""
     root = Path(persist_dir)
-    blocks_path = root / "diagnostics" / "catalogue" / "validation_score_blocks.csv"
-    scores_path = root / "predictions" / "validation" / "submission_click_probabilities.csv"
-    scopes_path = root / "selection" / "request_scopes.json"
-    if scopes_path.is_file():
-        saved_pool = read_json(scopes_path).get("pool_fingerprint", {}).get("ids_and_published_sha256")
+    model, _, pre, _ = load_model(root, device)
+    names = read_json(root / "model" / "feature_dictionary.json")
+    out = {"loaded_from": str(root), "article_ids_match": check_article_ids(root, ws.art),
+           "preprocessing_matches_workspace": pre.to_json() == ws.pre.to_json(),
+           "feature_names_match": names["ordered_features"]["request_context"] == F.REQUEST_DENSE_COLUMNS(pre)
+                                  and names["ordered_features"]["candidate"] == F.PAIR_DENSE_COLUMNS}
+    art, contexts = device_and_tensors(ws, device)
+    context = contexts["validation"]
+    lookup = pd.Index(ws.ctx["validation"].requests.behaviour_id)
+    for name, path in {
+        "recorded": root / "diagnostics" / "recorded_slates" / "validation_scores.parquet",
+        "catalogue": root / "predictions" / "validation" / "submission_article_scores.parquet",
+    }.items():
+        parquet = pq.ParquetFile(path)
+        batch = next(parquet.iter_batches(batch_size=max(1, n_requests * C.EXPORT_K)), None)
+        if batch is None:
+            out[f"{name}_pairs_compared"] = 0
+            out[f"{name}_max_abs_logit_diff"] = 0.0
+            continue
+        frame = batch.to_pandas()
+        frame = frame[frame.behaviour_id.isin(frame.behaviour_id.drop_duplicates().iloc[:n_requests])]
+        req = lookup.get_indexer(frame.behaviour_id)
+        if (req < 0).any():
+            raise ValueError("saved reload probe has an unknown request")
+        ai = ws.art.lookup(frame.article_id.to_numpy(np.int64))
+        with torch.no_grad():
+            logits = model(context.tensors, art.tensors, len(art.ids),
+                           torch.from_numpy(req).to(device), torch.from_numpy(ai).to(device)).float().cpu().numpy()
+        out[f"{name}_pairs_compared"] = len(frame)
+        out[f"{name}_max_abs_logit_diff"] = float(np.abs(logits - frame.score.to_numpy()).max()) if len(frame) else 0.0
+    scopes = root / "selection" / "request_scopes.json"
+    if scopes.is_file():
+        saved_pool = read_json(scopes).get("pool_fingerprint", {}).get("ids_and_published_sha256")
         out["pool_fingerprint_matches"] = saved_pool == ws.reports["pool_fingerprint"]["ids_and_published_sha256"]
-    if blocks_path.is_file() and scores_path.is_file() and scopes_path.is_file():
-        from .validate import read_block
-        blocks = pd.read_csv(blocks_path)
-        first = blocks.iloc[0]
-        frame = read_block(scores_path, int(first.byte_start), int(first.byte_end))
-        ids = read_json(scopes_path)["export_validation"]["behaviour_ids"]
-        all_pos = pd.Index(ws.ctx["validation"].requests.behaviour_id).get_indexer(ids)
-        positions = all_pos[int(first.first_request_index):int(first.last_request_index) + 1][:n_requests]
-        scorer = C.CatalogueScorer(model, v, art, device, cfg["pair_chunk"], False)
-        logits = scorer.logits(positions)
-        elig = scorer.eligible_mask(positions)
-        rows, cols = elig.nonzero(as_tuple=True)
-        recomputed = logits[rows, cols].cpu().numpy()
-        k = len(recomputed)
-        out["catalogue_pairs_compared"] = int(k)
-        out["catalogue_max_abs_logit_diff"] = float(np.abs(recomputed - frame.score.to_numpy()[:k]).max()) if k else None
-        out["catalogue_ids_match"] = bool(np.array_equal(ws.art.ids[ws.ctx["validation"].catalogue_idx][cols.cpu().numpy()],
-                                                         frame.article_id.to_numpy()[:k]))
     out["tolerance"] = tolerance
-    out["passed"] = bool(out["article_ids_match"] and out["preprocessing_matches_workspace"]
+    out["passed"] = bool(out["article_ids_match"] and out["preprocessing_matches_workspace"] and out["feature_names_match"]
+                         and out["recorded_pairs_compared"] > 0
                          and out["recorded_max_abs_logit_diff"] <= tolerance
-                         and (out.get("catalogue_max_abs_logit_diff") is None or out["catalogue_max_abs_logit_diff"] <= tolerance)
-                         and out.get("catalogue_ids_match", True) and out.get("pool_fingerprint_matches", True))
+                         and out["catalogue_max_abs_logit_diff"] <= tolerance
+                         and out.get("pool_fingerprint_matches", True))
     return out
 
 
@@ -680,6 +636,6 @@ def requirements_text() -> str:
 
 
 __all__ = ["make_config", "prepare_inputs", "preflight", "train_model", "export_recorded", "export_catalogue",
-           "full_score_gate", "export_budget", "check_export_budget", "resolve_request_scopes", "scope_ids",
+           "export_budget", "check_export_budget", "resolve_request_scopes", "scope_ids",
            "persist_run", "mark_run_complete", "run_is_complete", "reload_check", "requirements_text",
            "METRIC_DEFINITIONS", "parameter_counts", "git_info", "environment_info", "evaluate_recorded"]

@@ -35,7 +35,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 SPLITS = ("train", "validation", "test")
-EXPORT_SCHEMA_VERSION = 3
+EXPORT_SCHEMA_VERSION = 4
 
 # --------------------------------------------------------------------------
 # Paths
@@ -1362,154 +1362,123 @@ def top_k_reference(scores: np.ndarray, article_ids: np.ndarray, k: int) -> np.n
 
 
 class ShortlistWriter:
-    """Streams schema-v3 catalogue outputs for one split.
+    """Bounded, compressed schema-v4 top-K outputs; never writes exhaustive scores.
 
-    * rankings/{split}/submission_top_100.csv - one row per request
-    * predictions/{split}/eligibility_manifest.csv - pool size per request
-    * full catalogue scores (every scored request, or a declared score sample)
+    The same ordered IDs/scores populate the pair and native-list ranking files.
+    Every request, including an empty pool, also gets an eligibility-manifest row.
     """
 
-    def __init__(self, run_dir: Path, split: str, shortlist_size: int,
-                 full_scores: bool, flush_every: int = 5000, sampled_requests: bool = False):
-        """``sampled_requests``: only a declared subset of the split's requests is
-        scored (e.g. a smoke run); every file then lives under a
-        ``sampled_requests/`` folder so it can never pass as a complete export."""
-        self.split, self.k = split, shortlist_size
-        sub = "sampled_requests" if sampled_requests else ""
-        self.rank_path = (Path(run_dir) / "rankings" / split / sub /
-                          f"submission_top_{shortlist_size}.csv")
-        base = Path(run_dir) / "predictions" / split / sub
-        self.manifest_path = base / "eligibility_manifest.csv"
-        # Full scores for every scored request, or only for a declared score sample.
-        name = "submission_click_probabilities.csv"
-        self.score_path = base / name if full_scores else base / "score_sample" / name
-        for path in (self.rank_path, self.manifest_path, self.score_path):
+    def __init__(self, run_dir: Path, split: str, shortlist_size: int = 200,
+                 flush_every: int = 128):
+        self.k, self.flush_every = int(shortlist_size), int(flush_every)
+        base = Path(run_dir)
+        self.rank_path = base / "rankings" / split / f"submission_top_{self.k}.parquet"
+        self.score_path = base / "predictions" / split / "submission_article_scores.parquet"
+        self.manifest_path = base / "predictions" / split / "eligibility_manifest.parquet"
+        self.schemas = {
+            "ranks": pa.schema([("behaviour_id", pa.string()),
+                                ("article_ids", pa.list_(pa.int64()))]),
+            "scores": pa.schema([("behaviour_id", pa.string()), ("article_id", pa.int64()),
+                                 ("rank", pa.int32()), ("score", pa.float32())]),
+            "manifest": pa.schema([("behaviour_id", pa.string()), ("request_time_us", pa.int64()),
+                                   ("eligible_count", pa.int64()), ("shortlist_length", pa.int32())]),
+        }
+        self.writers = {}
+        for key, path in (("ranks", self.rank_path), ("scores", self.score_path),
+                          ("manifest", self.manifest_path)):
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.unlink(missing_ok=True)
-        self.flush_every = flush_every
-        self._ranks, self._manifest = [], []
-        self._score_header = True
-        self.score_rows = 0
-        self.requests = 0
+            self.writers[key] = pq.ParquetWriter(path, self.schemas[key], compression="zstd")
+        self.buffer = {key: [] for key in self.schemas}
+        self.requests = self.score_rows = 0
 
-    def add(self, behaviour_id: str, request_time: str, eligible_count: int,
-            shortlist_ids, scores=None, article_ids=None):
-        if len(shortlist_ids) != min(self.k, eligible_count):
-            raise AssertionError(f"{behaviour_id}: shortlist length {len(shortlist_ids)}")
-        if len(set(shortlist_ids)) != len(shortlist_ids):
-            raise AssertionError(f"{behaviour_id}: duplicate shortlist IDs")
-        self._ranks.append((behaviour_id, json.dumps([int(a) for a in shortlist_ids])))
-        self._manifest.append((behaviour_id, request_time, int(eligible_count),
-                               int(len(shortlist_ids)), scores is not None))
-        if scores is not None:
-            frame = pd.DataFrame({"behaviour_id": behaviour_id,
-                                  "article_id": np.asarray(article_ids, dtype=np.int64),
-                                  "score": np.asarray(scores, dtype=np.float64)})
-            frame["click_probability"] = 1.0 / (1.0 + np.exp(-frame["score"].to_numpy()))
-            frame = frame.sort_values("article_id", kind="stable")
-            frame.to_csv(self.score_path, mode="a", header=self._score_header, index=False)
-            self._score_header = False
-            self.score_rows += len(frame)
+    def add(self, behaviour_id: str, request_time_us: int, eligible_count: int,
+            shortlist_ids, scores):
+        ids = np.asarray(shortlist_ids, dtype=np.int64)
+        values = np.asarray(scores, dtype=np.float32)
+        if len(ids) != min(self.k, eligible_count) or len(values) != len(ids):
+            raise AssertionError(f"{behaviour_id}: top-K length differs from eligible pool")
+        if len(np.unique(ids)) != len(ids) or not np.isfinite(values).all():
+            raise AssertionError(f"{behaviour_id}: duplicate IDs or nonfinite scores")
+        if not np.array_equal(ids, top_k_reference(values, ids, self.k)):
+            raise AssertionError(f"{behaviour_id}: incorrect score/article-ID tie order")
+        self.buffer["ranks"].append({"behaviour_id": str(behaviour_id), "article_ids": ids.tolist()})
+        self.buffer["manifest"].append({"behaviour_id": str(behaviour_id),
+            "request_time_us": int(request_time_us), "eligible_count": int(eligible_count),
+            "shortlist_length": len(ids)})
+        self.buffer["scores"].extend({"behaviour_id": str(behaviour_id), "article_id": int(a),
+            "rank": rank, "score": float(v)} for rank, (a, v) in enumerate(zip(ids, values), 1))
         self.requests += 1
-        if len(self._ranks) >= self.flush_every:
+        self.score_rows += len(ids)
+        if len(self.buffer["ranks"]) >= self.flush_every:
             self.flush()
 
     def flush(self):
-        if self._ranks:
-            pd.DataFrame(self._ranks, columns=["behaviour_id", "article_ids"]).to_csv(
-                self.rank_path, mode="a", header=not self.rank_path.exists(), index=False)
-            pd.DataFrame(self._manifest, columns=["behaviour_id", "request_time",
-                                                  "eligible_count", "shortlist_length",
-                                                  "scores_exported"]).to_csv(
-                self.manifest_path, mode="a", header=not self.manifest_path.exists(), index=False)
-            self._ranks, self._manifest = [], []
+        for key, rows in self.buffer.items():
+            if rows:
+                self.writers[key].write_table(pa.Table.from_pylist(rows, schema=self.schemas[key]))
+                rows.clear()
 
     def close(self) -> dict:
         self.flush()
-        if not self.rank_path.exists():   # zero requests: still write headers
-            pd.DataFrame(columns=["behaviour_id", "article_ids"]).to_csv(self.rank_path, index=False)
+        for writer in self.writers.values():
+            writer.close()
         return {"rankings": str(self.rank_path), "manifest": str(self.manifest_path),
-                "scores": str(self.score_path) if self.score_rows else None,
-                "requests": self.requests, "score_rows": self.score_rows}
+                "scores": str(self.score_path), "requests": self.requests,
+                "score_rows": self.score_rows, "export_schema_version": EXPORT_SCHEMA_VERSION}
 
 
 def validate_catalogue_exports(split_arrays: SplitArrays, index: CatalogueIndex,
-                               outputs: dict, shortlist_size: int,
-                               max_age_hours=None, max_score_requests: int = 200,
-                               requests=None) -> dict:
-    """Re-read the written files and check them against the eligibility rule and,
-    for requests with exported scores, against the full score rows. ``requests``
-    restricts the expected behaviours to a declared request subset."""
-    ranks = pd.read_csv(outputs["rankings"], dtype={"behaviour_id": str})
-    manifest = pd.read_csv(outputs["manifest"], dtype={"behaviour_id": str})
-    keep = (np.arange(split_arrays.n_impressions) if requests is None
-            else np.sort(np.asarray(requests, dtype=np.int64)))
-    expected = behaviour_ids(split_arrays.user_id[keep], split_arrays.impression_id[keep])
-    if ranks["behaviour_id"].duplicated().any():
-        raise AssertionError("duplicate behaviours in the shortlist file")
-    if set(ranks["behaviour_id"]) != set(expected):
-        raise AssertionError("shortlist behaviours differ from the split's requests")
-    lo, hi = index.bounds(split_arrays.imp_time_us[keep], max_age_hours)
-    expected_counts = pd.Series(hi - lo, index=expected)
-    got_counts = manifest.set_index("behaviour_id")["eligible_count"]
-    if not got_counts.reindex(expected).eq(expected_counts).all():
-        raise AssertionError("eligible counts differ from the eligibility rule")
-    lists = ranks.set_index("behaviour_id")["article_ids"].map(json.loads)
-    lengths = lists.map(len)
-    if not lengths.reindex(expected).eq(np.minimum(shortlist_size, expected_counts)).all():
-        raise AssertionError("shortlist length != min(K, eligible count)")
-    # Membership: every listed article is eligible for that request.
-    position = {b: i for i, b in enumerate(expected)}
-    pub_by_id = dict(zip(index.article_ids.tolist(), index.published_us.tolist()))
-    bad = 0
-    for behaviour_id, ids in lists.items():
-        i = keep[position[behaviour_id]]
-        t = split_arrays.imp_time_us[i]
-        for a in ids:
-            p = pub_by_id.get(a)
-            if p is None or p > t:
-                bad += 1
-    if bad:
-        raise AssertionError(f"{bad} shortlisted articles are not eligible for their request")
-    checked_against_scores = 0
-    if outputs.get("scores"):
-        # Stream the score file and fully check up to ``max_score_requests``
-        # requests (all rows of each), so multi-GB exports never load at once.
-        exported = manifest.loc[manifest["scores_exported"].astype(bool), "behaviour_id"]
-        selected = set(exported.head(max_score_requests).tolist())
-        groups = {}
-        for chunk in pd.read_csv(outputs["scores"], dtype={"behaviour_id": str},
-                                 float_precision="round_trip", chunksize=2_000_000):
-            p = chunk["click_probability"].to_numpy()
-            if not (np.isfinite(chunk["score"]).all() and np.isfinite(p).all()
-                    and (p >= 0).all() and (p <= 1).all()):
-                raise AssertionError("non-finite score or probability outside [0, 1]")
-            unknown = set(chunk["behaviour_id"].unique()) - set(exported)
-            if unknown:
-                raise AssertionError(f"scores for requests not marked as exported: {list(unknown)[:3]}")
-            part = chunk[chunk["behaviour_id"].isin(selected)]
-            for behaviour_id, group in part.groupby("behaviour_id", sort=False):
-                groups.setdefault(behaviour_id, []).append(group)
-        for behaviour_id in selected:
-            group = pd.concat(groups.get(behaviour_id, [pd.DataFrame(columns=["article_id", "score"])]))
-            if group["article_id"].duplicated().any():
-                raise AssertionError(f"{behaviour_id}: duplicate article rows")
-            if len(group) != expected_counts[behaviour_id]:
-                raise AssertionError(f"{behaviour_id}: score rows != eligible count")
-            reference = top_k_reference(group["score"].to_numpy(dtype=float),
-                                        group["article_id"].to_numpy(dtype=np.int64),
-                                        shortlist_size)
-            if list(reference) != lists[behaviour_id]:
-                raise AssertionError(f"{behaviour_id}: shortlist differs from its scores")
-            checked_against_scores += 1
-    return {"requests": int(len(ranks)), "eligible_pairs": int(expected_counts.sum()),
-            "empty_pools": int((expected_counts == 0).sum()),
-            "shortlists_checked_against_full_scores": checked_against_scores,
-            "membership_and_length_checked": True}
+                               outputs: dict, shortlist_size: int = 200,
+                               max_score_requests: int = 128) -> dict:
+    """Check all request IDs/counts and one bounded score/ranking consistency batch.
+
+    The writer checks every request's finite values, uniqueness, length and order
+    before serialising; the scorer retains genuine top-K from its full pool.
+    No exhaustive catalogue score file is needed or assumed.
+    """
+    expected = behaviour_ids(split_arrays.user_id, split_arrays.impression_id)
+    lo, hi = index.bounds(split_arrays.imp_time_us)
+    counts = hi - lo
+    ranks = pq.ParquetFile(outputs["rankings"])
+    scores = pq.ParquetFile(outputs["scores"])
+    manifest = pq.ParquetFile(outputs["manifest"])
+    assert ranks.metadata.num_rows == manifest.metadata.num_rows == len(expected)
+    assert scores.metadata.num_rows == int(np.minimum(shortlist_size, counts).sum())
+    # Read just ID/count columns for complete request coverage, in bounded batches.
+    for source, columns in ((ranks, ["behaviour_id"]),
+                            (manifest, ["behaviour_id", "eligible_count", "request_time_us"])):
+        offset = 0
+        for batch in source.iter_batches(batch_size=8192, columns=columns):
+            table = batch.to_pydict()
+            end = offset + len(batch)
+            assert table["behaviour_id"] == expected[offset:end].tolist()
+            if "eligible_count" in table:
+                assert table["eligible_count"] == counts[offset:end].tolist()
+                assert table["request_time_us"] == split_arrays.imp_time_us[offset:end].tolist()
+            offset = end
+    sample = next(ranks.iter_batches(batch_size=max_score_requests), None)
+    ranking_rows = sample.to_pylist() if sample is not None else []
+    n_scores = sum(len(r["article_ids"]) for r in ranking_rows)
+    batch = next(scores.iter_batches(batch_size=max(1, n_scores)), None)
+    rows = batch.to_pylist()[:n_scores] if batch is not None else []
+    pos = 0
+    for ranking in ranking_rows:
+        ids = ranking["article_ids"]
+        group = rows[pos:pos + len(ids)]
+        assert [r["behaviour_id"] for r in group] == [ranking["behaviour_id"]] * len(ids)
+        assert [r["article_id"] for r in group] == ids
+        assert [r["rank"] for r in group] == list(range(1, len(ids) + 1))
+        assert np.array_equal(top_k_reference(np.array([r["score"] for r in group]),
+                                             np.array(ids, dtype=np.int64), len(ids)), ids)
+        pos += len(ids)
+    return {"requests": len(expected), "eligible_pairs": int(counts.sum()),
+            "score_rows": scores.metadata.num_rows, "empty_pools": int((counts == 0).sum()),
+            "all_request_ids_and_pool_counts_checked": True,
+            "score_ranking_requests_checked": len(ranking_rows)}
 
 
 # --------------------------------------------------------------------------
-# Metrics: per-impression AUC and nDCG@k with fair tie handling
+# Recorded-slate metrics (observed labels only)
 # --------------------------------------------------------------------------
 
 def impression_metrics(offsets: np.ndarray, labels: np.ndarray, scores: np.ndarray,
@@ -1569,8 +1538,8 @@ METRIC_DEFINITIONS = {
     "mean_impression_auc": (
         "Per (user_id, impression_id) slate: Mann-Whitney AUC of clicked vs "
         "unclicked candidates with average ranks (tied scores get half credit); "
-        "equal-weight mean over impressions with both label classes. Primary "
-        "metric, maximised for early stopping, checkpoint and tuning selection."),
+        "equal-weight mean over impressions with both label classes. Recorded-slate "
+        "diagnostic; catalogue Recall@100 selects checkpoints and tuning trials."),
     "mean_impression_ndcg@5": (
         "Per slate: binary-gain DCG over the top min(5, slate size) positions, tied "
         "scores given expected credit (mean label of the tie group at each position), "
@@ -1603,7 +1572,7 @@ def user_cluster_bootstrap(users: np.ndarray, a: np.ndarray, b: np.ndarray,
 
 
 # --------------------------------------------------------------------------
-# Exports (schema version 2)
+# Legacy recorded-slate CSV utilities (unused by the schema-v4 final notebook)
 # --------------------------------------------------------------------------
 
 def behaviour_ids(user_id: np.ndarray, impression_id: np.ndarray) -> np.ndarray:

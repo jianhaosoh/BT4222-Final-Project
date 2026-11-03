@@ -1,4 +1,4 @@
-"""Optional, bounded Optuna search (off by default).
+"""Bounded Optuna search before final training.
 
 Objective: validation catalogue known-click Recall@100 on the FIXED selection
 request sample (each request scored against its full eligible catalogue),
@@ -56,7 +56,7 @@ def select_best_trial(study) -> dict | None:
 
 def run_study(objective_builder, study_name: str, local_dir: Path, persist_dir: Path | None, n_trials: int,
               seed: int, timeout_hours: float | None = None, prune: bool = True):
-    import optuna  # installed only when tuning is enabled
+    import optuna
 
     local_dir.mkdir(parents=True, exist_ok=True)
     db = local_dir / "optuna_study.sqlite3"

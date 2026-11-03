@@ -45,7 +45,7 @@ class CatalogueSelector:
             "version": SELECTION_PROTOCOL_VERSION, "objective": SELECTION_OBJECTIVE, "direction": "maximize",
             "secondary": "observed-click nDCG@100 (ideal over all original known clicks, capped at 100)",
             "tie_breaker": "higher Recall@100, then higher nDCG@100, then the earlier checkpoint/trial",
-            "shortlist_size": C.SHORTLIST_SIZE, "ranking_order": "descending score, ties by ascending article_id",
+            "selection_k": C.SELECTION_K, "export_k": C.EXPORT_K, "shortlist_size": C.SHORTLIST_SIZE, "ranking_order": "descending score, ties by ascending article_id",
             "partition": "official validation split (development data; used repeatedly for selection)",
             "pool": "full time-eligible catalogue for every sampled request (no sampled negatives)",
             "eligibility_rules": C.ELIGIBILITY_RULES, "pool_policy": "published_at_or_before_request_v1",
@@ -82,15 +82,14 @@ class CatalogueSelector:
         block = self.cfg["request_block"]
         for lo in range(0, len(self.positions), block):
             pos = self.positions[lo:lo + block]
-            logits = scorer.logits(pos)
-            elig = scorer.eligible_mask(pos)
-            order, lengths, ties = scorer.rank(logits, elig)
-            order, lengths, ties = order.cpu().numpy(), lengths.cpu().numpy(), ties.cpu().numpy()
-            stats["scored_pairs"] += int(elig.sum())
+            top = scorer.topk(pos, k=C.SELECTION_K)
+            order, lengths, ties = (top[key].cpu().numpy() for key in
+                                    ("positions", "lengths", "tie_crosses_cutoff"))
+            stats["scored_pairs"] += int(top["eligible_count"].sum())
             for j in range(len(pos)):
                 info = self.clicks[lo + j]
                 ranked = cat_ids[order[j, :lengths[j]]]
-                n, hits, dcg, ideal = request_retrieval(ranked, info["ids"], C.SHORTLIST_SIZE)
+                n, hits, dcg, ideal = request_retrieval(ranked, info["ids"], C.SELECTION_K)
                 stats["requests_with_ties_crossing_cutoff"] += int(ties[j])
                 if n == 0:
                     stats["requests_without_known_clicks"] += 1

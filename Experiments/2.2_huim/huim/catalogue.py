@@ -1,4 +1,4 @@
-"""Time-eligible catalogue scoring, top-100 shortlists and streamed v3 exports.
+"""Time-eligible catalogue scoring, top-200 shortlists and streamed v4 Parquet exports.
 
 Eligibility (shared policy published_at_or_before_request_v1): for request
 (user_id, impression_id) at time t, an article of the ordered train_val -> test
@@ -9,27 +9,23 @@ No recency window, access rule or vector-coverage restriction is applied.
 """
 from __future__ import annotations
 
-import csv
-import hashlib
-import io
-import json
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
 import torch
 
 from .features import NO_PUB
 from .metrics import request_retrieval
-from .io_utils import atomic_write_json, read_json
 
-SHORTLIST_SIZE = 100
+SELECTION_K = 100
+EXPORT_K = 200
+SHORTLIST_SIZE = EXPORT_K
 FINAL_DISPLAY_SIZE = 5
-EXPORT_SCHEMA_VERSION = 3
+EXPORT_SCHEMA_VERSION = 4
 PREDICTION_POOL = "time_eligible_catalogue"
 ELIGIBILITY_RULES = [
     "policy published_at_or_before_request_v1: article belongs to the ordered union train_val/articles.parquet "
@@ -44,13 +40,21 @@ SCORE_SEMANTICS = {
     "click_probability": "sigmoid(score); UNCALIBRATED click-probability estimate conditional on the recorded-slate "
                          "training population; not a catalogue-wide CTR; values need not sum to one per request",
 }
-MANIFEST_COLUMNS = [
-    "behaviour_id", "user_id", "impression_id", "impression_time", "eligible_count", "shortlist_length",
-    "n_recorded", "n_recorded_ineligible", "n_clicked", "n_clicked_eligible", "n_clicked_not_in_catalogue",
-    "n_clicked_missing_pub", "n_clicked_future", "n_clicked_in_shortlist",
-    "observed_dcg_at_100", "ideal_dcg_at_100", "tie_crosses_cutoff",
-    "shortlist_share_with_text", "shortlist_median_age_h", "shortlist_distinct_categories",
-]
+SCORE_SCHEMA = pa.schema([
+    ("behaviour_id", pa.string()), ("article_id", pa.int64()), ("rank", pa.int32()),
+    ("score", pa.float32()), ("click_probability", pa.float64()),
+])
+RANKING_SCHEMA = pa.schema([("behaviour_id", pa.string()), ("article_ids", pa.list_(pa.int64()))])
+MANIFEST_SCHEMA = pa.schema([
+    ("behaviour_id", pa.string()), ("user_id", pa.int64()), ("impression_id", pa.int64()),
+    ("impression_time", pa.string()), ("eligible_count", pa.int64()), ("shortlist_length", pa.int32()),
+    ("n_recorded", pa.int64()), ("n_recorded_ineligible", pa.int64()),
+    ("n_clicked", pa.int64()), ("n_clicked_eligible", pa.int64()), ("n_clicked_not_in_catalogue", pa.int64()),
+    ("n_clicked_missing_pub", pa.int64()), ("n_clicked_future", pa.int64()),
+    *[(name, typ) for k in (100, 200) for name, typ in (
+        (f"n_clicked_in_top_{k}", pa.int64()), (f"observed_dcg_at_{k}", pa.float64()),
+        (f"ideal_dcg_at_{k}", pa.float64()), (f"tie_crosses_cutoff_{k}", pa.bool_()))],
+])
 
 
 # ---------------------------------------------------------------- policy ----
@@ -131,8 +135,9 @@ def feasibility_estimate(eligibility: dict, ctx, bytes_per_row: float | None = N
         "empty_pools": int((counts == 0).sum()),
         "pools_below_shortlist_size": int((counts < SHORTLIST_SIZE).sum()),
         "bytes_per_row_assumed": bytes_per_row,
-        "full_scores_csv_bytes_estimate": int(pairs * bytes_per_row),
-        "top100_csv_bytes_estimate": int(len(counts) * (20 + 9 * SHORTLIST_SIZE)),
+        "retained_score_rows": int(np.minimum(counts, EXPORT_K).sum()),
+        "retained_output_bytes_estimate": int(np.minimum(counts, EXPORT_K).sum() * 48 + len(counts) * (32 + EXPORT_K * 8)),
+
     }
     if pairs_per_second:
         est["scoring_hours_estimate"] = pairs / pairs_per_second / 3600
@@ -193,6 +198,64 @@ class CatalogueScorer:
         t = self.ctx.tensors["req_s"][torch.from_numpy(np.asarray(req_pos, dtype=np.int64)).to(self.device)]
         return self.pub_ok[None, :] & (self.pub[None, :] <= t[:, None])
 
+    @torch.no_grad()
+    def topk(self, req_pos: np.ndarray, k: int = EXPORT_K) -> dict:
+        """Score the full pool in pair chunks and retain k+1 only.
+
+        The extra item records a tie crossing k. Each merge sorts original IDs
+        first, then scores stably, so the result is the genuine catalogue top-K
+        even when a tie crosses an article-chunk boundary. No slate IDs enter it.
+        """
+        req_pos = np.asarray(req_pos, dtype=np.int64)
+        R, N = len(req_pos), len(self.cat)
+        rp = torch.from_numpy(req_pos).to(self.device)
+        best_scores = torch.empty((R, 0), dtype=torch.float32, device=self.device)
+        best_pos = torch.empty((R, 0), dtype=torch.int64, device=self.device)
+        counts = torch.zeros(R, dtype=torch.int64, device=self.device)
+        with self._autocast():
+            rs = self.model.request_state(self.ctx.tensors, self.art.tensors, rp)
+        nc = max(1, self.pair_chunk // max(R, 1))
+        req_s = self.ctx.tensors["req_s"][rp]
+        cat_ids = torch.as_tensor(self.art.ids[self.ctx.catalogue_idx], device=self.device)
+        for lo in range(0, N, nc):
+            hi = min(N, lo + nc)
+            n = hi - lo
+            rpos = torch.arange(R, device=self.device).repeat_interleave(n)
+            apos = torch.arange(n, device=self.device).repeat(R)
+            ast = {name: val[lo:hi] for name, val in self.ast.items()}
+            with self._autocast():
+                scores = self.model.score_from_states(
+                    self.ctx.tensors, self.art.tensors, len(self.art.ids), rp[rpos], self.cat[lo:hi][apos],
+                    rs, rpos, ast, apos).float().reshape(R, n)
+            if not torch.isfinite(scores).all():
+                raise FloatingPointError("non-finite catalogue logits")
+            eligible = self.pub_ok[None, lo:hi] & (self.pub[None, lo:hi] <= req_s[:, None])
+            counts += eligible.sum(1)
+            scores = scores.masked_fill(~eligible, float("-inf"))
+            positions = torch.arange(lo, hi, device=self.device)[None, :].expand(R, -1)
+            merged_scores = torch.cat((best_scores, scores), 1)
+            merged_pos = torch.cat((best_pos, positions), 1)
+            by_id = torch.argsort(cat_ids[merged_pos], dim=1, stable=True)
+            merged_scores = merged_scores.gather(1, by_id)
+            merged_pos = merged_pos.gather(1, by_id)
+            by_score = torch.argsort(merged_scores, dim=1, descending=True, stable=True)
+            keep = by_score[:, :k + 1]
+            best_scores = merged_scores.gather(1, keep)
+            best_pos = merged_pos.gather(1, keep)
+            # The discarded portion cannot outrank the retained prefix, checked
+            # while its scores still exist (no second catalogue scoring pass).
+            if by_score.shape[1] > k + 1:
+                next_score = merged_scores.gather(1, by_score[:, k + 1:k + 2])[:, 0]
+                if not (best_scores[:, -1] >= next_score).all():
+                    raise AssertionError("running top-K merge discarded a higher score")
+        def ties_at(cutoff):
+            if best_scores.shape[1] <= cutoff:
+                return torch.zeros(R, dtype=torch.bool, device=self.device)
+            return (counts > cutoff) & (best_scores[:, cutoff - 1] == best_scores[:, cutoff])
+        return {"positions": best_pos[:, :k], "scores": best_scores[:, :k],
+                "lengths": counts.clamp_max(k), "eligible_count": counts,
+                "tie_crosses_cutoff": ties_at(k), "selection_tie_crosses_cutoff": ties_at(SELECTION_K)}
+
     @staticmethod
     def rank(logits: torch.Tensor, eligible: torch.Tensor, k: int = SHORTLIST_SIZE):
         """Descending score; export ties broken by ascending article_id (= ascending
@@ -213,240 +276,107 @@ class CatalogueScorer:
 
 # ------------------------------------------------------------------ export --
 
-def _csv_bytes(table: pa.Table, header: bool) -> bytes:
-    buf = io.BytesIO()
-    try:
-        opts = pacsv.WriteOptions(include_header=header, quoting_style="needed")
-    except TypeError:  # older pyarrow
-        opts = pacsv.WriteOptions(include_header=header)
-    pacsv.write_csv(table, buf, write_options=opts)
-    return buf.getvalue()
+def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.ndarray, *,
+                 click_info: list | None, recorded_counts: np.ndarray | None,
+                 request_block: int = 16, log=print) -> dict:
+    """Score full eligible pools; stream only genuine top-200 and request manifests.
 
-
-def _truncate_or_create(path: Path, size: int) -> None:
-    """Cut a partial file back to the last checkpointed size. Never extend it:
-    a file shorter than recorded means it was lost or partly copied."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    current = path.stat().st_size if path.exists() else 0
-    if current < size:
-        raise RuntimeError(f"{path} has {current} bytes but the export progress records {size}; "
-                           "the partial export is damaged — remove its progress file to restart this split.")
-    with open(path, "a+b") as handle:
-        handle.truncate(size)
-
-
-def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.ndarray, *, write_full_scores: bool,
-                 click_info: list | None, recorded_counts: tuple | None, request_block: int = 16,
-                 checkpoint_every_blocks: int = 50, log=print, max_blocks: int | None = None,
-                 model_digest: str | None = None) -> dict:
-    """Stream rankings (+ optional full scores) for the given requests, resumably.
-
-    Files under out_root:
-      predictions/{split}/submission_click_probabilities.csv   (if write_full_scores)
-      rankings/{split}/submission_top_100.csv
-      diagnostics/catalogue/{split}_requests.csv               (eligibility/recall manifest)
-      diagnostics/catalogue/{split}_score_blocks.csv           (byte ranges per request block)
-      diagnostics/catalogue/{split}_export_progress.json       (resume state; written after each flush)
-    `max_blocks` bounds work for an interruption test.
+    Parquet row groups bound write memory. Partial files replace final files only
+    after all requests are written; this final workflow starts a fresh run folder.
+    Labels never enter the recommendation or recorded-score schemas.
     """
     ctx, art = scorer.ctx, scorer.art
-    split = ctx.split
-    out_root = Path(out_root)
+    split, root = ctx.split, Path(out_root)
     paths = {
-        "scores": out_root / "predictions" / split / "submission_click_probabilities.csv",
-        "rankings": out_root / "rankings" / split / "submission_top_100.csv",
-        "manifest": out_root / "diagnostics" / "catalogue" / f"{split}_requests.csv",
-        "blocks": out_root / "diagnostics" / "catalogue" / f"{split}_score_blocks.csv",
+        "scores": root / "predictions" / split / "submission_article_scores.parquet",
+        "rankings": root / "rankings" / split / "submission_top_200.parquet",
+        "manifest": root / "diagnostics" / "catalogue" / f"{split}_requests.parquet",
     }
-    progress_path = out_root / "diagnostics" / "catalogue" / f"{split}_export_progress.json"
+    schemas = {"scores": SCORE_SCHEMA, "rankings": RANKING_SCHEMA, "manifest": MANIFEST_SCHEMA}
+    temporary = {name: path.with_name("." + path.name + ".partial") for name, path in paths.items()}
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    writers = {name: pq.ParquetWriter(temporary[name], schema, compression="zstd")
+               for name, schema in schemas.items()}
     request_positions = np.asarray(request_positions, dtype=np.int64)
-    signature = {"split": split, "n_requests": int(len(request_positions)),
-                 "requests_sha": hashlib.sha256(request_positions.tobytes()).hexdigest(),  # order-sensitive
-                 "write_full_scores": bool(write_full_scores), "request_block": int(request_block),
-                 "model_digest": model_digest, "catalogue_sha": str(pd.util.hash_array(ctx.catalogue_idx).sum())}
-    progress = None
-    if progress_path.is_file():
-        progress = read_json(progress_path)
-        if progress.get("signature") != signature:
-            raise RuntimeError(f"{progress_path} belongs to a different export configuration; "
-                               "use a new output directory or remove it deliberately.")
-        if progress.get("finished"):
-            log(f"{split}: export already finished at {out_root}")
-            return progress
-        log(f"{split}: resuming export at request {progress['next_request']}")
-    else:
-        progress = {"signature": signature, "next_request": 0, "finished": False,
-                    "bytes": {k: 0 for k in paths}, "rows_scores": 0, "seconds": 0.0, "blocks_done": 0}
-    for key, path in paths.items():
-        if key == "scores" and not write_full_scores:
-            continue
-        _truncate_or_create(path, progress["bytes"][key])
-
-    handles = {k: open(p, "ab") for k, p in paths.items() if k != "scores" or write_full_scores}
+    cat_ids = art.ids[ctx.catalogue_idx]
+    offsets = ctx.recorded.get("offsets") if ctx.recorded else None
+    n_scores, n_pairs, start = 0, 0, time.time()
     try:
-        if progress["bytes"]["rankings"] == 0:
-            handles["rankings"].write(b"behaviour_id,article_ids\n")
-        if progress["bytes"]["manifest"] == 0:
-            handles["manifest"].write((",".join(MANIFEST_COLUMNS) + "\n").encode())
-        if progress["bytes"]["blocks"] == 0:
-            handles["blocks"].write(b"block,first_request_index,last_request_index,byte_start,byte_end,rows\n")
-        header_needed = write_full_scores and progress["bytes"]["scores"] == 0
-        behaviour_ids = ctx.requests.behaviour_id.to_numpy()
-        cat_ids = art.ids[ctx.catalogue_idx]
-        cat_ids_t = pa.array(cat_ids, type=pa.int64())
-        times = pd.to_datetime(ctx.requests.impression_time).astype(str).to_numpy()
-        rec_offsets = ctx.recorded.get("offsets") if ctx.recorded else None
-        t_start = time.time()
-        blocks_this_call = 0
-        i = progress["next_request"]
-        while i < len(request_positions):
-            if max_blocks is not None and blocks_this_call >= max_blocks:
-                break
-            block = request_positions[i:i + request_block]
-            logits = scorer.logits(block)
-            elig = scorer.eligible_mask(block)
-            order, lengths, ties = scorer.rank(logits, elig)
-            ties_np = ties.cpu().numpy()
-            lengths_np = lengths.cpu().numpy()
-            order_np = order.cpu().numpy()
-            # Shortlist diagnostics (freshness / diversity / vector coverage)
-            top_valid = torch.arange(order.shape[1], device=order.device)[None, :] < lengths[:, None]
-            has_text = (scorer.has_text[order] & top_valid).sum(1).float() / lengths.clamp_min(1)
-            t_req = ctx.tensors["req_s"][torch.from_numpy(block).to(order.device)]
-            age_h = (t_req[:, None] - scorer.pub[order]).float() / 3600.0
-            age_h = torch.where(top_valid, age_h, torch.full_like(age_h, float("nan")))
-            med_age = torch.nanmedian(age_h, dim=1).values.cpu().numpy()
-            cats = scorer.category[order].cpu().numpy()
-            # --- full scores (eligible only), request-major then ascending article_id
-            if write_full_scores:
-                rows_idx, cols_idx = elig.nonzero(as_tuple=True)
-                vals = logits[rows_idx, cols_idx].cpu().numpy().astype(np.float32)
-                rows_np, cols_np = rows_idx.cpu().numpy(), cols_idx.cpu().numpy()
-                table = pa.table({
-                    "behaviour_id": pc.take(pa.array(behaviour_ids[block].astype(str)), pa.array(rows_np)),
-                    "article_id": pc.take(cat_ids_t, pa.array(cols_np)),
-                    "score": pa.array(vals, type=pa.float32()),
-                    "click_probability": pa.array(1.0 / (1.0 + np.exp(-vals.astype(np.float64))), type=pa.float64()),
-                })
-                if header_needed:  # header written once, outside every block's byte range
-                    handles["scores"].write(b"behaviour_id,article_id,score,click_probability\n")
-                    header_needed = False
-                start = handles["scores"].tell()
-                handles["scores"].write(_csv_bytes(table, False))
-                end = handles["scores"].tell()
-                progress["rows_scores"] += len(vals)
-            else:
-                start = end = 0
-                rows_np = None
-            handles["blocks"].write(f"{progress['blocks_done']},{i},{i + len(block) - 1},{start},{end},"
-                                    f"{int(elig.sum())}\n".encode())
-            # --- rankings + manifest
-            rank_buf, man_buf = io.StringIO(), io.StringIO()
-            rank_writer, man_writer = csv.writer(rank_buf, lineterminator="\n"), csv.writer(man_buf, lineterminator="\n")
-            elig_counts = elig.sum(1).cpu().numpy()
+        for lo in range(0, len(request_positions), request_block):
+            block = request_positions[lo:lo + request_block]
+            top = scorer.topk(block, EXPORT_K)
+            indices, values, lengths, counts = (top[name].cpu().numpy() for name in
+                                               ("positions", "scores", "lengths", "eligible_count"))
+            ties100 = top["selection_tie_crosses_cutoff"].cpu().numpy()
+            ties200 = top["tie_crosses_cutoff"].cpu().numpy()
+            score_rows, ranking_rows, manifest_rows = [], [], []
             for j, pos in enumerate(block):
-                ids = cat_ids[order_np[j, :lengths_np[j]]].tolist()
-                rank_writer.writerow([behaviour_ids[pos], json.dumps(ids)])
-                info = click_info[pos] if click_info is not None else None
-                if info is None:  # unlabelled (test): outcomes unknown, nothing computed
-                    clicks = [""] * 8
-                else:
-                    n_clicked, hits, dcg, ideal = request_retrieval(ids, info["ids"], SHORTLIST_SIZE)
-                    clicks = [n_clicked, int(info["eligible"].sum()), int(info["not_in_catalogue"].sum()),
-                              int(info["missing"].sum()), int(info["future"].sum()), hits,
-                              f"{dcg:.10f}", f"{ideal:.10f}"]
-                clicks.append(int(bool(ties_np[j])))
-                n_rec = int(rec_offsets[pos + 1] - rec_offsets[pos]) if rec_offsets is not None else ""
-                n_rec_bad = recorded_counts[pos] if recorded_counts is not None else ""
-                n_cat = len(set(cats[j, :lengths_np[j]].tolist()))
                 req = ctx.requests.iloc[pos]
-                man_writer.writerow([behaviour_ids[pos], int(req.user_id), int(req.impression_id), times[pos],
-                                     int(elig_counts[j]), int(lengths_np[j]), n_rec, n_rec_bad, *clicks,
-                                     f"{float(has_text[j]):.4f}", "" if np.isnan(med_age[j]) else f"{float(med_age[j]):.3f}",
-                                     n_cat])
-            handles["rankings"].write(rank_buf.getvalue().encode())
-            handles["manifest"].write(man_buf.getvalue().encode())
-            i += len(block)
-            progress["blocks_done"] += 1
-            blocks_this_call += 1
-            if progress["blocks_done"] % checkpoint_every_blocks == 0 or i >= len(request_positions):
-                for h in handles.values():
-                    h.flush()
-                progress["bytes"] = {k: (handles[k].tell() if k in handles else 0) for k in paths}
-                progress["next_request"] = int(i)
-                progress["seconds"] += time.time() - t_start
-                t_start = time.time()
-                atomic_write_json(progress_path, progress)
-                log(f"{split}: {i}/{len(request_positions)} requests; {progress['rows_scores']:,} score rows; "
-                    f"{progress['seconds'] / 60:.1f} min")
-        for h in handles.values():
-            h.flush()
-        progress["bytes"] = {k: (handles[k].tell() if k in handles else 0) for k in paths}
-        progress["next_request"] = int(i)
-        progress["seconds"] += time.time() - t_start
-        progress["finished"] = i >= len(request_positions)
-        atomic_write_json(progress_path, progress)
+                bid = str(req.behaviour_id)
+                ids = cat_ids[indices[j, :lengths[j]]].tolist()
+                scores = values[j, :lengths[j]]
+                if not np.isfinite(scores).all() or len(ids) != len(set(ids)):
+                    raise AssertionError("non-finite score or duplicate ID in retained top-K")
+                # Verify score-descending / ID-ascending order before dropping
+                # this block's retained scores; the scorer checked each merge.
+                if ids != np.asarray(ids, dtype=np.int64)[np.lexsort((ids, -scores))].tolist():
+                    raise AssertionError("top-K score/article-ID ordering disagrees")
+                probabilities = torch.sigmoid(torch.from_numpy(scores.astype(np.float64))).numpy()
+                for rank, (article, score, probability) in enumerate(zip(ids, scores, probabilities), 1):
+                    score_rows.append({"behaviour_id": bid, "article_id": article, "rank": rank,
+                                       "score": float(score), "click_probability": float(probability)})
+                ranking_rows.append({"behaviour_id": bid, "article_ids": ids})
+                row = {"behaviour_id": bid, "user_id": int(req.user_id), "impression_id": int(req.impression_id),
+                       "impression_time": str(req.impression_time), "eligible_count": int(counts[j]),
+                       "shortlist_length": int(lengths[j]),
+                       "n_recorded": int(offsets[pos + 1] - offsets[pos]) if offsets is not None else None,
+                       "n_recorded_ineligible": int(recorded_counts[pos]) if recorded_counts is not None else None,
+                       "tie_crosses_cutoff_100": bool(ties100[j]), "tie_crosses_cutoff_200": bool(ties200[j])}
+                info = click_info[pos] if click_info is not None else None
+                if info is not None:
+                    row.update(n_clicked=len(info["ids"]), n_clicked_eligible=int(info["eligible"].sum()),
+                               n_clicked_not_in_catalogue=int(info["not_in_catalogue"].sum()),
+                               n_clicked_missing_pub=int(info["missing"].sum()), n_clicked_future=int(info["future"].sum()))
+                    for k in (SELECTION_K, EXPORT_K):
+                        _, hits, dcg, ideal = request_retrieval(ids, info["ids"], k)
+                        row.update({f"n_clicked_in_top_{k}": hits, f"observed_dcg_at_{k}": dcg,
+                                    f"ideal_dcg_at_{k}": ideal})
+                manifest_rows.append(row)
+            for name, rows in (("scores", score_rows), ("rankings", ranking_rows), ("manifest", manifest_rows)):
+                writers[name].write_table(pa.Table.from_pylist(rows, schema=schemas[name]))
+            n_scores += len(score_rows)
+            n_pairs += int(counts.sum())
+            if lo == 0 or (lo // request_block + 1) % 100 == 0:
+                log(f"{split}: {lo + len(block):,}/{len(request_positions):,} requests; {n_pairs:,} eligible pairs scored")
     finally:
-        for h in handles.values():
-            h.close()
-    progress["paths"] = {k: str(p) for k, p in paths.items() if k != "scores" or write_full_scores}
-    return progress
+        for writer in writers.values():
+            writer.close()
+    for name, path in paths.items():
+        temporary[name].replace(path)
+    return {"finished": True, "requests": len(request_positions), "rows_scores": n_scores,
+            "scored_pairs": n_pairs, "seconds": time.time() - start,
+            "topk_checked_during_scoring": True, "paths": {name: str(path) for name, path in paths.items()}}
 
 
-def write_recorded_slate_scores(path: Path, ctx, logits: np.ndarray) -> dict:
-    """Every original recorded candidate exactly once: behaviour_id,article_id,score,click_probability."""
-    rec = ctx.recorded
-    table = pa.table({
-        "behaviour_id": pa.array(ctx.requests.behaviour_id.to_numpy()[rec["req_pos"]].astype(str)),
-        "article_id": pa.array(rec["article_id"], type=pa.int64()),
-        "score": pa.array(logits.astype(np.float32), type=pa.float32()),
-        "click_probability": pa.array(1.0 / (1.0 + np.exp(-logits.astype(np.float64))), type=pa.float64()),
-    })
-    path = Path(path)
+def write_recorded_slate_scores(path: Path, ctx, logits: np.ndarray, batch_rows: int = 100_000) -> dict:
+    """All original shown candidates, including nonclicks and outside the shortlist; no labels."""
+    rec, path = ctx.recorded, Path(path)
+    schema = pa.schema([field for field in SCORE_SCHEMA if field.name != "rank"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.partial")
-    with open(tmp, "wb") as handle:
-        handle.write(_csv_bytes(table, True))
-    tmp.replace(path)
-    return {"path": str(path), "rows": int(len(table)), "requests": int(len(np.unique(rec["req_pos"])))}
-
-
-def measure_throughput(scorer: CatalogueScorer, request_positions: np.ndarray, request_block: int = 16,
-                       n_blocks: int = 4) -> dict:
-    """Benchmark scoring pairs/s and CSV formatting rows/s on a few request blocks."""
-    if not len(request_positions):
-        return {}
-    blocks = [request_positions[i:i + request_block] for i in range(0, min(len(request_positions), request_block * n_blocks), request_block)]
-    scorer.logits(blocks[0])  # warm-up
-    if scorer.device.type == "cuda":
-        torch.cuda.synchronize()
-    t0, pairs = time.time(), 0
-    csv_rows, csv_bytes, csv_seconds = 0, 0, 0.0
-    for b in blocks:
-        logits = scorer.logits(b)
-        elig = scorer.eligible_mask(b)
-        if scorer.device.type == "cuda":
-            torch.cuda.synchronize()
-        pairs += logits.numel()
-        r, c = elig.nonzero(as_tuple=True)
-        vals = logits[r, c].cpu().numpy()
-        t1 = time.time()
-        table = pa.table({"behaviour_id": pc.take(pa.array(scorer.ctx.requests.behaviour_id.to_numpy()[b].astype(str)),
-                                                  pa.array(r.cpu().numpy())),
-                          "article_id": pa.array(scorer.art.ids[scorer.ctx.catalogue_idx][c.cpu().numpy()]),
-                          "score": pa.array(vals.astype(np.float32)),
-                          "click_probability": pa.array(1 / (1 + np.exp(-vals.astype(np.float64))))})
-        data = _csv_bytes(table, False)
-        csv_seconds += time.time() - t1
-        csv_rows += len(vals)
-        csv_bytes += len(data)
-    seconds = time.time() - t0
-    return {"pairs_scored": int(pairs), "seconds_total": seconds,
-            "pairs_per_second_including_formatting": pairs / max(seconds, 1e-9),
-            "pairs_per_second_scoring_only": pairs / max(seconds - csv_seconds, 1e-9),
-            "csv_rows_per_second": csv_rows / max(csv_seconds, 1e-9),
-            "csv_bytes_per_row": csv_bytes / max(csv_rows, 1),
-            "note": "Excludes disk/Drive write speed; measured on a few blocks only."}
+    temporary = path.with_name("." + path.name + ".partial")
+    with pq.ParquetWriter(temporary, schema, compression="zstd") as writer:
+        for lo in range(0, len(logits), batch_rows):
+            hi = min(len(logits), lo + batch_rows)
+            values = logits[lo:hi].astype(np.float32)
+            table = pa.Table.from_pydict({
+                "behaviour_id": ctx.requests.behaviour_id.to_numpy()[rec["req_pos"][lo:hi]].astype(str),
+                "article_id": rec["article_id"][lo:hi], "score": values,
+                "click_probability": torch.sigmoid(torch.from_numpy(values.astype(np.float64))).numpy(),
+            }, schema=schema)
+            writer.write_table(table)
+    temporary.replace(path)
+    return {"path": str(path), "rows": len(logits), "requests": int(len(np.unique(rec["req_pos"])))}
 
 
 def sample_requests(n_requests: int, n: int, seed: int) -> np.ndarray:
