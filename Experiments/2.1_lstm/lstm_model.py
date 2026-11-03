@@ -314,6 +314,8 @@ class SplitTensors:
         self.n_candidates = arrays.n_candidates
         self.offsets = t(arrays.offsets, torch.long)
         self.imp_time = t(arrays.imp_time_s, torch.long)
+        # Exact request times (microseconds, CPU) for catalogue eligibility bounds.
+        self.imp_time_us = np.asarray(arrays.imp_time_us, dtype=np.int64)
         self.imp_user_row = t(arrays.imp_user_row, torch.long)
         self.imp_ctx = t(arrays.imp_context, torch.float32)
         self.cand_rows = t(arrays.cand_article_row, torch.long)
@@ -488,15 +490,25 @@ def restore_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([_cpu_byte_tensor(s) for s in state["cuda"]])
 
 
-def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
+def selection_key(metrics: dict, selection: dict) -> tuple:
+    """Lexicographic key: primary objective, then tie-break metric (both maximised).
+    A later checkpoint must be strictly better, so equal keys keep the earlier one."""
+    return (metrics[selection["objective"]], metrics[selection["tiebreak"]])
+
+
+def train_model(model, train: SplitTensors, select_fn, selection: dict,
                 cfg: TrainConfig, out_dir: Path, resume: bool = True,
                 on_epoch_end=None, trial=None, log=print):
-    """Train with BCE on logits; select the epoch with the best validation
-    mean impression AUC (ties keep the earlier epoch).
+    """Train with BCE on observed (recorded-slate) pairs; select checkpoints with
+    ``select_fn(model) -> dict`` evaluated once per epoch (the declared interval).
 
-    ``evaluate(scores) -> dict`` computes validation metrics from fp32 logits.
-    Saves ``best_model_state.pt`` (inference weights) and
-    ``recovery/last_checkpoint.pt`` (resume state) under ``out_dir``.
+    ``selection`` declares the objective (e.g. ``known_click_recall@100``), the
+    tie-break metric (``observed_click_ndcg@100``), the validation request sample
+    and pool policy. It is stored in every recovery checkpoint; resuming with a
+    different declaration (e.g. an AUC-selected checkpoint) is refused. Early
+    stopping and the learning-rate schedule follow the objective; patience counts
+    selection evaluations. Saves ``best_model_state.pt`` and
+    ``recovery/last_checkpoint.pt`` under ``out_dir``.
     """
     out_dir = Path(out_dir)
     device = train.device
@@ -508,7 +520,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
     use_amp = cfg.use_amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     loss_fn = nn.BCEWithLogitsLoss()
-    history, best = [], {"epoch": None, "auc": -math.inf, "metrics": None}
+    history, best = [], {"epoch": None, "key": None, "metrics": None}
     start_epoch, stale = 1, 0
     best_state = None
     recovery = out_dir / "recovery" / "last_checkpoint.pt"
@@ -520,6 +532,17 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         # Load to CPU: model/optimizer tensors are moved to the parameters' device
         # by load_state_dict, and RNG states must stay CPU uint8 tensors.
         state = torch.load(recovery, map_location="cpu", weights_only=False)
+        saved_cfg = {k: v for k, v in (state.get("train_config") or {}).items() if k != "max_epochs"}
+        current_cfg = {k: v for k, v in asdict(cfg).items() if k != "max_epochs"}
+        if saved_cfg != current_cfg:
+            raise RuntimeError(f"{recovery} was trained with different settings "
+                               f"({sorted(k for k in current_cfg if saved_cfg.get(k) != current_cfg[k])}); "
+                               "start a new run instead of resuming it.")
+        if state.get("selection") != selection:
+            raise RuntimeError(
+                f"{recovery} was selected with {state.get('selection', {}).get('objective', 'AUC (legacy)')}"
+                f" / a different sample or policy than the current declaration "
+                f"({selection['objective']}); start a new run instead of resuming it.")
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
@@ -541,7 +564,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             log(f"Checkpoint generator was saved on {state.get('device_generator_type')}, "
                 f"resuming on {device.type}: history-dropout RNG restarts from the seed.")
         log(f"Resumed from {recovery} after epoch {state['epoch']} "
-            f"(best epoch {best['epoch']}, AUC {best['auc']:.4f}). Exact bitwise "
+            f"(best epoch {best['epoch']}, {selection['objective']} {best['key'][0]:.4f}). Exact bitwise "
             "resumption is not guaranteed (cuDNN/AMP nondeterminism).")
         # Older checkpoints have no "early_stopped" key; treat "finished" as such.
         if state.get("early_stopped", state.get("finished", False)) \
@@ -575,29 +598,36 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             if step % 200 == 0:
                 log(f"  epoch {epoch} step {step}/{len(batches)} "
                     f"loss {total / count:.4f} ({time.time() - t0:.0f}s)")
-        scores = predict_logits(model, validation, cfg.eval_batch_impressions)
-        metrics = evaluate(scores)
-        auc = metrics["mean_impression_auc"]
-        if auc is None:
-            raise ValueError("No validation impression has both a click and a non-click, so "
-                             "AUC-based selection is impossible; enlarge the (smoke) sample.")
+        train_seconds = time.time() - t0
+        t_sel = time.time()
+        metrics = select_fn(model)
+        selection_seconds = time.time() - t_sel
+        objective = metrics.get(selection["objective"])
+        if objective is None or metrics.get(selection["tiebreak"]) is None:
+            raise ValueError(f"{selection['objective']} is undefined: the validation selection "
+                             "sample has no request with a known click. Enlarge the sample.")
+        model.train()
         lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(auc)
+        scheduler.step(objective)
+        key = selection_key(metrics, selection)
         row = {"epoch": epoch, "train_bce": total / max(count, 1),
-               "validation_auc": auc,
-               "validation_ndcg@5": metrics["mean_impression_ndcg@5"],
-               "learning_rate": lr, "seconds": time.time() - t0}
+               **{name: metrics.get(name) for name in selection["logged_metrics"]},
+               "learning_rate": lr, "train_seconds": train_seconds,
+               "selection_seconds": selection_seconds,
+               "seconds": time.time() - t0}
         history.append(row)
-        improved = auc > best["auc"]
+        improved = best["key"] is None or tuple(key) > tuple(best["key"])
         if improved:
-            best = {"epoch": epoch, "auc": auc, "metrics": metrics}
+            best = {"epoch": epoch, "key": list(key), "metrics": metrics}
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             atomic_torch_save(best_state, best_path)
             stale = 0
         else:
             stale += 1
-        log(f"epoch {epoch}: train BCE {row['train_bce']:.4f} | val AUC {auc:.4f} "
-            f"nDCG@5 {row['validation_ndcg@5']:.4f} | lr {lr:.2e} | "
+        auc = metrics.get("diagnostic_recorded_slate_auc")
+        log(f"epoch {epoch}: train BCE {row['train_bce']:.4f} | val {selection['objective']} "
+            f"{key[0]:.4f} {selection['tiebreak']} {key[1]:.4f} | diag AUC "
+            f"{auc if auc is None else round(auc, 4)} | lr {lr:.2e} | "
             f"{row['seconds']:.0f}s{' *best*' if improved else ''}")
         # Stop after `early_stopping_patience` consecutive epochs without improvement.
         early_stopped = stale >= cfg.early_stopping_patience
@@ -609,20 +639,20 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             "generator": generator.get_state(), "device_generator": device_gen.get_state(),
             "device_generator_type": device.type,
             "finished": finished, "early_stopped": early_stopped,
-            "best_model": best_state,
+            "best_model": best_state, "selection": selection,
             "train_config": asdict(cfg),
         }, recovery)
         (out_dir / "training_history.json").write_text(json.dumps(history, indent=2))
         if on_epoch_end is not None:
             on_epoch_end(epoch, row)
         if trial is not None:
-            trial.report(auc, epoch)
+            trial.report(objective, epoch)
             if trial.should_prune():
                 import optuna
                 raise optuna.TrialPruned()
         if finished:
             if early_stopped:
-                log(f"Early stopping: no validation AUC gain for {stale} epochs.")
+                log(f"Early stopping: no {selection['objective']} gain for {stale} evaluations.")
             break
 
     if best["epoch"] is None:
@@ -672,13 +702,15 @@ class CatalogueScorer:
 
     def __init__(self, model, data: "SplitTensors", index, age_stats: dict,
                  max_age_hours=None, chunk: int = 32768, user_batch: int = 1024,
-                 max_state_gb: float = 4.0):
+                 max_state_gb: float = 4.0, requests=None):
+        """``requests``: if given, only those requests' users get precomputed LSTM
+        states (used for the per-epoch selection sample)."""
         self.model = model.eval()
         self.data, self.index, self.chunk = data, index, chunk
         self.age_mean, self.age_std = age_stats["mean"], age_stats["std"]
         device = data.device
         self.device = device
-        self.lo, self.hi = index.bounds(data.imp_time.cpu().numpy(), max_age_hours)
+        self.lo, self.hi = index.bounds(data.imp_time_us, max_age_hours)
         rows = torch.as_tensor(index.rows, dtype=torch.long, device=device)
         self.ids = torch.as_tensor(index.article_ids, dtype=torch.long, device=device)
         self.pub = torch.as_tensor(index.published_s, dtype=torch.long, device=device)
@@ -686,25 +718,34 @@ class CatalogueScorer:
             enc = [model.articles.encode_rows(rows[i:i + chunk]) for i in range(0, len(rows), chunk)]
             self.enc = torch.cat(enc) if enc else torch.zeros(0, model.cfg.article_dim, device=device)
             self.q = model.query(self.enc) if len(self.enc) else self.enc[:, :model.cfg.attention_dim]
-        # User LSTM states: precompute for all users when they fit in memory.
+        # User LSTM states: precompute (for all users, or the requests' users) when
+        # they fit in memory; otherwise compute per request.
         U, L = data.hist_rows.shape
-        bytes_needed = U * L * (model.cfg.lstm_hidden + model.cfg.attention_dim) * 4
+        if requests is None:
+            users = torch.arange(U, device=device)
+        else:
+            users = torch.unique(data.imp_user_row[torch.as_tensor(np.asarray(requests),
+                                                                   dtype=torch.long, device=device)])
+        bytes_needed = len(users) * L * (model.cfg.lstm_hidden + model.cfg.attention_dim) * 4
         self.precomputed = bytes_needed <= max_state_gb * 1e9
         self.states = self.keys = None
+        self.user_slot = torch.full((U,), -1, dtype=torch.long, device=device)
         if self.precomputed:
+            self.user_slot[users] = torch.arange(len(users), device=device)
             states, keys = [], []
             with torch.no_grad():
-                for s in range(0, U, user_batch):
-                    st = model.encode_history(data.hist_rows[s:s + user_batch],
-                                              data.hist_feats[s:s + user_batch],
-                                              data.hist_len[s:s + user_batch])
+                for s in range(0, len(users), user_batch):
+                    rows = users[s:s + user_batch]
+                    st = model.encode_history(data.hist_rows[rows], data.hist_feats[rows],
+                                              data.hist_len[rows])
                     states.append(st)
                     keys.append(model.key(st))
             self.states, self.keys = torch.cat(states), torch.cat(keys)
 
     def _user(self, u: int):
-        if self.precomputed:
-            return self.states[u], self.keys[u]
+        slot = int(self.user_slot[u]) if self.precomputed else -1
+        if slot >= 0:
+            return self.states[slot], self.keys[slot]
         d = self.data
         with torch.no_grad():
             st = self.model.encode_history(d.hist_rows[u:u + 1], d.hist_feats[u:u + 1],
@@ -739,6 +780,22 @@ class CatalogueScorer:
         return self.ids[lo:hi], out
 
     def shortlist(self, i: int, k: int):
+        """Exact top-k plus ``self.last_tie_at_cutoff``: whether an article outside
+        the shortlist has the same score as the last one inside it (the article-ID
+        tie rule then decided membership)."""
         ids, logits = self.score_request(i)
         top_ids, top_logits = select_top_k(logits, ids, k)
+        self.last_tie_at_cutoff = bool(len(logits) > k and
+                                       int((logits == top_logits[-1]).sum()) >
+                                       int((top_logits == top_logits[-1]).sum()))
         return top_ids, top_logits, ids, logits
+
+
+def catalogue_shortlists(scorer: CatalogueScorer, requests, k: int) -> tuple[dict, int]:
+    """Exact full-pool top-k for each request index; returns ({i: ids}, ties at cutoff)."""
+    out, ties = {}, 0
+    for i in requests:
+        top_ids, _, _, _ = scorer.shortlist(int(i), k)
+        out[int(i)] = top_ids.cpu().numpy()
+        ties += int(scorer.last_tie_at_cutoff)
+    return out, ties
