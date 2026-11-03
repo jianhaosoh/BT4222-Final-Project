@@ -13,12 +13,12 @@ reranking → final top 5 recommendations.**
 Distinguish the inputs used to learn from observed clicks from the pool scored
 when making recommendations:
 
-| Operation | Article pool | Labels and purpose |
-| --- | --- | --- |
-| Training | Each behaviour's recorded `article_ids_inview` slate | Clicked = 1; shown but unclicked = 0. The shared feature tables already contain these expanded pairs. Keep this training setup. |
-| Recorded-slate validation | The same recorded candidate rows in validation | Labelled click-ranking diagnostic; not the primary shortlist-selection objective. |
+| Operation                            | Article pool                                         | Labels and purpose                                                                                                                               |
+| ------------------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Training                             | Each behaviour's recorded `article_ids_inview` slate | Clicked = 1; shown but unclicked = 0. The shared feature tables already contain these expanded pairs. Keep this training setup.                  |
+| Recorded-slate validation            | The same recorded candidate rows in validation       | Labelled click-ranking diagnostic; not the primary shortlist-selection objective.                                                                |
 | Catalogue prediction, for each split | Every article eligible at each behaviour's timestamp | Score behaviour × eligible article, then select the top 100. Articles outside the recorded slate have **unknown** outcomes, not negative labels. |
-| Stage 2 | Stage 1's catalogue-derived shortlist | Apply the agreed business priorities and produce the final top 5. |
+| Stage 2                              | Stage 1's catalogue-derived shortlist                | Apply the agreed business priorities and produce the final top 5.                                                                                |
 
 Do not re-explode the existing training feature tables or create catalogue-wide
 negative labels. Catalogue prediction is a **new inference path**, not merely a
@@ -70,11 +70,11 @@ not claim a recorded-slate export implements this path.
 
 ## One workflow, three responsibilities
 
-| Stage | Responsibility |
-| --- | --- |
-| Shared preprocessing — `Preprocessing/` | Prepare the agreed splits, features and embeddings once; publish common inputs on Drive. |
-| Stage 1 — `Experiments/` | Train/load each relevance model on observed pairs, validate it, score the eligible catalogue, and export full catalogue scores, top-100 shortlists, recorded-slate diagnostics and the saved model. |
-| Stage 2 — shared reranking and evaluation | Consume each model's catalogue-derived shortlists, apply business priorities, compare final top-5 lists and produce the final evaluation and report analysis. |
+| Stage                                     | Responsibility                                                                                                                                                                                      |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shared preprocessing — `Preprocessing/`   | Prepare the agreed splits, features and embeddings once; publish common inputs on Drive.                                                                                                            |
+| Stage 1 — `Experiments/`                  | Train/load each relevance model on observed pairs, validate it, score the eligible catalogue, and export full catalogue scores, top-100 shortlists, recorded-slate diagnostics and the saved model. |
+| Stage 2 — shared reranking and evaluation | Consume each model's catalogue-derived shortlists, apply business priorities, compare final top-5 lists and produce the final evaluation and report analysis.                                       |
 
 Keep cross-model comparisons and final evaluation together in that shared stage.
 Individual experiment notebooks analyse validation only for development; they
@@ -105,12 +105,12 @@ keeping, including when a simpler model is sufficient.
 Use the following links to guide the explanation, rather than requiring every
 model to address every objective:
 
-| Business link | Example explanation in a model notebook | Evidence brought together in shared evaluation |
-| --- | --- | --- |
-| Relevant recommendations | Does category/topic affinity, reading history or content similarity explain why an article scores highly? | Stage 1 catalogue known-click Recall@100 and observed-click nDCG@100; Stage 2 final-list relevance, alongside representative examples. |
-| Continued reading | If using historical reading depth or sequence information, explain how it could represent a reader's interests over time. | Session-continuation performance where suitable outcome labels exist; distinguish this from click prediction. |
-| Fresh content | Does recency information help the model consider timely articles? Explain any relevance/freshness trade-off. | Article-age distribution of top-ranked items before and after reranking. |
-| Exploration and variety | Do the highest-scoring articles repeatedly concentrate on the same topics? Explain the model's behaviour and implications for reranking. | Topic/category diversity before and after reranking, alongside relevance metrics. |
+| Business link            | Example explanation in a model notebook                                                                                                  | Evidence brought together in shared evaluation                                                                                         |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Relevant recommendations | Does category/topic affinity, reading history or content similarity explain why an article scores highly?                                | Stage 1 catalogue known-click Recall@100 and observed-click nDCG@100; Stage 2 final-list relevance, alongside representative examples. |
+| Continued reading        | If using historical reading depth or sequence information, explain how it could represent a reader's interests over time.                | Session-continuation performance where suitable outcome labels exist; distinguish this from click prediction.                          |
+| Fresh content            | Does recency information help the model consider timely articles? Explain any relevance/freshness trade-off.                             | Article-age distribution of top-ranked items before and after reranking.                                                               |
+| Exploration and variety  | Do the highest-scoring articles repeatedly concentrate on the same topics? Explain the model's behaviour and implications for reranking. | Topic/category diversity before and after reranking, alongside relevance metrics.                                                      |
 
 Include one or two focused pieces of **validation** evidence suited to the model:
 for example, feature importance or permutation importance, a targeted feature
@@ -127,11 +127,11 @@ handoff to the shared evaluation/report owner.
 
 ## Tracks and numbering
 
-| Track | ID prefix | Naming examples |
-| --- | --- | --- |
-| Traditional models | `1` | `1.1_<short_name>`, `1.2_<short_name>` |
-| Neural networks | `2` | `2.1_<short_name>`, `2.2_<short_name>` |
-| Pretrained models | `3` | `3.1_<model_name>` |
+| Track              | ID prefix | Naming examples                        |
+| ------------------ | --------- | -------------------------------------- |
+| Traditional models | `1`       | `1.1_<short_name>`, `1.2_<short_name>` |
+| Neural networks    | `2`       | `2.1_<short_name>`, `2.2_<short_name>` |
+| Pretrained models  | `3`       | `3.1_<model_name>`                     |
 
 Each experiment directory sits directly under `Experiments/` and is named
 `<ID>_<short_model_name>`. The first number identifies the track; there is no
@@ -228,16 +228,16 @@ Mount Drive first in Colab and adjust `DRIVE_ROOT` to the location of your copy 
 shortcut. Apply `SEED` to the random-number generators and model/framework
 settings you use. Keep all other input paths relative to it:
 
-| Input | Path under `DRIVE_ROOT` |
-| --- | --- |
-| Raw engineered features | `feature_engineering/{split}_features.parquet` |
-| Log variants | `feature_engineering/log_variants/{split}_features.parquet` |
-| Scaled features | `feature_engineering/scaled_log_variants/{split}_features.parquet` |
-| Feature vocabulary | `feature_engineering/feature_vocabulary.json` |
-| Train/validation article catalogue | `train_val/articles.parquet` |
-| Test article catalogue | `test/articles.parquet` |
-| Train/validation article vectors | `train_val/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/train_val/`) |
-| Test article vectors | `test/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/test/`) |
+| Input                              | Path under `DRIVE_ROOT`                                                                                   |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Raw engineered features            | `feature_engineering/{split}_features.parquet`                                                            |
+| Log variants                       | `feature_engineering/log_variants/{split}_features.parquet`                                               |
+| Scaled features                    | `feature_engineering/scaled_log_variants/{split}_features.parquet`                                        |
+| Feature vocabulary                 | `feature_engineering/feature_vocabulary.json`                                                             |
+| Train/validation article catalogue | `train_val/articles.parquet`                                                                              |
+| Test article catalogue             | `test/articles.parquet`                                                                                   |
+| Train/validation article vectors   | `train_val/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/train_val/`) |
+| Test article vectors               | `test/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/test/`)           |
 
 Use `train`, `validation`, and `test` consistently in file names and metadata;
 `validation` is the split otherwise called “val”. See the
@@ -271,12 +271,12 @@ separate from a file-loading failure.
 Stage 1 selects a catalogue-derived shortlist for Stage 2, so its model-selection
 metric must measure that task:
 
-| Role | Metric and evaluation pool |
-| --- | --- |
-| **Stage 1 primary** | **Mean known-click Recall@100** over validation requests, using the full time-eligible catalogue for each request. Maximise this for hyperparameter, checkpoint and early-stopping decisions. |
-| **Stage 1 secondary** | **Mean observed-click nDCG@100** on the same catalogue predictions, measuring the order within the shortlist. |
-| Recorded-slate diagnostic | Mean impression AUC on the original shown candidates; useful for debugging click ranking, not the final Stage 1 selection objective. |
-| Stage 2 final-list evaluation | nDCG@5 for the final five recommendations, alongside the agreed business metrics and explicit observed-outcome limitations. |
+| Role                          | Metric and evaluation pool                                                                                                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stage 1 primary**           | **Mean known-click Recall@100** over validation requests, using the full time-eligible catalogue for each request. Maximise this for hyperparameter, checkpoint and early-stopping decisions. |
+| **Stage 1 secondary**         | **Mean observed-click nDCG@100** on the same catalogue predictions, measuring the order within the shortlist.                                                                                 |
+| Recorded-slate diagnostic     | Mean impression AUC on the original shown candidates; useful for debugging click ranking, not the final Stage 1 selection objective.                                                          |
+| Stage 2 final-list evaluation | nDCG@5 for the final five recommendations, alongside the agreed business metrics and explicit observed-outcome limitations.                                                                   |
 
 Stage 2 can reorder a retained clicked article but cannot recover one discarded
 by Stage 1. That is why shortlist membership (Recall@100) is primary and its
@@ -486,11 +486,11 @@ behaviour_id,article_id,score,click_probability
 12345:67890,9876543,1.0,0.7310585786
 ```
 
-| Column | Contract |
-| --- | --- |
-| `behaviour_id` | Shared original-ID request identifier, repeated for every eligible article. |
-| `article_id` | Original integer article ID from the eligible catalogue; not restricted to `article_ids_inview`. |
-| `score` | Finite Stage 1 relevance score; higher is more relevant. Declare whether it is a probability, logit or ranking score. |
+| Column              | Contract                                                                                                                                            |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `behaviour_id`      | Shared original-ID request identifier, repeated for every eligible article.                                                                         |
+| `article_id`        | Original integer article ID from the eligible catalogue; not restricted to `article_ids_inview`.                                                    |
+| `score`             | Finite Stage 1 relevance score; higher is more relevant. Declare whether it is a probability, logit or ranking score.                               |
 | `click_probability` | Finite value in `[0, 1]` from a genuine click-probability model or documented fitted calibration. Uncalibrated estimates must be described as such. |
 
 Keep logits in `score` and their sigmoid in `click_probability` when that is the

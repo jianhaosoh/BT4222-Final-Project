@@ -333,6 +333,10 @@ def main():
     predictions.to_parquet(args.output / 'validation_predictions.parquet', index=False)
     joblib.dump({'pipeline': model, 'numeric_features': NUMERIC,
                  'categorical_features': CATEGORICAL}, args.output / 'model.joblib')
+    pd.DataFrame({
+        'feature': model['features'].get_feature_names_out(),
+        'coefficient': model['model'].coef_[0],
+    }).to_csv(args.output / 'logistic_regression_coefficients.csv', index=False)
     print(f'Saved model and results to {args.output.resolve()}', flush=True)
 
 
