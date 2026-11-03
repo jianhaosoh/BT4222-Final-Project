@@ -265,3 +265,91 @@ print("Train target:", y_train.value_counts().to_dict())
 Fit the model with `X_train, y_train`, evaluate it with `X_validation, y_validation`, and predict on `X_test`. The numbered one-hot and history-preference columns are mapped to their original values in `feature_vocabulary.json`.
 
 The saved files retain both raw and log alternatives for traceability; the loader selects one version per transformed field. The raw and log cases can still contain null predictors. The scaled files impute their selected continuous columns using train values, but other nullable fields may remain, so use model-appropriate missing-value handling. Fit any additional imputer or scaler on **train only**, then apply it to validation and test.
+
+## Article text and image embeddings
+
+[`embedding_pipeline.py`](embedding_pipeline.py) is a standalone regular-API example.
+It combines each article's Danish title, subtitle, and body into one text document,
+requests one Gemini Embedding 2 vector, and joins the supplied image vectors by
+`article_id`. Text and image vectors are saved separately.
+
+### Setup and run
+
+Use Python 3.11 or later. From the repository root:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r "Preprocessing/requirements-embeddings.txt"
+cp .env.example .env
+```
+
+Add your `GEMINI_API_KEY` to `.env`. This file is ignored by Git. The script reads
+it from the repository root; existing environment variables take precedence.
+The defaults are `gemini-embedding-2` and 768 text dimensions.
+
+The current data remains in the sibling `Project` directory. Adjust these paths
+if your files are elsewhere:
+
+```sh
+EMBEDDING_DATA=../Project/data/ebnerd_small
+EMBEDDING_IMAGES=../Project/data/ebnerd_large/Ekstra_Bladet_image_embeddings/image_embeddings.parquet
+
+# Local input check: no API calls and no output writes.
+python "Preprocessing/embedding_pipeline.py" \
+  --articles "$EMBEDDING_DATA/articles.parquet" \
+  --image-embeddings "$EMBEDDING_IMAGES" --dry-run
+
+# Generate a small sample in its own directory.
+python "Preprocessing/embedding_pipeline.py" \
+  --articles "$EMBEDDING_DATA/articles.parquet" \
+  --image-embeddings "$EMBEDDING_IMAGES" --limit 3 \
+  --output-dir data/embeddings/ebnerd_small-smoke
+```
+
+For the full catalogue, omit `--limit 3` and the smoke-test `--output-dir`.
+
+The feature-engineering notebook combines the train/validation and official test
+article catalogues. To prepare vectors for both, pass them in the same order:
+
+```sh
+python "Preprocessing/embedding_pipeline.py" \
+  --articles /path/to/train_val/articles.parquet /path/to/ebnerd_testset/articles.parquet \
+  --image-embeddings "$EMBEDDING_IMAGES" --output-dir data/embeddings/combined
+```
+
+Overlapping article IDs keep the first catalogue's snapshot, matching Step 3.
+The current local embedding files cover the 20,738-article SMALL catalogue; extra
+articles from the official test catalogue need vectors generated from that file.
+Use a left join when adding vectors to candidates so missing vectors never remove
+candidate rows.
+
+The script uses the regular API, one document per request. Successful text vectors
+are checkpointed every 100 rows and on interruption. A separate local
+`text_cache.parquet` keeps all successful vectors even after a limited or interrupted
+rerun. Repeating the command reuses
+vectors with the same prepared text, model and dimension, including identical text
+on different article IDs. Documents longer than 8,192 tokens receive an explicit
+`input_too_long` status. Temporary rate-limit/server errors are retried.
+
+### Files and model inputs
+
+Default outputs are in `data/embeddings/ebnerd_small/`:
+
+| File | Main fields |
+| --- | --- |
+| `text_embeddings.parquet` | `article_id`, `text_embedding` (768 float32 values), `has_text_embedding`, `status`, `error_code`, `input_hash` |
+| `image_embeddings.parquet` | `article_id`, `image_embedding` (1,024 float32 values), `has_image_embedding`, `status`, `error_code` |
+
+Missing inputs remain null; no article is dropped and no zero vector is invented.
+The inspected SMALL catalogue has 20,738 articles, 18 without usable text. The
+shared image artifact covers 16,995 articles (81.95%); 3,743 have no image vector.
+Extra IDs in the shared image artifact are excluded by the article-ID join.
+
+Use `candidate_article_id = article_id` for candidate feature lookups and the same
+article-ID mapping for historical clicks. Keep dense vectors in lookup tables
+until model batching rather than duplicating them across the full impression
+file. Text and image vectors come from different model spaces; do not compute
+text-to-image cosine similarity between them. Fit downstream scaling, PCA and
+missing-value handling on training data only. The text is a supplied catalogue
+snapshot, not a reconstruction of article text at each impression time.

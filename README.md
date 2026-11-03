@@ -15,3 +15,10 @@ This project uses the **EB-NeRD SMALL** dataset from Ekstra Bladet, a Danish new
 Each shown article is a candidate: clicked articles receive a positive label, while shown but unclicked articles receive a negative label. 
 
 Dataset source: [EB-NeRD dataset and documentation](https://recsys.eb.dk/dataset/).
+
+## Preprocessing and embeddings
+
+See [Preprocessing/README.md](Preprocessing/README.md) for the current engineered
+feature files and the regular-API article embedding script. The script saves
+Gemini text vectors and supplied EB-NeRD image vectors separately, keyed by
+`article_id`, for lookup using `candidate_article_id`.

@@ -1,0 +1,6 @@
+# Python 3.11+; install in a virtual environment.
+google-genai==2.34.0
+python-dotenv==1.2.4
+pyarrow==26.0.0
+pandas==2.3.3
+numpy>=1.26,<3

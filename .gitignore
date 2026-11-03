@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 data/
+.venv/
+# Local planning notes and verification code are not part of the submission.
+/docs/
+/tests/
+/.worktrees/
