@@ -36,15 +36,31 @@ The shared folder is owned by another account. Add a Drive shortcut so it appear
 ## Running
 
 1. In Colab, choose a GPU runtime and open `experiment.ipynb`.
-2. The first code cell clones this repository if `lstm_*.py` are not next to the notebook. Set `REPO_BRANCH` to the branch that contains them.
-3. Optional smoke run: set `SMOKE_TEST = True`. This uses 5% of users and one epoch, and the run ID is tagged `_smoke`.
-4. Full run: keep the defaults and choose *Runtime → Run all*.
-5. Load-only export: set `TRAIN_MODEL = False` and `LOAD_RUN_ID = "<run id>"`.
-6. Resume after a disconnect: set `RESUME_RUN_ID = "<run id>"`. It resumes from the Drive recovery checkpoint and is not guaranteed to be bitwise exact.
+2. Code version. The notebook pins `CODE_COMMIT` and the sha256 of both helper modules. It then clones, or fetches into an existing clean clone, and checks out that commit detached. It stops if the hashes or commit differ, or if an existing clone has local changes.
+3. Dependencies are checked before the helpers are imported. DuckDB is installed only if it is missing.
+4. The first execution uses the defaults:
+   - `SMOKE_TEST = True` (5% of users, one epoch, run ID tagged `_smoke`)
+   - `RUN_ABLATIONS = False`
+   - `RUN_OPTUNA = False`
+   - `RUN_RESUME_CHECK = True`
+5. Full main model: set `SMOKE_TEST = False`.
+6. Controls without retraining the main model:
+   - set `TRAIN_MODEL = False`, `LOAD_RUN_ID = "<main run>"` and `RUN_ABLATIONS = True`;
+   - the controls reuse the saved hyperparameters;
+   - the run ID ends in `_load_controls`.
+7. Resume after a disconnect: set `RESUME_RUN_ID = "<run id>"`. It resumes from the Drive recovery checkpoint and is not guaranteed to be bitwise exact.
+
+## Vector files
+
+Some pyarrow versions (18–20) cannot read nullable fixed-size-list vector columns. They fail with `Expected all lists to be of size=768 but index … had size=0`. For exactly that error, the loader falls back to DuckDB's Parquet reader, which keeps values, dimensions, IDs, row order and nulls. `run_config.json` records the reader used for each file.
+
+As an alternative, set `WRITE_COMPATIBLE_VECTORS = True`. This writes verified copies with variable-length lists under `OUTPUT_ROOT/compatible_vectors/` and uses them in place of the originals. Each copy is compared exactly with its source before it is accepted, and the originals are never modified.
 
 ## Outputs
 
-Local outputs go to `/content/bt4222_outputs/2.1_lstm/<run_id>/` in Colab, or `outputs/` locally. Both are ignored by Git. Each run is copied to `<DATA_ROOT>/Experiments/2.1_lstm/<run_id>/` and verified there with sha256 hashes.
+Local outputs go to `/content/bt4222_outputs/2.1_lstm/<run_id>/` in Colab, or `outputs/` locally. Both are ignored by Git.
+
+Each run is copied to `OUTPUT_ROOT/Experiments/2.1_lstm/<run_id>/` and verified there with sha256 hashes. By default, `OUTPUT_ROOT` is `MyDrive/BT4222 Experiment Outputs`, a folder you own and separate from the shared inputs. Setting it to the shared folder also works if you have edit access. The notebook checks write access before it trains.
 
 The run folder contains:
 
@@ -57,11 +73,11 @@ The run folder contains:
   - `mappings.npz`
   - `code/` (bundled modules)
   - `recovery/last_checkpoint.pt`
-- `metrics.json`, `run_config.json`, `training_history.{json,csv}`, `requirements.txt`, `reload_check.json`, `manifest.json`
+- `metrics.json`, `run_config.json`, `training_history.{json,csv}`, `requirements.txt`, `reload_check.json`, `resume_check.json`, `manifest.json`
 - `ablations/<variant>/summary.json`
 - `logs/notebook_log.txt`
 - `review_<run_id>.zip`
 
-Optuna, when enabled, writes `<DATA_ROOT>/Experiments/2.1_lstm/tuning/<study>/` containing a SQLite snapshot and `trials.csv`.
+Optuna, when enabled, writes `OUTPUT_ROOT/Experiments/2.1_lstm/tuning/<study>/` containing a SQLite snapshot and `trials.csv`.
 
 Validation metrics are **development** results, because validation is used for early stopping and selection. Test labels are unavailable, so no test metric is produced.

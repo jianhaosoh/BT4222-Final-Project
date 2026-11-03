@@ -9,8 +9,9 @@ Variants (``ModelConfig.variant``):
   attention           main model: candidate-specific attention over LSTM states
   last_state          simpler history summary: final LSTM state, same for all
                       candidates in the slate (no target-aware weighting)
-  attention_shuffled  order control: same as ``attention`` but trained/evaluated
-                      on histories in a fixed random order (prepared in data)
+  attention_shuffled  order-only control: same as ``attention``, with identical
+                      per-event features (computed chronologically), but each
+                      user's events fed in a fixed random order (prepared in data)
   attention_no_lstm   pooled control: attention directly over per-event inputs,
                       no recurrence
 """
@@ -427,12 +428,17 @@ def rng_state() -> dict:
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
 
 
+def _cpu_byte_tensor(value) -> torch.Tensor:
+    """RNG/generator states must be CPU uint8 tensors, whatever map_location did."""
+    return torch.as_tensor(value).detach().to(device="cpu", dtype=torch.uint8)
+
+
 def restore_rng_state(state: dict) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(_cpu_byte_tensor(state["torch"]))
     if state.get("cuda") and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([_cpu_byte_tensor(s) for s in state["cuda"]])
 
 
 def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
@@ -463,7 +469,9 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
     device_gen = torch.Generator(device=device).manual_seed(cfg.seed)
 
     if resume and recovery.is_file():
-        state = torch.load(recovery, map_location=device, weights_only=False)
+        # Load to CPU: model/optimizer tensors are moved to the parameters' device
+        # by load_state_dict, and RNG states must stay CPU uint8 tensors.
+        state = torch.load(recovery, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
@@ -472,12 +480,14 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         history, best, stale = state["history"], state["best"], state["stale"]
         start_epoch = state["epoch"] + 1
         restore_rng_state(state["rng"])
-        generator.set_state(state["generator"])
+        generator.set_state(_cpu_byte_tensor(state["generator"]))
+        if state.get("device_generator") is not None:
+            device_gen.set_state(_cpu_byte_tensor(state["device_generator"]))
         log(f"Resumed from {recovery} after epoch {state['epoch']} "
             f"(best epoch {best['epoch']}, AUC {best['auc']:.4f}). Exact bitwise "
             "resumption is not guaranteed (cuDNN/AMP nondeterminism).")
-        if state.get("finished"):
-            log("Recovery checkpoint marks training as finished; skipping the loop.")
+        if state.get("early_stopped") or state["epoch"] >= cfg.max_epochs:
+            log("Recovery checkpoint is already complete; skipping the training loop.")
             start_epoch = cfg.max_epochs + 1
 
     for epoch in range(start_epoch, cfg.max_epochs + 1):
@@ -530,12 +540,14 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             f"nDCG@5 {row['validation_ndcg@5']:.4f} | lr {lr:.2e} | "
             f"{row['seconds']:.0f}s{' *best*' if improved else ''}")
         # Stop after `early_stopping_patience` consecutive epochs without improvement.
-        finished = stale >= cfg.early_stopping_patience or epoch == cfg.max_epochs
+        early_stopped = stale >= cfg.early_stopping_patience
+        finished = early_stopped or epoch == cfg.max_epochs
         atomic_torch_save({
             "epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
             "history": history, "best": best, "stale": stale, "rng": rng_state(),
-            "generator": generator.get_state(), "finished": finished,
+            "generator": generator.get_state(), "device_generator": device_gen.get_state(),
+            "finished": finished, "early_stopped": early_stopped,
             "train_config": asdict(cfg),
         }, recovery)
         (out_dir / "training_history.json").write_text(json.dumps(history, indent=2))
@@ -547,7 +559,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
                 import optuna
                 raise optuna.TrialPruned()
         if finished:
-            if stale >= cfg.early_stopping_patience:
+            if early_stopped:
                 log(f"Early stopping: no validation AUC gain for {stale} epochs.")
             break
 

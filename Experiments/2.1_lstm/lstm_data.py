@@ -453,25 +453,6 @@ def build_history(path: Path, split_start: pd.Timestamp, max_len: int,
     return hist
 
 
-def shuffled_history(hist: HistoryArrays, seed: int) -> HistoryArrays:
-    """Order control: permute each user's retained events with a fixed seed.
-
-    Event-level values (article, read time, scroll, timestamp, so the gap to
-    the impression) move with their event; only the sequence order changes.
-    Order-derived inputs (gap to previous event) are disabled downstream.
-    """
-    rng = np.random.default_rng(seed)
-    max_len = hist.article_ids.shape[1]
-    keys = rng.random(hist.article_ids.shape)
-    keys[np.arange(max_len)[None, :] >= hist.lengths[:, None]] = np.inf
-    perm = np.argsort(keys, axis=1, kind="stable")
-    take = lambda a: np.take_along_axis(a, perm, axis=1)
-    return HistoryArrays(hist.user_ids, hist.lengths, hist.full_lengths,
-                         take(hist.article_ids), take(hist.times_s),
-                         take(hist.read_time), take(hist.scroll),
-                         {**hist.stats, "shuffled_seed": seed})
-
-
 # --------------------------------------------------------------------------
 # Article catalogue, vocabularies and frozen vectors
 # --------------------------------------------------------------------------
@@ -519,6 +500,59 @@ def load_catalogue(paths: list[Path]) -> tuple[pd.DataFrame, dict]:
     return catalogue, info
 
 
+FIXED_SIZE_LIST_ERROR = "Expected all lists to be of size"
+
+
+def _duckdb_read(path: Path, columns: list[str] | None = None) -> pa.Table:
+    """Read a Parquet file with DuckDB's own Parquet reader.
+
+    DuckDB decodes Parquet LIST columns from the Parquet levels rather than the
+    stored Arrow fixed_size_list hint, so it reads nullable fixed-size vector
+    columns that pyarrow 18-20 reject ("Expected all lists to be of size=...").
+    Values are returned unchanged as float32 lists; nulls stay null.
+    """
+    import duckdb
+    select = ", ".join('"' + c.replace('"', '""') + '"' for c in columns) if columns else "*"
+    escaped = str(path).replace("'", "''")
+    with duckdb.connect() as con:
+        relation = con.sql(f"SELECT {select} FROM read_parquet('{escaped}')")
+        # DuckDB 1.x and 2.x both provide to_arrow_table on relations.
+        if hasattr(relation, "to_arrow_table"):
+            table = relation.to_arrow_table()
+        else:  # pragma: no cover - older DuckDB
+            table = relation.fetch_arrow_table()
+    if isinstance(table, pa.RecordBatchReader):  # pragma: no cover
+        table = table.read_all()
+    return table
+
+
+def read_vector_table(path: Path, columns: list[str] | None = None) -> tuple[pa.Table, str]:
+    """pyarrow first; DuckDB only for the known nullable fixed-size-list failure."""
+    try:
+        return pq.read_table(path, columns=columns), f"pyarrow {pa.__version__}"
+    except pa.ArrowInvalid as error:
+        if FIXED_SIZE_LIST_ERROR not in str(error):
+            raise RuntimeError(f"Could not read {path}: {error!r}") from error
+        try:
+            import duckdb
+        except ImportError as missing:
+            raise RuntimeError(
+                f"{path}: pyarrow {pa.__version__} cannot decode its nullable fixed-size "
+                "vector column, and DuckDB is not installed for the fallback reader. "
+                "Install duckdb (pip install duckdb) and rerun; do not substitute zeros."
+            ) from missing
+        try:
+            table = _duckdb_read(path, columns)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"{path}: pyarrow failed ({error}) and DuckDB also failed "
+                f"({fallback_error!r}). The file exists, so this is a decoding problem, "
+                "not missing vectors; inspect the file rather than dropping rows."
+            ) from fallback_error
+        return table, (f"duckdb {duckdb.__version__} (pyarrow {pa.__version__} raised: "
+                       f"{str(error)[:80]})")
+
+
 def decode_vectors(path: Path, vector_column: str, flag_column: str,
                    expected_dim: int) -> tuple[np.ndarray, np.ndarray, dict]:
     """Actually decode a vector column (list, large_list or fixed_size_list).
@@ -527,15 +561,16 @@ def decode_vectors(path: Path, vector_column: str, flag_column: str,
     ids[available], available mask [n]). Unreadable files raise with a
     diagnosis; legitimate nulls are reported, never filled here.
     """
-    try:
-        table = pq.read_table(path, columns=["article_id", vector_column, flag_column])
-    except Exception as error:  # pragma: no cover - diagnostic path
-        raise RuntimeError(
-            f"Could not read {vector_column} from {path}: {error!r}. The file exists, "
-            "so this is a decoding/storage problem rather than missing vectors. "
-            "Inspect the Parquet schema (e.g. nullable fixed_size_list) and re-export "
-            "the vectors as variable-length float32 lists; do not substitute zeros."
-        ) from error
+    table, reader = read_vector_table(path, ["article_id", vector_column, flag_column])
+    ids, matrix, available, info = decode_vectors_from_table(
+        table, vector_column, flag_column, expected_dim, str(path))
+    info.update({"storage_type": str(pq.ParquetFile(path).schema_arrow.field(vector_column).type),
+                 "reader": reader})
+    return ids, matrix, available, info
+
+
+def decode_vectors_from_table(table: pa.Table, vector_column: str, flag_column: str,
+                              expected_dim: int, path: str):
     ids = table["article_id"].to_numpy().astype(np.int64)
     if len(np.unique(ids)) != len(ids):
         raise ValueError(f"{path}: duplicate article_id rows")
@@ -544,6 +579,11 @@ def decode_vectors(path: Path, vector_column: str, flag_column: str,
             or pa.types.is_fixed_size_list(vectors.type)):
         raise TypeError(f"{path}: {vector_column} has type {vectors.type}")
     available = pc.is_valid(vectors).to_numpy(zero_copy_only=False)
+    if not pa.types.is_fixed_size_list(vectors.type):
+        # Some writers store a missing vector as an empty list rather than null.
+        empty = available & (pc.list_value_length(vectors).fill_null(0)
+                             .to_numpy(zero_copy_only=False) == 0)
+        available = available & ~empty
     present = vectors.filter(pa.array(available))
     lengths = pc.list_value_length(present).to_numpy(zero_copy_only=False)
     if len(lengths) and not (lengths == expected_dim).all():
@@ -565,10 +605,58 @@ def decode_vectors(path: Path, vector_column: str, flag_column: str,
     norms = np.linalg.norm(matrix, axis=1) if len(matrix) else np.array([np.nan])
     info = {"path": str(path), "rows": len(ids), "available": int(available.sum()),
             "missing": int((~available).sum()), "dim": expected_dim,
-            "storage_type": str(table.schema.field(vector_column).type),
             "norm_min_median_max": [float(norms.min()), float(np.median(norms)),
                                     float(norms.max())]}
     return ids, matrix, available, info
+
+
+def write_compatible_vectors(source: Path, destination: Path, vector_column: str,
+                             flag_column: str, expected_dim: int) -> dict:
+    """Write a copy whose vectors are nullable variable-length float32 lists.
+
+    Every column, row order, article ID, null and float value is preserved; the
+    copy is re-read with pyarrow and compared exactly before it is accepted.
+    """
+    source, destination = Path(source), Path(destination)
+    if source.resolve() == destination.resolve():
+        raise ValueError("write the compatible copy to a different path")
+    table, reader = read_vector_table(source)
+    column = table[vector_column].combine_chunks()
+    # list_flatten emits exactly the values of non-null entries, in order, so
+    # offsets rebuilt from the per-entry lengths (0 for nulls) line up with them.
+    values = pc.list_flatten(column).cast(pa.float32())
+    lengths = pc.list_value_length(column).fill_null(0).to_numpy(zero_copy_only=False)
+    offsets = pa.array(np.r_[0, np.cumsum(lengths)].astype(np.int64))
+    if offsets[-1].as_py() != len(values):
+        raise AssertionError(f"{source}: flattened values do not match list lengths")
+    rebuilt = pa.ListArray.from_arrays(offsets.cast(pa.int32()), values,
+                                       type=pa.list_(pa.float32()), mask=pc.is_null(column))
+    out = table.set_column(table.schema.get_field_index(vector_column),
+                           pa.field(vector_column, pa.list_(pa.float32())), rebuilt)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp.parquet")
+    pq.write_table(out, temporary)
+    check = pq.read_table(temporary)
+    for name in table.column_names:
+        if name == vector_column:
+            continue
+        if not check[name].equals(table[name]):
+            temporary.unlink(missing_ok=True)
+            raise AssertionError(f"column {name} changed in the compatible copy")
+    a_ids, a_mat, a_ok, _ = decode_vectors_from_table(table, vector_column, flag_column,
+                                                       expected_dim, str(source))
+    b_ids, b_mat, b_ok, _ = decode_vectors_from_table(check, vector_column, flag_column,
+                                                       expected_dim, str(temporary))
+    if not (np.array_equal(a_ids, b_ids) and np.array_equal(a_ok, b_ok)
+            and np.array_equal(a_mat, b_mat)):
+        temporary.unlink(missing_ok=True)
+        raise AssertionError("vectors changed in the compatible copy")
+    os.replace(temporary, destination)
+    return {"source": str(source), "source_sha256": sha256_file(source),
+            "source_reader": reader, "destination": str(destination),
+            "destination_sha256": sha256_file(destination), "rows": len(a_ids),
+            "available": int(a_ok.sum()), "dim": expected_dim,
+            "verified_exact": True, "pyarrow": pa.__version__}
 
 
 def union_vectors(sources: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
@@ -820,8 +908,7 @@ class SplitArrays:
 
 def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
                        hist: HistoryArrays, articles: ArticleTable, stats: dict,
-                       device_columns: list, disable_order_features: bool = False
-                       ) -> SplitArrays:
+                       device_columns: list) -> SplitArrays:
     starts = offsets[:-1]
     first = frame.iloc[starts]
     imp_time = (first["impression_time"].astype("datetime64[us]").astype("int64")
@@ -887,8 +974,6 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
     scroll_z = _z(np.where(scroll_missing, 0, hist.scroll) / 100.0, stats["scroll_fraction"])
     prev = np.diff(hist.times_s, axis=1, prepend=0) / 3600.0
     prev_missing = ~mask | (np.arange(mask.shape[1])[None, :] == 0)
-    if disable_order_features:
-        prev_missing = np.ones_like(prev_missing)
     prev_z = np.where(prev_missing, 0.0,
                       _z(np.log1p(np.clip(prev, 0, None)), stats["log_gap_prev_h"]))
     pub = articles.published_s[hist_rows]
@@ -926,6 +1011,27 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
         hist_features=events, hist_lengths=hist.lengths,
         hist_full_lengths=hist.full_lengths,
         context_names=names, candidate_names=cand_names, event_names=event_names)
+
+
+def permute_history(arrays: SplitArrays, seed: int) -> SplitArrays:
+    """Order-only control: permute each user's retained events with a fixed seed.
+
+    Run this *after* build_split_arrays, so every event keeps exactly the
+    features computed in true chronological order (including its gap to the
+    previous event, read time, scroll, age at read and timestamp, hence its gap
+    to the impression). The ordered and shuffled variants therefore receive the
+    same per-event information; only the sequence order seen by the LSTM differs.
+    """
+    rng = np.random.default_rng(seed)
+    rows, max_len = arrays.hist_article_row.shape
+    keys = rng.random((rows, max_len))
+    keys[np.arange(max_len)[None, :] >= arrays.hist_lengths[:, None]] = np.inf
+    perm = np.argsort(keys, axis=1, kind="stable")
+    take = lambda a: np.take_along_axis(a, perm if a.ndim == 2 else perm[..., None], axis=1)
+    return SplitArrays(**{**arrays.__dict__,
+                          "hist_article_row": take(arrays.hist_article_row),
+                          "hist_times_s": take(arrays.hist_times_s),
+                          "hist_features": take(arrays.hist_features)})
 
 
 def coverage_report(split: SplitArrays, articles: ArticleTable) -> dict:
