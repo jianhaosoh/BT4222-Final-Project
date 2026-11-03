@@ -26,4 +26,8 @@ Gemini text vectors and supplied EB-NeRD image vectors separately, keyed by
 ## Experiments
 
 Use [Experiments/README.md](Experiments/README.md) for track numbering, the common
-notebook structure, prediction CSV formats and saved-model handoff requirements.
+notebook structure, business-linked explainability, prediction CSV formats and
+saved-model handoff requirements. Keep preprocessing shared, model training and
+validation development in the experiment notebooks, and cross-model comparison,
+reranking/ensembling and final evaluation together in one shared stage. Each model
+exports train, validation and test predictions for that handoff.
