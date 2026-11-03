@@ -110,6 +110,8 @@ embedded bins, projected to d = 64:
 * Selection, early stopping and `ReduceLROnPlateau` follow validation catalogue Recall@100 (see above); at most 4 epochs.
 
 These defaults are hypotheses. Optuna (`RUN_TUNING`) is optional and bounded, and off by default.
+When enabled, it now runs before main training and applies the selected trial's
+parameters to that training run. Selection uses validation only, never test.
 
 Differences between the HUIM paper, the BlackPearl code and this adaptation are tabulated in notebook §1. In
 summary, the "instant interest" features (exposure counts, slate size, in-slate ranks, session co-occurrence) are
@@ -264,8 +266,8 @@ Exported results on a request sample are sampled development results, not full-s
    Alternatively, use the existing Git checkout route with a Colab `GITHUB_TOKEN`
    secret that can read the private fork.
 3. In the first code cell, set the following:
-   * `DATA_ROOT`: the shared folder or its shortcut. It is read-only and is never written.
-   * `OUTPUT_ROOT`: writable persistent storage. The default is `MyDrive/BT4222 Experiment Runs/2.2_huim`. Use `BT4222 Shared Final Folder/Experiments/2.2_huim` only if you can write there; the write probe checks this.
+   * `DATA_ROOT`: the shared project folder or its shortcut. Source datasets are not modified.
+   * `OUTPUT_ROOT`: defaults to `DATA_ROOT/Experiments/2.2_huim`, so runs are shared with the group. You need edit access to this experiment folder.
    * `REPO_BRANCH`: used only for the Git checkout route.
 4. Run with `RUN_MODE = "smoke"` end to end. Then use `"development"`. Use `"full"` only after reading the preflight and refined budgets; it also needs `CONFIG_OVERRIDES = {"max_export_pairs": ...}`.
 
@@ -286,7 +288,8 @@ Exported results on a request sample are sampled development results, not full-s
 
 The run bundle is written to `PERSIST_DIR = OUTPUT_ROOT/<run_id>/`. It contains:
 
-* the model files: `model/weights.pt`, `model_config.json`, `preprocessing.json` and `article_ids.npy`;
+* the model files: `model/weights.pt`, `model_config.json`, `preprocessing.json`,
+  `article_ids.npy`, `feature_dictionary.json` and a copy of the helper source in `model/code/huim/`;
 * `run_config.json`, `metrics.json`, `export_manifest.json`, `requirements.txt` and `training_history.json`;
 * `recovery/`, the exports, the logs, and `_COMPLETE_RUN.json`.
 
@@ -294,6 +297,13 @@ Every file is copied and verified by SHA-256. `_COMPLETE_RUN.json` is written la
 check from the persistent copy has passed. Load-only mode accepts only a valid marker, so a summary file alone
 never marks a run complete. The selected weights are also stored inside the recovery checkpoint, so a crash
 between the two saves cannot mislabel them.
+
+`feature_dictionary.json` preserves ordered input names and categorical index-to-value
+mappings. `preprocessing.json` preserves the fitted vocabularies, bins and scaling;
+`article_ids.npy` preserves original article identity. Reuse these files on load,
+rather than fitting new preprocessing or guessing feature labels from weights.
+Reload checks include feature-name order as well as predictions. Embedding coordinates
+are learned/frozen representation dimensions, not interpretable word coefficients.
 
 ## What to return for review
 

@@ -113,10 +113,16 @@ The run folder contains (export schema v3):
   - `model_state.pt` (state_dict)
   - `model_config.json`
   - `preprocessing.json`
+  - `feature_dictionary.json` (ordered input names, category/topic index mappings and interpretation notes)
   - `catalogue_policy.json`
   - `mappings.npz`
   - `code/` (bundled modules)
   - `recovery/last_checkpoint.pt`
+
+Reload uses the saved preprocessing and original article mappings, never refits
+them, and checks the feature dictionary as well as predictions. This preserves
+feature meaning after loading; vector coordinates are not word-level coefficients.
+When Optuna is enabled, its selected parameters are applied before main training.
 - `metrics.json`, `run_config.json`, `export_manifest.json`, `catalogue_feasibility.json`, `training_history.{json,csv}`, `requirements.txt`, `reload_check.json`, `resume_check.json`, `manifest.json`
 - `ablations/<variant>/`: `summary.json` and `validation_per_impression.npz` (per-request Recall@100 and nDCG@100 on the selection sample, and diagnostic per-impression AUC), plus a `COMPLETE.json` marker that is written last and holds both files' hashes.
 - `selection/`: `validation_requests.csv` (selection requests), `train_requests.csv` (training requests, when sampled) and `{split}_export_requests.csv`.

@@ -350,7 +350,10 @@ class TestPersistence(unittest.TestCase):
             tr2.load_recovery(Path(tmp) / "recovery/last.pt")
             self.assertTrue((Path(tmp) / "model/weights.pt").is_file())  # restored from recovery
             hashes = save_model_files(Path(tmp), model, model.cfg, pre, art, {"selected_epoch": 0})
-            self.assertEqual(len(hashes), 4)
+            self.assertEqual(len(hashes), 5)
+            names = json.loads((Path(tmp) / "model/feature_dictionary.json").read_text())
+            self.assertEqual(names["ordered_features"]["request_context"], F.REQUEST_DENSE_COLUMNS(pre))
+            self.assertEqual(names["categorical_index_to_value"]["category_vocab"]["2"], pre.state["category_vocab"][0])
             loaded, cfg2, pre2, meta = load_model(Path(tmp), torch.device("cpu"))
             self.assertEqual(pre2.to_json(), json.loads(json.dumps(pre.to_json())))
             rp = torch.from_numpy(ctx.recorded["req_pos"])

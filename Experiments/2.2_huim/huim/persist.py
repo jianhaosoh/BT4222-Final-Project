@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
 
-from .features import Preprocessor
+from .features import Preprocessor, REQUEST_DENSE_COLUMNS, PAIR_DENSE_COLUMNS
 from .io_utils import atomic_write_json, read_json, sha256_file
 from .model import ModelConfig, build_model
 
-MODEL_FILES = ["model/weights.pt", "model/model_config.json", "model/preprocessing.json", "model/article_ids.npy"]
+MODEL_FILES = ["model/weights.pt", "model/model_config.json", "model/preprocessing.json",
+               "model/article_ids.npy", "model/feature_dictionary.json"]
 
 
 def save_model_files(run_dir: Path, model, model_cfg: ModelConfig, pre: Preprocessor, art, selection: dict) -> dict:
@@ -29,6 +31,28 @@ def save_model_files(run_dir: Path, model, model_cfg: ModelConfig, pre: Preproce
         "load": "huim.persist.load_model(bundle_dir, device); state_dict loaded with torch.load(weights_only=True)",
     })
     atomic_write_json(run_dir / "model" / "preprocessing.json", pre.to_json())
+    state = pre.to_json()
+    dictionary = {
+        "model_family": "HUIM-inspired candidate-aware attention",
+        "ordered_features": {"request_context": REQUEST_DENSE_COLUMNS(pre),
+                             "candidate": PAIR_DENSE_COLUMNS,
+                             "history_event": ["article representation", "read_time_bin", "scroll_bin", "recency_bin"]},
+        "categorical_index_to_value": {
+            key: {**{"0": "padding/missing", "1": "unknown"},
+                  **{str(i + 2): value for i, value in enumerate(values)}}
+            for key, values in state.items()
+            if key in ("category_vocab", "article_type_vocab", "sentiment_vocab", "topic_vocab", "subcategory_vocab")},
+        "device_one_hot_values": state["device_vocab"],
+        "fitted_transformations": "preprocessing.json (saved bins, cross-feature columns, scaling and vocabulary order)",
+        "article_row_to_original_id": "article_ids.npy",
+        "score": "click logit; sigmoid probability is uncalibrated",
+        "embedding_interpretation": "Vector coordinates are not word features; preserve source/dimensions and interpret meaningful groups.",
+    }
+    atomic_write_json(run_dir / "model" / "feature_dictionary.json", dictionary)
+    code_dir = run_dir / "model" / "code" / "huim"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    for source in Path(__file__).parent.glob("*.py"):
+        shutil.copy2(source, code_dir / source.name)
     tmp = run_dir / "model" / ".article_ids.npy.tmp"
     with open(tmp, "wb") as handle:
         np.save(handle, art.ids)
