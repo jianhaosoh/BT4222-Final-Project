@@ -228,10 +228,12 @@ def load_candidate_table(path: Path, split: str) -> tuple[pd.DataFrame, dict]:
             "users": int(frame["user_id"].nunique()),
             "device_columns": device_columns}
     if split == "test":
-        if labels.notna().any():
-            info["note"] = "test has non-null labels; they are ignored"
+        if labels.isna().any() or not labels.isin([0, 1]).all():
+            raise ValueError("Project holdout needs complete binary labels on disk; rebuild Step 1 and Step 3.")
+        # Source ground truth is reserved for the later frozen-pipeline evaluator.
         frame["clicked"] = np.nan
-        info["labelled"] = False
+        info.update({"labelled": False, "source_labelled": True,
+                     "role": "project holdout; targets masked during development"})
     else:
         if labels.isna().any():
             raise ValueError(f"{split}: missing click labels")
@@ -261,6 +263,7 @@ def cross_check_behaviours(frame: pd.DataFrame, behaviours_path: Path,
     """Confirm the feature rows equal the exploded in-view slates (and labels)."""
     names = pq.ParquetFile(behaviours_path).schema_arrow.names
     columns = ["user_id", "impression_id", "article_ids_inview"]
+    # Do not read holdout outcomes during the development consistency check.
     has_clicks = "article_ids_clicked" in names and split != "test"
     if has_clicks:
         columns.append("article_ids_clicked")
@@ -951,7 +954,7 @@ class SplitArrays:
     cand_article_id: np.ndarray    # [N] original
     cand_article_row: np.ndarray   # [N] article table row
     cand_features: np.ndarray      # [N, K] float32
-    labels: np.ndarray             # [N] float32 (NaN for test)
+    labels: np.ndarray             # [N] float32 (holdout targets masked to NaN)
     hist_article_row: np.ndarray   # [U+1, L]
     hist_times_s: np.ndarray       # [U+1, L]
     hist_features: np.ndarray      # [U+1, L, F] float32

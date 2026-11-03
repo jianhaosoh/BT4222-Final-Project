@@ -24,6 +24,24 @@ This does not require another owner's running experiment to adopt our technology
 or restart. Existing CSV outputs are legacy artifacts; migrate their reader with
 an explicit adapter when combining results.
 
+## Project holdout
+
+Run the updated Step 1 then Step 3 preprocessing notebooks before a full model
+run. Keep train and current validation unchanged; project test is a seed-43
+whole-user sample from unused original SMALL validation users, excluding current
+validation users, with their original validation histories. Target `train rows / 8`
+for the approximate 80–10–10 behaviour-row ratio. Validation and holdout share the
+original validation week and are user-disjoint from each other, not necessarily
+from the earlier train week. Step 3 rebuilds test features only using saved train
+transformations; article/embedding assets stay unchanged. The split manifest
+identifies `ebnerd_small_labelled_user_holdout_v1`.
+
+All three project datasets retain labels. Training notebooks mask holdout targets
+and export top 200 plus separate slate scores. Tune models and the reranker on
+validation; final evaluation joins holdout labels after the whole pipeline is
+frozen. The separate official challenge test is still unlabelled. Other model
+owners should adopt the same inputs and split roles.
+
 ## Stage-one task: learn relevance, then shortlist the eligible catalogue
 
 The intended recommendation pipeline is:
@@ -464,10 +482,10 @@ choices and Stage 2 reranking settings must be chosen using train/validation,
 then frozen before final evaluation. Do not use test metrics, leaderboard feedback
 or test business-metric comparisons to revise those choices.
 
-The supplied official test has no click labels: generate predictions and perform
-label-free schema, loading and export-integrity checks, but do not invent test
-AUC, nDCG or recall. If a genuine untouched labelled test/evaluation set is
-available later, evaluate the frozen pipeline for final reporting only. The
+The separate official challenge test has no click labels. Our project `test/`
+now contains a labelled holdout from unused original validation users. Keep its
+targets out of development: export predictions and do label-free integrity checks,
+then calculate outcome metrics only after the full pipeline is frozen. The
 existence of test predictions does not make that split a development set.
 
 ### Catalogue shortlisting and end-to-end checks
@@ -517,8 +535,9 @@ report tables.
 State the partition used for tuning and early stopping. If validation is used
 repeatedly for selection, report its scores as **development/validation results**,
 not an untouched final test. Any reserved labelled evaluation partition must be
-defined consistently across experiments before tuning. The official test split
-has no click labels: export predictions, but do not tune on it or invent metrics.
+defined consistently across experiments before tuning. Project holdout labels
+remain reserved for final evaluation; export predictions without inspecting
+outcomes during model or reranker development.
 
 Hyperparameter-search technology is optional. If using a tuner such as Optuna,
 document the search space, budget, sampler/pruner, seeds, objective and outcomes;
@@ -561,10 +580,11 @@ Document how to reconstruct the saved model without retraining; a load-only
 branch in the final training notebook is not required. Training predictions are
 in-sample diagnostics unless explicitly recorded as out-of-fold predictions.
 Use validation for agreed model selection; do not tune on test results. The
-current official test files have **no click labels**: still export test predictions;
-labels may be joined separately only where genuine ground truth becomes
-available. The shared evaluation stage must otherwise record test metrics as
-unavailable. Notebook outputs alone do not establish that a model can be reloaded.
+project holdout has labels on disk; mask them in development loaders and still
+export predictions. Join them in the final evaluation stage only after all
+model and reranker settings are frozen. The independent official challenge test
+remains unlabelled. Notebook outputs alone do not establish that a model can be
+reloaded.
 
 ## Shared behaviour identifier
 
@@ -574,8 +594,8 @@ integer IDs. For example, user `12345` and impression `67890` become
 `12345:67890`. Treat this column as a string. Use the same definition for every
 model and split; do not use a dataframe row number or an encoded model index.
 
-This preserves the shared grouping key `(user_id, impression_id)`: test
-`impression_id` values alone are not unique across users. The split is identified
+This preserves the shared grouping key `(user_id, impression_id)`: official-test
+`impression_id` values alone can repeat across users. The split is identified
 by the file name. The evaluation owner can recover both original IDs by splitting
 `behaviour_id` at `:` and join labels/context from the shared input tables.
 
@@ -630,8 +650,8 @@ slate separately when eligibility differs; report ineligible recorded candidates
 rather than dropping them. Store all original slate rows, not only clicks.
 
 Join observed labels separately using the original IDs. Unshown articles remain
-unknown, not negatives; official test labels remain unavailable. Recorded-slate
-AUC answers whether shown-clicked articles outrank shown-unclicked articles.
+unknown, not negatives; project holdout labels remain reserved for final
+evaluation. Recorded-slate AUC answers whether shown-clicked articles outrank shown-unclicked articles.
 Catalogue known-click Recall@100/200 answers whether the shortlist recovers
 known clicks from the larger pool. Do not present catalogue precision as observed
 click precision or build a catalogue-wide click/no-click confusion matrix by
@@ -692,7 +712,7 @@ Record the selection request sample/interval if used. Final cross-model tables,
 train/validation comparisons and reranking results belong in the shared evaluation
 stage, using the same split and candidate rows for every model. The existing saved
 baseline benchmark used its own sample and is not directly comparable by default.
-Do not report a score for unlabelled test data.
+Report project holdout metrics only after the complete pipeline is frozen.
 
 The reranking/evaluation owner receives all three splits' top-200 scores,
 top-200 shortlists and separate complete recorded-slate diagnostics. Tune any
@@ -743,5 +763,5 @@ search plots. Report retrieval curves at K up to 200, user-cluster uncertainty,
 recorded-slate AUC, history/coverage subgroup errors, representative recommendations
 and missing-vector effects. Explain model decisions with meaningful feature/history
 groups; attention weights alone are not causal explanations. Later Stage 2 analysis compares
-relevance, freshness, diversity and continuity before/after reranking. Keep test
-outcomes out of every tuning and reranking decision.
+relevance, freshness, diversity and continuity before/after reranking. Keep
+holdout outcomes out of every tuning and reranking decision.

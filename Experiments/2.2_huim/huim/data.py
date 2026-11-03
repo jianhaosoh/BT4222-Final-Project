@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 from .io_utils import file_record, read_json
 
 SPLITS = ("train", "validation", "test")
-LABELLED_SPLITS = ("train", "validation")
+DEVELOPMENT_SPLITS = ("train", "validation")
 
 # Article columns used by the model. Totals (inviews/pageviews/read time) are
 # first-seven-day aggregates and last_modified_time is later than the impression:
@@ -429,7 +429,10 @@ def load_behaviours(path: Path, split: str) -> pd.DataFrame:
     missing = set(BEHAVIOUR_COLUMNS_REQUIRED) - available
     if missing:
         raise ValueError(f"{path} lacks {sorted(missing)}")
-    columns = BEHAVIOUR_COLUMNS_REQUIRED + [c for c in BEHAVIOUR_COLUMNS_OPTIONAL if c in available]
+    if "article_ids_clicked" not in available:
+        raise ValueError(f"{split}: expected labelled project data; rebuild Step 1 and Step 3")
+    columns = BEHAVIOUR_COLUMNS_REQUIRED + [c for c in BEHAVIOUR_COLUMNS_OPTIONAL
+                if c in available and (c != "article_ids_clicked" or split in DEVELOPMENT_SPLITS)]
     frame = pd.read_parquet(path, columns=columns)
     if frame[["user_id", "impression_id"]].isna().any().any():
         raise ValueError(f"{split}: null user_id/impression_id")
@@ -445,7 +448,7 @@ def load_behaviours(path: Path, split: str) -> pd.DataFrame:
         raise ValueError(f"{split}: empty recorded slate")
     if frame.article_ids_inview.map(lambda a: len(a) != len(np.unique(a))).any():
         raise ValueError(f"{split}: duplicate article within a recorded slate")
-    if split in LABELLED_SPLITS:
+    if split in DEVELOPMENT_SPLITS:
         if "article_ids_clicked" not in frame:
             raise ValueError(f"{split}: no click labels")
         frame["article_ids_clicked"] = frame.article_ids_clicked.map(lambda v: np.asarray(v, dtype="int64"))
@@ -453,7 +456,7 @@ def load_behaviours(path: Path, split: str) -> pd.DataFrame:
         if any(bad):
             raise ValueError(f"{split}: clicked article outside recorded slate in {sum(bad)} rows")
     else:
-        frame["article_ids_clicked"] = None  # official test labels stay unknown
+        frame["article_ids_clicked"] = None  # holdout labels remain on disk for final evaluation only
     # Deterministic request order used by every export.
     return frame.sort_values(["user_id", "impression_id"], kind="stable").reset_index(drop=True)
 
@@ -475,7 +478,7 @@ def load_recorded_pairs(feature_path: Path, split: str, behaviours: pd.DataFrame
     check = pairs.merge(exploded, on=cols[:3], how="outer", indicator=True)
     if not (check["_merge"] == "both").all():
         raise ValueError(f"{split}: feature-table keys differ from recorded slates")
-    if split in LABELLED_SPLITS:
+    if split in DEVELOPMENT_SPLITS:
         if pairs.clicked.isna().any():
             raise ValueError(f"{split}: missing click labels")
         clicks = behaviours[["user_id", "impression_id", "article_ids_clicked"]].explode("article_ids_clicked")
@@ -485,9 +488,9 @@ def load_recorded_pairs(feature_path: Path, split: str, behaviours: pd.DataFrame
             raise ValueError(f"{split}: feature-table labels disagree with article_ids_clicked")
         pairs["clicked"] = pairs.clicked.astype("int8")
     else:
-        if pairs.clicked.notna().any():
-            raise ValueError("test feature table unexpectedly has labels")
-        pairs["clicked"] = np.nan  # unknown, never zero
+        if pairs.clicked.isna().any() or not pairs.clicked.isin([0, 1]).all():
+            raise ValueError("Project holdout needs complete binary labels on disk; rebuild Step 1 and Step 3.")
+        pairs["clicked"] = np.nan  # reserved ground truth, masked during development
     return pairs
 
 

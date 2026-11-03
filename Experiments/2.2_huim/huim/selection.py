@@ -46,7 +46,7 @@ class CatalogueSelector:
             "secondary": "observed-click nDCG@100 (ideal over all original known clicks, capped at 100)",
             "tie_breaker": "higher Recall@100, then higher nDCG@100, then the earlier checkpoint/trial",
             "selection_k": C.SELECTION_K, "export_k": C.EXPORT_K, "shortlist_size": C.SHORTLIST_SIZE, "ranking_order": "descending score, ties by ascending article_id",
-            "partition": "official validation split (development data; used repeatedly for selection)",
+            "partition": "project validation subset (development data; used repeatedly for selection)",
             "pool": "full time-eligible catalogue for every sampled request (no sampled negatives)",
             "eligibility_rules": C.ELIGIBILITY_RULES, "pool_policy": "published_at_or_before_request_v1",
             "catalogue_policy": cfg["catalogue_policy"]["validation"], "catalogue_ids_sha256": cat_digest,
@@ -61,7 +61,7 @@ class CatalogueSelector:
             "interval_steps": cfg["selection_interval_steps"], "evaluate_at_epoch_end": True,
             "early_stopping_patience_evaluations": cfg["early_stopping_patience"],
             "min_improvement": cfg["min_improvement"],
-            "reserved_final_partition": None,  # none is declared by the shared protocol; test has no labels
+            "reserved_final_partition": "project test: unused original validation users; evaluate after full pipeline freeze"
         }
 
     def sample_record(self) -> dict:

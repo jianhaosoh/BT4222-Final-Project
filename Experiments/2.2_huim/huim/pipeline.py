@@ -166,7 +166,8 @@ def prepare_inputs(cfg: dict, data_root: Path, pre: F.Preprocessor | None = None
                   "recorded_candidates_not_in_union": int(len(np.setdiff1d(pairs[s].candidate_article_id.to_numpy(np.int64),
                                                                           articles.article_id.to_numpy())))}
               for s in D.SPLITS}
-    reports = {"catalogues": catalogues["report"], "referenced_articles_not_in_any_catalogue": int(len(not_found)),
+    reports = {"test_role": "labelled project holdout; targets masked until final evaluation",
+               "catalogues": catalogues["report"], "referenced_articles_not_in_any_catalogue": int(len(not_found)),
                "pool_policy": POOL_POLICY, "pool_fingerprint": pool, "pool_source_files": pool_sources,
                "article_lookup_coverage": lookup,
                "history": {s: history[s]["report"] for s in D.SPLITS},
@@ -369,7 +370,7 @@ def export_recorded(model, ws: Workspace, run_dir: Path, device) -> dict:
         bad = C.recorded_eligibility(ws.ctx[s], ws.art)
         bad.to_csv(Path(run_dir) / "diagnostics" / "recorded_slates" / f"{s}_catalogue_ineligible.csv", index=False)
         info["catalogue_ineligible_recorded_candidates"] = bad.reason.value_counts().to_dict()
-        if s in D.LABELLED_SPLITS:
+        if s in D.DEVELOPMENT_SPLITS:
             info["metrics"] = impression_metrics(ws.ctx[s].recorded["req_pos"],
                                                  ws.ctx[s].recorded["label"].astype(int), logits, k=5)
         out[s] = info
@@ -392,7 +393,7 @@ def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, re
     results = {}
     for s, positions in request_sets.items():
         scorer = C.CatalogueScorer(model, ctx[s], art, device, cfg["pair_chunk"], cfg["inference_amp"])
-        clicks = C.click_eligibility(ws.ctx[s], ws.art, positions) if s in D.LABELLED_SPLITS else None
+        clicks = C.click_eligibility(ws.ctx[s], ws.art, positions) if s in D.DEVELOPMENT_SPLITS else None
         progress = C.export_split(scorer, out_root, positions, click_info=clicks,
                                   recorded_counts=_recorded_bad_counts(ws, s), request_block=cfg["request_block"], log=log)
         validation = validate_export(ws.ctx[s], ws.art, out_root, positions)
@@ -407,14 +408,14 @@ def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, re
             empty += int((frame.eligible_count == 0).sum())
             if len(frame):
                 min_len, max_len = min(min_len, int(frame.shortlist_length.min())), max(max_len, int(frame.shortlist_length.max()))
-            if s in D.LABELLED_SPLITS:
+            if s in D.DEVELOPMENT_SPLITS:
                 for k in summaries:
                     summaries[k].append(recall_summary(frame, k))
         summary = {"requests": requests, "scored_pairs": progress["scored_pairs"], "empty_pools": empty,
                    "retained_score_rows": progress["rows_scores"], "seconds": progress["seconds"],
                    "shortlist_length": {"min": min_len if requests else 0, "max": max_len,
                                         "mean": lengths / requests if requests else 0.0}}
-        if s in D.LABELLED_SPLITS:
+        if s in D.DEVELOPMENT_SPLITS:
             metrics = {}
             for k, chunks in summaries.items():
                 known = sum(c["requests_with_known_clicks"] for c in chunks)

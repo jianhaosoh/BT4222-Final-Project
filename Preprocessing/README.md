@@ -6,7 +6,24 @@ Run [step3_feature_engineering.ipynb](step3_feature_engineering.ipynb) in Colab 
 MyDrive/Colab Notebooks/BT4222 Shared Final Folder/feature_engineering/
 ```
 
-Each row is one candidate article shown in an impression. Train and validation have `clicked` (1 for a clicked candidate, 0 otherwise). Test has a null `clicked` column. Every feature file has the same column names for its case. The history features are already joined into these files; `*_history_profiles.parquet` is for inspecting the intermediate per-user profiles.
+Each row is one candidate article shown in an impression. All project splits have binary `clicked` on disk (1 for a clicked candidate, 0 otherwise). Test is the labelled project holdout; development loaders hide its targets. Every feature file has the same column names for its case. The history features are already joined into these files; `*_history_profiles.parquet` is for inspecting the intermediate per-user profiles.
+
+## Labelled project holdout
+
+Run Step 1 then Step 3 in Colab. Step 1 keeps the existing validation users and
+samples whole users from the unused original SMALL validation data, excluding
+validation users, with seed 43 and a target of `train rows / 8`. It saves their
+behaviours and matching original validation histories under `test/`.
+Validation and holdout share the original validation week and have no users in
+common; earlier train-user overlap is allowed. The 80–10–10 ratio is approximate
+by behaviour rows. The official challenge test is a separate unlabelled dataset.
+
+Step 3 rebuilds test features/profiles/log/scaled files only, reusing saved
+train-fitted state. Article catalogues, embeddings and train/validation feature
+files stay unchanged. `split_manifest.json` records the new membership and source.
+The final evaluator joins keys and `clicked` from `test_features.parquet` after
+model and reranker settings are frozen; `load_xy("test", ...)` keeps returning
+`y=None` during development. The preview notebook shows holdout counts only.
 
 ## Four input cases
 
@@ -25,7 +42,7 @@ The `log` and `log_scaled` cases require Step 15 of the notebook to have selecte
 
 ## Columns in the generated datasets
 
-The last executed Step 3 schema in `step3_feature_engineering.ipynb` contains **209 raw columns**: 43 fixed columns, 116 history-preference columns, and 50 one-hot columns. The train, validation, and test feature files use this schema; `clicked` is null in test. Of the 209 columns, 202 are predictors selected by `load_xy()` and seven are identifiers, time, split, or target fields. The vocabulary comes from train, so regenerate this list from Parquet metadata if you rebuild with different source data.
+The last executed Step 3 schema in `step3_feature_engineering.ipynb` contains **209 raw columns**: 43 fixed columns, 116 history-preference columns, and 50 one-hot columns. The train, validation, and test feature files use this schema; `clicked` is binary in the project holdout and reserved for final evaluation. Of the 209 columns, 202 are predictors selected by `load_xy()` and seven are identifiers, time, split, or target fields. The vocabulary comes from train, so regenerate this list from Parquet metadata if you rebuild with different source data.
 
 **Identifiers, time, and target (7):**
 
@@ -236,7 +253,7 @@ def load_xy(split, case):
     X = data[feature_columns].copy()
     keys = data[key_columns].copy()
     if split == "test":
-        y = None
+        y = None  # holdout targets stay on disk until final evaluation
     else:
         if data["clicked"].isna().any():
             raise ValueError(f"{split} has missing click labels")
@@ -260,7 +277,7 @@ print("Train target:", y_train.value_counts().to_dict())
 # assert X_train.columns.equals(X_test.columns) and y_test is None
 ```
 
-`X_train`, `X_validation`, and `X_test` are the model input tables. `y_train` and `y_validation` are the click targets. Keep `train_keys`, `validation_keys`, and `test_keys` beside the predictions so you can group candidates by **`(user_id, impression_id)`** and identify each article. In the test data, `impression_id` alone is not unique across users.
+`X_train`, `X_validation`, and `X_test` are the model input tables. `y_train` and `y_validation` are the click targets. Keep `train_keys`, `validation_keys`, and `test_keys` beside the predictions so you can group candidates by **`(user_id, impression_id)`** and identify each article. Use the composite key consistently; historical official-test impression IDs can repeat across users.
 
 Fit the model with `X_train, y_train`, evaluate it with `X_validation, y_validation`, and predict on `X_test`. The numbered one-hot and history-preference columns are mapped to their original values in `feature_vocabulary.json`.
 

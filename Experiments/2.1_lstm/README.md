@@ -98,7 +98,7 @@ validation at both K=100 and K=200; export size does not change the selection
 objective. Recall denominators and nDCG ideals retain all original known clicks,
 including missed/ineligible clicks. Unshown articles' zero observed gain is
 retrieval bookkeeping, not a non-click label. Validation is repeatedly used
-**development** data. Official test labels and test outcome metrics are unavailable.
+**development** data. Project test labels are kept on disk for final evaluation and masked during development.
 
 ## Outputs and persistent model bundle
 
@@ -165,3 +165,10 @@ models on identical validation requests/pools. Learning curves, Optuna plots,
 ablations, history/coverage subgroups, meaningful feature/history explanations and
 Stage 2 trade-offs belong there. Attention weights alone are not causal
 explanations. No SHAP or evaluation notebook is created in this update.
+
+Before running, execute the updated Step 1 and Step 3 preprocessing notebooks.
+Project test now comes from unused original validation users and their histories;
+train and validation membership stays unchanged. The split manifest is saved
+with the run. Tune both stages on validation, then evaluate the labelled holdout
+after the whole pipeline is frozen. Top-200 and separate slate exports stay the
+same. The independent official challenge test remains unlabelled.

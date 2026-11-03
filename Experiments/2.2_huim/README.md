@@ -46,7 +46,7 @@ AdamW, gradient clipping and GPU mixed precision train the model on recorded-sla
 
 **Selection remains K=100 while export K=200.** Recall is macro-averaged over requests with original known clicks. Missed/ineligible clicks stay in the denominator. Observed-click nDCG uses those same original clicks in its ideal, capped at K; zero observed gain for an unshown article is retrieval bookkeeping, never an observed non-click label. Exact checkpoint ties retain the earlier checkpoint.
 
-Validation is reused for development selection. Recorded-slate AUC is diagnostic only. Exported validation reports Recall@100/200 and observed-click nDCG@100/200 separately from the 100-request selection sample. Test has no labels and no reported click metrics. Training predictions are in-sample, not out-of-fold stacking inputs.
+Validation is reused for development selection. Recorded-slate AUC is diagnostic only. Exported validation reports Recall@100/200 and observed-click nDCG@100/200 separately from the 100-request selection sample. Project test labels are reserved for final evaluation and masked in this notebook. Training predictions are in-sample, not out-of-fold stacking inputs.
 
 ## Shared catalogue and request identity
 
@@ -98,3 +98,10 @@ Internal recovery helpers remain available for development, but the submitted no
 The planned shared evaluation notebook loads these selected bundles without retraining. It will use saved histories and trials for learning/search plots, compare identical validation requests and pools, inspect representative recommendations and history/feature groups, and assess coverage, missing-vector effects, uncertainty and Stage 2 relevance/freshness/diversity/continuity trade-offs. Attention weights alone are not causal explanations. Keep test outcomes out of selection and reranker tuning.
 
 Static/synthetic checks use `python3 -m unittest discover -s tests -v` from this directory. They do not run training or an Optuna search. Source ZIP regeneration must include exactly the current `huim/*.py` files.
+
+Before running, execute the updated Step 1 and Step 3 preprocessing notebooks.
+Project test now comes from unused original validation users and their histories;
+train and validation membership stays unchanged. The split manifest is saved
+with the run. Tune both stages on validation, then evaluate the labelled holdout
+after the whole pipeline is frozen. Top-200 and separate slate exports stay the
+same. The independent official challenge test remains unlabelled.
