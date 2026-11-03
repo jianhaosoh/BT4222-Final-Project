@@ -481,12 +481,18 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         start_epoch = state["epoch"] + 1
         restore_rng_state(state["rng"])
         generator.set_state(_cpu_byte_tensor(state["generator"]))
-        if state.get("device_generator") is not None:
+        if (state.get("device_generator") is not None
+                and state.get("device_generator_type") == device.type):
             device_gen.set_state(_cpu_byte_tensor(state["device_generator"]))
+        elif state.get("device_generator") is not None:
+            log(f"Checkpoint generator was saved on {state.get('device_generator_type')}, "
+                f"resuming on {device.type}: history-dropout RNG restarts from the seed.")
         log(f"Resumed from {recovery} after epoch {state['epoch']} "
             f"(best epoch {best['epoch']}, AUC {best['auc']:.4f}). Exact bitwise "
             "resumption is not guaranteed (cuDNN/AMP nondeterminism).")
-        if state.get("early_stopped") or state["epoch"] >= cfg.max_epochs:
+        # Older checkpoints have no "early_stopped" key; treat "finished" as such.
+        if state.get("early_stopped", state.get("finished", False)) \
+                or state["epoch"] >= cfg.max_epochs:
             log("Recovery checkpoint is already complete; skipping the training loop.")
             start_epoch = cfg.max_epochs + 1
 
@@ -547,6 +553,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
             "history": history, "best": best, "stale": stale, "rng": rng_state(),
             "generator": generator.get_state(), "device_generator": device_gen.get_state(),
+            "device_generator_type": device.type,
             "finished": finished, "early_stopped": early_stopped,
             "train_config": asdict(cfg),
         }, recovery)
