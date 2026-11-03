@@ -778,6 +778,18 @@ class TestVectorPrecedence(unittest.TestCase):
             self.assertGreater(rep["test"]["overlap_max_abs_diff"], 0)
             self.assertEqual(rep["article_ids_with_a_record"], 4)
 
+    def test_missing_first_record_with_larger_later_id_does_not_crash(self):
+        """Regression: overlap diagnostic indexed past the end when the earlier record was missing."""
+        from huim import data as D
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self.write(tmp, "train_val", [(1, [1.0, 0.0]), (9, None)])
+            b = self.write(tmp, "test", [(9, [3.0, 4.0]), (3, [5.0, 5.0])])
+            paths = D.DataPaths(root=Path(tmp), image_vectors={"train_val": a, "test": b})
+            ids, vectors, rep = D.load_vectors(paths, "image", ["train_val", "test"], 2)
+            self.assertEqual(ids.tolist(), [1, 3])  # 9 stays missing
+            self.assertEqual(rep["test"]["later_vectors_not_backfilled_for_earlier_missing"], 1)
+
     def test_malformed_records_fail_instead_of_becoming_missing(self):
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -843,6 +855,17 @@ class TestSharedSampling(unittest.TestCase):
         self.assertEqual(info2["reference"]["matches_own_hash_selection"], set(other) == set(own))
         with self.assertRaises(ValueError):
             S.resolve_scope(req, "validation", "selection_validation", 8, 42, {"ids": ["999:999"], "source": "x"})
+        # A different-size reference never overrides the configured limit (incl. None = all requests).
+        for n in (5, 12, None):
+            pos3, info3 = S.resolve_scope(req, "validation", "export_validation", n, 42, {"ids": own, "source": "x"})
+            self.assertEqual(info3["used"], "own_hash_selection")
+            self.assertEqual(len(pos3), len(req) if n is None else n)
+            self.assertIn("not_used", info3["reference"])
+        with self.assertRaises(ValueError):  # other sampling seed
+            S.resolve_scope(req, "validation", "selection_validation", 8, 42, {"ids": own, "source": "x", "seed": 7})
+        with self.assertRaises(ValueError):  # other pool policy
+            S.resolve_scope(req, "validation", "selection_validation", 8, 42,
+                            {"ids": own, "source": "x", "policy": "split_catalogues"})
 
     def test_reads_31_run_folder(self):
         from huim import sampling as S

@@ -398,11 +398,10 @@ def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expec
         if len(matrix) and earlier_usable.any() and kept_ids:
             prior_ids = np.concatenate(kept_ids)
             prior_vec = np.concatenate(kept_vectors)
-            order = np.argsort(prior_ids)
-            loc = order[np.searchsorted(prior_ids[order], ids[earlier_usable])]
-            both = prior_ids[loc] == ids[earlier_usable]
-            if both.any():
-                diag["overlap_max_abs_diff"] = float(np.abs(prior_vec[loc[both]] - matrix[earlier_usable][both]).max())
+            # Overlap of usable vectors in both sources (IDs whose earlier record is missing are not in prior_ids).
+            _, ia, ib = np.intersect1d(prior_ids, ids, assume_unique=True, return_indices=True)
+            if len(ia):
+                diag["overlap_max_abs_diff"] = float(np.abs(prior_vec[ia] - matrix[ib]).max())
         new = ~earlier_usable
         kept_ids.append(ids[new])
         kept_vectors.append(matrix[new])

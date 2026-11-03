@@ -100,22 +100,30 @@ def resolve_scope(requests: pd.DataFrame, split: str, purpose: str, n: int | Non
     info = {"purpose": purpose, "split": split, "limit": n, "seed": seed, "rule": SAMPLING_RULE,
             "population_requests": int(len(requests))}
     used = own
+    info["used"] = "own_hash_selection"
     if reference is not None:
+        ref_seed, ref_policy = reference.get("seed"), reference.get("policy")
+        if ref_seed is not None and int(ref_seed) != int(seed):
+            raise ValueError(f"{purpose}/{split}: reference sampling seed {ref_seed} != {seed}")
+        if ref_policy is not None and ref_policy != POOL_POLICY["name"]:
+            raise ValueError(f"{purpose}/{split}: reference pool policy {ref_policy!r} != {POOL_POLICY['name']!r}")
         index = pd.Index(bids)
         pos = index.get_indexer(reference["ids"])
         if (pos < 0).any():
             raise ValueError(f"{purpose}/{split}: {int((pos < 0).sum())} reference IDs from {reference['source']} are "
                              "not in this request population; the inputs differ — do not compare these scopes")
         own_same_n = hash_prefix(requests, split, len(reference["ids"]), seed)
+        target = len(requests) if n is None else int(n)
         info["reference"] = {"source": reference["source"], "requests": len(reference["ids"]),
-                             "reference_seed": reference.get("seed"), "reference_policy": reference.get("policy"),
+                             "reference_seed": ref_seed, "reference_policy": ref_policy,
                              "matches_own_hash_selection": bool(set(bids[own_same_n]) == set(reference["ids"]))}
-        if n is not None and len(reference["ids"]) != n:
-            info["reference"]["note"] = f"reference has {len(reference['ids'])} requests; configured limit {n}"
-        used = chronological(requests, pos)
-        info["used"] = "reference_ids"
-    else:
-        info["used"] = "own_hash_selection"
+        if len(reference["ids"]) == min(target, len(requests)):
+            used = chronological(requests, pos)  # same scope size: prefer the saved 3.1 IDs
+            info["used"] = "reference_ids"
+        else:
+            # A different-size reference is a different scope; never let it override the configured limit.
+            info["reference"]["not_used"] = (f"reference has {len(reference['ids'])} requests but this scope needs "
+                                            f"{target}; own hash selection used")
     ids = bids[used]
     info.update(requests=int(len(used)), behaviour_ids_sha256=ids_digest(ids),
                 first_ids=ids[:5].tolist())

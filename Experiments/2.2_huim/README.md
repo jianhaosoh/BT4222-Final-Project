@@ -169,7 +169,10 @@ download limit. The Colab preflight cell is the first check on them.
 * The smallest N requests by (priority, `behaviour_id`) are selected and then processed by (`impression_time`, `user_id`, `impression_id`).
 * Three separate limits apply: training, selection-validation and export per split. A smaller N is a prefix of the same order, so the 25 exported validation requests are a subset of the 100 selection requests.
 * Requests come from the complete population of each split. A training request keeps its complete recorded slate, and fixed histories are not augmented.
-* With `REFERENCE_31_RUN` set, 3.1's saved IDs are reused (`input_audit.json` `selection_requests`, `eligibility/{split}_requests.csv`). Our own hash selection is always recorded with `matches_own_hash_selection`.
+* With `REFERENCE_31_RUN` set, 3.1's saved IDs are reused (`input_audit.json` `selection_requests`, `eligibility/{split}_requests.csv`), but only for a scope of the **same size**.
+  * A different-size reference never overrides a limit, including `None` (all requests); it is recorded as `not_used`.
+  * A reference with another sampling seed or pool policy raises an error.
+  * Our own hash selection is always recorded, with `matches_own_hash_selection`. "Sampled" is computed from the actual scope sizes.
 * A synthetic test and a check on the real mini feature tables both show identical IDs **and** processing order to 3.1's indexer, imported read-only.
 
 **Metric scopes stay separate.** `metrics.json` has `selection_validation` (the selection requests, re-scored for

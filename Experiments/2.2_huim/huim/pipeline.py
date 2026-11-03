@@ -128,6 +128,12 @@ def prepare_inputs(cfg: dict, data_root: Path, pre: F.Preprocessor | None = None
     if list(cfg["vector_source_order"]) != union:
         raise ValueError(f"vector_source_order must be {union} under {POOL_POLICY['name']}")
     articles, catalogues = D.load_articles(paths, union)
+    # Eligibility compares whole seconds; 3.1 compares full timestamps. Refuse data where that could differ.
+    for name, values in [("articles.published_time", articles.published_time)] + \
+            [(f"{s}.impression_time", behaviours[s].impression_time) for s in D.SPLITS]:
+        ts = pd.to_datetime(values).dropna()
+        if len(ts) and (ts.dt.microsecond.ne(0).any() or ts.dt.nanosecond.ne(0).any()):
+            raise ValueError(f"{name} has sub-second timestamps; second-resolution eligibility would differ from 3.1")
     log(f"articles: {len(articles):,} unique IDs from {union}")
     text_ids, text_vecs, text_rep = D.load_vectors(paths, "text", cfg["vector_source_order"], cfg["text_dim"])
     image_ids, image_vecs, image_rep = D.load_vectors(paths, "image", cfg["vector_source_order"], cfg["image_dim"])
@@ -149,19 +155,21 @@ def prepare_inputs(cfg: dict, data_root: Path, pre: F.Preprocessor | None = None
     members = np.unique(np.concatenate([catalogues["members"][n] for n in union]))  # the same union for every split
     for s in D.SPLITS:
         ctx[s] = F.build_split_context(s, behaviours[s], events[s], history[s]["users"], art, pre, members, pairs[s])
+    # Pool identity = policy + sorted IDs + publication times (content), never file paths/mtimes.
     pool = sampling.pool_fingerprint(art.ids[ctx["train"].catalogue_idx],
-                                     art.tensors["pub_s"].numpy()[ctx["train"].catalogue_idx],
-                                     {n: {k: v for k, v in file_record(paths.articles[n], None).items()
-                                          if k != "sha256"} for n in union})
+                                     art.tensors["pub_s"].numpy()[ctx["train"].catalogue_idx], {})
+    pool_sources = {n: file_record(paths.articles[n], 0) for n in union}  # size/mtime only; not a content hash
     for s in D.SPLITS:
-        assert np.array_equal(ctx[s].catalogue_idx, ctx["train"].catalogue_idx), "pool differs across splits"
+        if not np.array_equal(ctx[s].catalogue_idx, ctx["train"].catalogue_idx):
+            raise RuntimeError(f"{s}: pool differs from train under {POOL_POLICY['name']}")
     lookup = {s: {"history_articles_not_in_union": int(len(np.setdiff1d(events[s].article_id.to_numpy(np.int64),
                                                                        articles.article_id.to_numpy()))),
                   "recorded_candidates_not_in_union": int(len(np.setdiff1d(pairs[s].candidate_article_id.to_numpy(np.int64),
                                                                           articles.article_id.to_numpy())))}
               for s in D.SPLITS}
     reports = {"catalogues": catalogues["report"], "referenced_articles_not_in_any_catalogue": int(len(not_found)),
-               "pool_policy": POOL_POLICY, "pool_fingerprint": pool, "article_lookup_coverage": lookup,
+               "pool_policy": POOL_POLICY, "pool_fingerprint": pool, "pool_source_files": pool_sources,
+               "article_lookup_coverage": lookup,
                "history": {s: history[s]["report"] for s in D.SPLITS},
                "contexts": {s: ctx[s].report for s in D.SPLITS}, "article_table": art.report,
                "split_starts": {s: str(v) for s, v in starts.items()},

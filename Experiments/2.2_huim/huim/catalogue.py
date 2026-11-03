@@ -10,6 +10,7 @@ No recency window, access rule or vector-coverage restriction is applied.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import time
@@ -260,7 +261,7 @@ def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.
     progress_path = out_root / "diagnostics" / "catalogue" / f"{split}_export_progress.json"
     request_positions = np.asarray(request_positions, dtype=np.int64)
     signature = {"split": split, "n_requests": int(len(request_positions)),
-                 "requests_sha": str(pd.util.hash_array(request_positions).sum()),
+                 "requests_sha": hashlib.sha256(request_positions.tobytes()).hexdigest(),  # order-sensitive
                  "write_full_scores": bool(write_full_scores), "request_block": int(request_block),
                  "model_digest": model_digest, "catalogue_sha": str(pd.util.hash_array(ctx.catalogue_idx).sum())}
     progress = None
