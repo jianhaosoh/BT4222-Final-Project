@@ -45,6 +45,8 @@ Files:
 
 * `experiment.ipynb`: the Colab notebook, using the common headings 1–9.
 * `huim/`: helper modules.
+* [`huim_helpers.zip`](huim_helpers.zip): the same helper source files packaged for
+  direct upload to Colab; no datasets, weights or generated run outputs.
   * `data`: inputs and checks.
   * `features`: request/article/history tensors and the feature audit.
   * `model`, `train`, `metrics`.
@@ -55,6 +57,9 @@ Files:
   * `pipeline`: orchestration, request scopes and budgets.
   * `tune`: optional Optuna search.
 * `tests/test_static.py`: synthetic checks (no shared data, no optimiser steps).
+
+Keep `huim/` as the editable source. Rebuild `huim_helpers.zip` from its Python
+files whenever those helpers change so the drag-and-drop copy stays current.
 
 Run the tests with:
 
@@ -252,9 +257,10 @@ Exported results on a request sample are sampled development results, not full-s
 ## Colab execution
 
 1. Open `experiment.ipynb` from main in Colab, on a GPU runtime.
-2. Upload the `huim/` helper package, or a `huim_helpers.zip`/`huim.zip` containing
-   that folder, into Colab's Files panel (`/content`). The notebook unpacks the ZIP
-   and imports the uploaded code automatically; no GitHub token is needed.
+2. Download [`huim_helpers.zip`](huim_helpers.zip) from this folder (use GitHub's
+   **Download raw file** button) and drag it into Colab's Files panel (`/content`).
+   Leave it zipped: the notebook unpacks and imports it automatically, with no
+   GitHub token needed. Uploading the `huim/` source folder also works.
    Alternatively, use the existing Git checkout route with a Colab `GITHUB_TOKEN`
    secret that can read the private fork.
 3. In the first code cell, set the following:
