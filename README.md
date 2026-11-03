@@ -25,5 +25,5 @@ Gemini text vectors and supplied EB-NeRD image vectors separately, keyed by
 
 ## Experiments
 
-Use [experiments/README.md](experiments/README.md) for track numbering, the common
+Use [Experiments/README.md](Experiments/README.md) for track numbering, the common
 notebook structure, prediction CSV formats and saved-model handoff requirements.

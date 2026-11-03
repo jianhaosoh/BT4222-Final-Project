@@ -11,14 +11,14 @@ predictions and models without rerunning training notebooks.
 | Neural networks | `2` | `2.1_lstm`, `2.2_<model_name>` |
 | Pretrained models | `3` | `3.1_<model_name>` |
 
-Each experiment directory sits directly under `experiments/` and is named
+Each experiment directory sits directly under `Experiments/` and is named
 `<ID>_<short_model_name>`. The first number identifies the track; there is no
 separate track directory. Agree on the next unused ID before starting. Keep an ID
 stable; record hyperparameter trials as separate runs inside that experiment
 rather than renumbering it. Create only the experiments you own.
 
 ```text
-experiments/
+Experiments/
   README.md
   2.1_lstm/                            # empty until work starts
 ```
@@ -232,7 +232,7 @@ Do not report a score for unlabelled test data.
 Keep a complete local copy under the experiment's `outputs/<run_id>/` first.
 Share that run folder, or a ZIP preserving its structure, using Telegram or the
 shared Google Drive. A suggested Drive location is
-`BT4222 Shared Final Folder/experiments/<experiment_id>/<run_id>/`.
+`BT4222 Shared Final Folder/Experiments/<experiment_id>/<run_id>/`.
 
 Before handing it over, confirm:
 
