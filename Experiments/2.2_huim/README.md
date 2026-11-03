@@ -251,12 +251,16 @@ Exported results on a request sample are sampled development results, not full-s
 
 ## Colab execution
 
-1. Add a Colab secret `GITHUB_TOKEN` (a fine-grained token with read access to the fork) and enable it for the notebook.
-2. Open `experiment.ipynb` from the branch or from GitHub in Colab, on a GPU runtime.
+1. Open `experiment.ipynb` from main in Colab, on a GPU runtime.
+2. Upload the `huim/` helper package, or a `huim_helpers.zip`/`huim.zip` containing
+   that folder, into Colab's Files panel (`/content`). The notebook unpacks the ZIP
+   and imports the uploaded code automatically; no GitHub token is needed.
+   Alternatively, use the existing Git checkout route with a Colab `GITHUB_TOKEN`
+   secret that can read the private fork.
 3. In the first code cell, set the following:
    * `DATA_ROOT`: the shared folder or its shortcut. It is read-only and is never written.
    * `OUTPUT_ROOT`: writable persistent storage. The default is `MyDrive/BT4222 Experiment Runs/2.2_huim`. Use `BT4222 Shared Final Folder/Experiments/2.2_huim` only if you can write there; the write probe checks this.
-   * `REPO_BRANCH`: currently `claude/focused-shannon-s4lmma`.
+   * `REPO_BRANCH`: used only for the Git checkout route.
 4. Run with `RUN_MODE = "smoke"` end to end. Then use `"development"`. Use `"full"` only after reading the preflight and refined budgets; it also needs `CONFIG_OVERRIDES = {"max_export_pairs": ...}`.
 
    | Setting | smoke (labelled) | development (aligned with 3.1) | full |
