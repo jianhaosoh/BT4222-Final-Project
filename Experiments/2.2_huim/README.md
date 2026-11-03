@@ -1,6 +1,6 @@
 # 2.2_huim — HUIM-inspired Stage 1 relevance model and catalogue shortlist
 
-**Status:** the implementation is prepared and has passed static and synthetic checks. It has **not** been
+**Status:** the implementation is prepared and has passed static and synthetic checks (30 tests, no optimiser steps). It has **not** been
 executed on the shared data. No training, metric, export, persistence or reload result exists yet. The
 executed Colab notebook and its review bundle will be the first evidence.
 
@@ -13,8 +13,29 @@ It implements Stage 1 only:
 | Operation | Pool | Labels |
 | --- | --- | --- |
 | Training | Shared recorded pairs (`feature_engineering/{split}_features.parquet` keys + `clicked`) | clicked = 1, shown-unclicked = 0; no re-explosion, no catalogue negatives |
-| Recorded-slate benchmark | Every recorded candidate, grouped by `(user_id, impression_id)` | mean impression AUC (primary, selection), nDCG@5 (secondary) |
-| Catalogue prediction | Every article of the split's declared catalogue with `published_time <= impression_time` | unknown outside the recorded slate; known-click Recall@100 and coverage only |
+| Catalogue validation (selection) | A fixed sample of validation requests, each scored against its **full** eligible catalogue | **known-click Recall@100 (primary)**, observed-click nDCG@100 (secondary); unshown outcomes unknown |
+| Catalogue prediction | Every article of the split's declared catalogue with `published_time <= impression_time` | Recall@100 / nDCG@100 for labelled splits; coverage only for test |
+| Recorded-slate diagnostic | Every recorded candidate, grouped by `(user_id, impression_id)` | mean impression AUC, **diagnostic only** |
+
+## Metric contract and model selection (Experiments/README.md, commit 2869a48)
+
+* **Primary.** Macro known-click Recall@100 over validation requests with known clicks:
+  * clicked articles rejected by eligibility stay in the denominator;
+  * an empty pool scores 0;
+  * membership follows the export order (descending score, ties by ascending `article_id`).
+* **Secondary.** Observed-click nDCG@100 on the same shortlists:
+  * gain is 1 for an original known click; any other article has 0 *observed* gain, which is bookkeeping, not a negative label;
+  * the ideal DCG places **all** original known clicks first, capped at 100, so missed and ineligible clicks count against it.
+* **Diagnostic.** Recorded-slate AUC. nDCG@5 belongs to Stage 2's final list.
+* **Selection.**
+  * Every `selection_interval_steps` (300; smoke: 3) and at each epoch end, a fixed validation sample is scored against its full catalogue. The sample is 2,000 requests (smoke: 64) with seed `20261103`, and is saved to `selection/selection_requests.json`.
+  * No score CSVs are written during selection.
+  * The best checkpoint is chosen by Recall@100, then nDCG@100, then the earlier checkpoint.
+  * Early stopping counts selection evaluations without improvement (patience 3, `min_improvement` 0). `ReduceLROnPlateau` follows Recall@100.
+  * The selected checkpoint is restored and re-evaluated. The notebook asserts that it reproduces its recorded metrics.
+  * Controls and Optuna trials use the same sample and rule. Optuna prunes on intermediate Recall@100 and keeps pruned and failed trials.
+* **Provenance.** Recovery checkpoints carry the selection protocol (sample hash, interval, pool). A checkpoint from another protocol, such as the earlier AUC-selected version of this experiment, is refused. A loaded legacy bundle is labelled diagnostic and is not described as Recall-selected.
+* **Partitions.** Validation is development data. No reserved labelled final partition is declared by the shared protocol. Test is never evaluated or used for any choice.
 
 Files:
 
@@ -75,7 +96,7 @@ embedded bins, projected to d = 64:
 * BCE on logits; AdamW, with no decay on biases, norms or embeddings.
 * Dropout 0.2 and modality dropout 0.15. The test catalogue mostly lacks vectors, so the model must also score from metadata alone.
 * Gradient clipping and AMP.
-* `ReduceLROnPlateau` on validation AUC, early stopping with patience 1, and at most 4 epochs.
+* Selection, early stopping and `ReduceLROnPlateau` follow validation catalogue Recall@100 (see above); at most 4 epochs.
 
 These defaults are hypotheses. Optuna (`RUN_TUNING`) is optional and bounded, and off by default.
 
@@ -102,6 +123,20 @@ On the attached mini fixture, this static inspection gave:
 * topic preference matches within 3e-8;
 * 7-day clicks match within 4e-5;
 * article age matches to about 0.03 h. This difference comes from float32 log round-trip, and future-published candidates are clipped to 0.
+
+## Vector files
+
+`data.read_vector_table` tries PyArrow first. If PyArrow cannot decode the column (for example, a nullable
+fixed-size list), it falls back to DuckDB and then Polars, when installed.
+
+* Every backend result is coerced to a concrete `pyarrow.Table` inside the reader. DuckDB 1.5.2's `.arrow()` returns a `RecordBatchReader`, which is read with `read_all()`.
+* The only cast changes the list container to `FLOAT[]`, so float32 values, dimensions and null masks are preserved.
+* The reader used, its raw return type, the source type and earlier errors are recorded. A file that no reader can decode raises; it is never treated as missing vectors or replaced by zeros.
+* Notebook §3 checks all four original files (`vector_file_check.json`) before building inputs.
+* Regression tests cover real DuckDB 1.5.2, a forced reader-type stub, Polars, and the all-readers-fail case.
+
+The original full-data image files were not checked here: at 70 MB and 18.6 MB, they exceed the Drive connector's
+download limit. The Colab preflight cell is the first check on them.
 
 ## Eligibility policy and catalogue versions (declared)
 
@@ -210,6 +245,6 @@ Return the executed `experiment.ipynb` and `review_bundle_<run_id>.zip`. The not
 * `training_history.json`, `reload_check.json`, `interruption_check.json` (if run) and `requirements.txt`;
 * `logs/run.log` and `logs/errors.log`;
 * `controls/controls.csv` and `tuning/trials.csv` / `summary.json` (if run);
-* the attention diagnostics, the dev-sample request lists and manifests, the export progress files, and the ineligible-recorded-candidate lists.
+* the attention diagnostics, learning curves, `selection/selection_requests.json`, `vector_file_check.json`, the dev-sample request lists and manifests, the export progress files, and the ineligible-recorded-candidate lists.
 
 Full data, score CSVs and model binaries are not needed for review.

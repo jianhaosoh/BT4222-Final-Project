@@ -19,6 +19,8 @@ from .io_utils import (disk_free_bytes, environment_info, git_info, mirror_tree,
 from .metrics import METRIC_DEFINITIONS, impression_metrics, recall_summary
 from .model import ModelConfig, build_model, parameter_counts
 from .persist import MODEL_FILES, check_article_ids, load_model, save_model_files
+from .io_utils import atomic_write_json, copy_verified
+from .selection import CatalogueSelector, selection_positions
 from .train import Trainer, evaluate_recorded, score_recorded, seed_everything
 from .validate import validate_export, validate_recorded
 
@@ -36,8 +38,16 @@ BASE_CONFIG = {
     "history_len": 50, "d_model": 64, "attention_mode": "softmax", "attention_hidden": [32, 16],
     "fusion": "concat", "feature_hidden": 64, "head_hidden": [128, 64], "dropout": 0.2, "modality_dropout": 0.15,
     # optimisation
-    "lr": 1e-3, "weight_decay": 1e-4, "batch_size": 4096, "max_epochs": 4, "early_stopping_patience": 1,
+    "lr": 1e-3, "weight_decay": 1e-4, "batch_size": 4096, "max_epochs": 4,
     "grad_clip": 1.0, "amp": True, "checkpoint_every_steps": 200, "log_every_steps": 200,
+    # selection (Experiments/README.md): catalogue validation Recall@100 on a FIXED request sample,
+    # each sampled request scored against its full eligible catalogue; declared before training
+    "selection_requests": 2000,           # None = every validation request
+    "selection_seed": 20261103,
+    "selection_interval_steps": 300,      # plus an evaluation at every epoch end
+    "early_stopping_patience": 3,         # selection evaluations without improvement
+    "min_improvement": 0.0,               # 0: any better (Recall, then nDCG) checkpoint resets patience
+    "scheduler_patience": 1,              # ReduceLROnPlateau on Recall@100, in evaluations
     # training subset (None = all supplied train pairs); whole impressions only
     "train_impression_limit": None,
     # catalogue scoring/export
@@ -51,7 +61,9 @@ BASE_CONFIG = {
 }
 
 PRESETS = {
+    # labelled smoke run: tiny, explicitly bounded request samples for selection and export
     "smoke": {"train_impression_limit": 3000, "max_epochs": 1, "checkpoint_every_steps": 0,
+              "selection_requests": 64, "selection_interval_steps": 3,
               "dev_sample_requests": {"train": 16, "validation": 64, "test": 16}},
     # all validation requests are shortlisted (Recall@100 on every request); scores only for the sample
     "development": {"shortlist_splits": ["validation"]},
@@ -212,8 +224,15 @@ def device_and_tensors(ws: Workspace, device):
     return ws.device_cache[key]
 
 
+def make_selector(ws: Workspace, cfg: dict, device) -> CatalogueSelector:
+    """The fixed validation selection sample (same for every checkpoint, control and trial)."""
+    art, ctx = device_and_tensors(ws, device)
+    positions = selection_positions(len(ws.ctx["validation"].requests), cfg["selection_requests"], cfg["selection_seed"])
+    return CatalogueSelector(ws.ctx["validation"], ws.art, ctx["validation"], art, positions, device, cfg)
+
+
 def train_model(ws: Workspace, cfg: dict, run_dir: Path, persist_dir: Path | None, device, resume: bool = True,
-                log=print) -> tuple:
+                log=print, selector: CatalogueSelector | None = None, on_evaluation=None) -> tuple:
     seed_everything(cfg["seed"])
     if "request_scaler" not in ws.pre.state:
         F.fit_dense_scalers(ws.pre, ws.ctx["train"], ws.art)
@@ -221,8 +240,14 @@ def train_model(ws: Workspace, cfg: dict, run_dir: Path, persist_dir: Path | Non
     model = build_model(mcfg, ws.pre).to(device)
     art, ctx = device_and_tensors(ws, device)
     subset, subset_info = training_subset(ws, cfg)
+    selector = selector or make_selector(ws, cfg, device)
+    sample_path = Path(run_dir) / "selection" / "selection_requests.json"
+    atomic_write_json(sample_path, selector.sample_record())
+    if persist_dir is not None:
+        copy_verified(sample_path, Path(persist_dir) / "selection" / "selection_requests.json")
     tcfg = dict(cfg, train_pair_indices=subset)
-    trainer = Trainer(model, art, ctx["train"], ctx["validation"], device, tcfg, run_dir, persist_dir, log)
+    trainer = Trainer(model, art, ctx["train"], ctx["validation"], device, tcfg, run_dir, persist_dir, log,
+                      selector=selector, on_evaluation=on_evaluation)
     rec = Path(run_dir) / "recovery" / "last.pt"
     persisted = Path(persist_dir) / "recovery" / "last.pt" if persist_dir else None
     if resume and not rec.is_file() and persisted is not None and persisted.is_file():
@@ -235,13 +260,25 @@ def train_model(ws: Workspace, cfg: dict, run_dir: Path, persist_dir: Path | Non
     if resume and rec.is_file():
         trainer.load_recovery(rec)
     state = trainer.fit()
-    # reload the selected (best-AUC) inference weights
+    if state["best"] is None:
+        raise RuntimeError("no selection evaluation ran; shortlist selection is incomplete (no AUC fallback)")
+    # Restore the selected (best Recall@100) checkpoint, not the last one, and re-evaluate it.
     model.load_state_dict(torch.load(Path(run_dir) / "model" / "weights.pt", map_location=device, weights_only=True))
     model.eval()
-    selection = {"objective": "validation mean impression AUC (recorded slates)", "direction": "maximize",
-                 "tie_breaker": "earlier epoch", "selected_epoch": state["best_epoch"],
-                 "selected_validation_auc": state["best_auc"], "early_stopping_patience": cfg["early_stopping_patience"],
-                 "partition": "official validation split (development data; repeatedly used for selection)"}
+    restored = selector.evaluate(model)
+    best = state["best"]
+    selection = {**selector.protocol,
+                 "selected_checkpoint": {k: best[k] for k in ("eval_index", "epoch", "step_in_epoch", "global_step")},
+                 "selected_known_click_recall@100_selection_sample": best["known_click_recall@100"],
+                 "selected_observed_click_ndcg@100_selection_sample": best["observed_click_ndcg@100"],
+                 "selected_diagnostic_recorded_slate_auc": best["diagnostic_recorded_slate_auc"],
+                 "restored_checkpoint_reevaluation": {k: restored[k] for k in (
+                     "known_click_recall@100", "observed_click_ndcg@100", "requests_evaluated")},
+                 "restored_matches_recorded": bool(
+                     abs(restored["known_click_recall@100"] - best["known_click_recall@100"]) <= 1e-9
+                     and abs(restored["observed_click_ndcg@100"] - best["observed_click_ndcg@100"]) <= 1e-6),
+                 "evaluations": len(state["history"]), "stop_reason": state["stop_reason"],
+                 "selection_sample_file": "selection/selection_requests.json"}
     save_model_files(run_dir, model, mcfg, ws.pre, ws.art, selection)
     return model, mcfg, state, subset_info, selection
 
@@ -341,8 +378,6 @@ def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, re
                    "seconds": progress["seconds"], "full_scores_written": bool(full_scores[s])}
         if s in D.LABELLED_SPLITS:
             summary["recall"] = recall_summary(manifest)
-            m = manifest[manifest.n_clicked > 0]
-            summary["known_click_recall@5_stage1_only"] = float((m.n_clicked_in_top5 / m.n_clicked).mean()) if len(m) else None
         results[s] = {"progress": {k: v for k, v in progress.items() if k != "signature"}, "validation": validation,
                       "summary": summary}
         status = "PASSED" if validation["passed"] else f"FAILED ({validation['n_errors']} errors)"
@@ -375,17 +410,23 @@ def full_score_gate(preflight_report: dict, cfg: dict, out_roots: list, throughp
 
 # ------------------------------------------------------------ diagnostics --
 
-def vector_masked_metrics(model, ws: Workspace, device) -> dict:
-    """Validation recorded-slate metrics with every text/image vector hidden.
+def vector_masked_metrics(model, ws: Workspace, device, selector: CatalogueSelector | None = None) -> dict:
+    """Selection-sample Recall@100 / nDCG@100 (and diagnostic recorded-slate AUC)
+    with every text/image vector hidden.
 
-    The test catalogue is mostly without vectors; this shows how much ranking
+    The test catalogue is mostly without vectors; this shows how much shortlist
     quality depends on them (a robustness diagnostic, not a model choice)."""
     art, ctx = device_and_tensors(ws, device)
     masked = F.ArticleTable(art.ids, dict(art.tensors), art.report)
     masked.tensors["has_text"] = torch.zeros_like(art.tensors["has_text"])
     masked.tensors["has_image"] = torch.zeros_like(art.tensors["has_image"])
-    m, _ = evaluate_recorded(model, ctx["validation"], masked, device)
-    return m
+    diag, _ = evaluate_recorded(model, ctx["validation"], masked, device)
+    out = {"diagnostic_recorded_slate_auc": diag["mean_impression_auc"]}
+    if selector is not None:
+        sel = selector.evaluate(model, art_dev=masked)
+        out.update({k: sel[k] for k in ("known_click_recall@100", "observed_click_ndcg@100",
+                                        "eligible_only_recall@100", "requests_evaluated")})
+    return out
 
 
 @torch.no_grad()

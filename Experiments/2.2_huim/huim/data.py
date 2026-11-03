@@ -211,9 +211,12 @@ def _decode_vector_column(table: pa.Table, column: str, flag: str, expected_dim:
     vector is null, flagged unavailable, wrong length or non-finite are reported
     separately; no vector is invented."""
     ids = table["article_id"].to_numpy().astype("int64")
+    table = as_arrow_table(table)
     col = table[column].combine_chunks()
-    if pa.types.is_fixed_size_list(col.type):
+    if pa.types.is_fixed_size_list(col.type) or pa.types.is_large_list(col.type):
         col = col.cast(pa.list_(col.type.value_type))
+    if not pa.types.is_floating(col.type.value_type):
+        raise TypeError(f"{column} has non-float values: {col.type}")
     lengths = pc.list_value_length(col).to_numpy(zero_copy_only=False)
     lengths = np.where(np.isnan(lengths.astype("float64")), -1, lengths).astype("int64") \
         if lengths.dtype.kind == "f" else np.asarray(lengths, dtype="float64")
@@ -244,37 +247,103 @@ def _decode_vector_column(table: pa.Table, column: str, flag: str, expected_dim:
     return kept_ids, matrix[finite], diagnostics
 
 
-def read_vector_table(path: Path, column: str, flag: str) -> tuple[pa.Table, dict]:
-    """Read article_id + vector (+flag). PyArrow first; if it cannot decode the
-    column (e.g. a nullable fixed-size list), retry with DuckDB or Polars when
-    installed, converting to variable-length lists without changing values.
-    The original error and the reader used are recorded; if every reader
+def as_arrow_table(obj) -> pa.Table:
+    """Coerce reader results to a concrete pyarrow.Table.
+
+    DuckDB >= 1.4 returns a pyarrow.RecordBatchReader from ``.arrow()``; older
+    versions return a Table. Polars returns a Table. Anything else is an error,
+    never silently converted."""
+    if isinstance(obj, pa.Table):
+        return obj
+    if isinstance(obj, pa.RecordBatchReader):
+        return obj.read_all()
+    if isinstance(obj, pa.RecordBatch):
+        return pa.Table.from_batches([obj])
+    if hasattr(obj, "read_all"):  # reader-like objects from other bindings
+        return as_arrow_table(obj.read_all())
+    raise TypeError(f"Unsupported Arrow result type: {type(obj).__name__}")
+
+
+def _duckdb_table(path: Path, columns: list[str], column: str) -> tuple[pa.Table, str]:
+    import duckdb
+
+    def q(name):
+        return '"' + name.replace('"', '""') + '"'
+
+    select = ", ".join(f"CAST({q(c)} AS FLOAT[]) AS {q(c)}" if c == column else q(c) for c in columns)
+    con = duckdb.connect()
+    try:
+        result = con.execute(f"SELECT {select} FROM read_parquet(?)", [str(path)])
+        raw = result.arrow()  # DuckDB >= 1.4: RecordBatchReader; older: Table
+        return as_arrow_table(raw), type(raw).__name__
+    finally:
+        con.close()
+
+
+def _polars_table(path: Path, columns: list[str], column: str) -> tuple[pa.Table, str]:
+    import polars as pl
+
+    frame = pl.read_parquet(path, columns=columns)
+    frame = frame.with_columns(pl.col(column).cast(pl.List(pl.Float32)))
+    raw = frame.to_arrow()
+    return as_arrow_table(raw), type(raw).__name__
+
+
+def read_vector_table(path: Path, column: str, flag: str, readers=("pyarrow", "duckdb", "polars")) -> tuple[pa.Table, dict]:
+    """Read article_id + vector (+flag) as a concrete pyarrow.Table.
+
+    PyArrow first; if it cannot decode the column (e.g. a nullable fixed-size
+    list on some versions), retry with DuckDB or Polars when installed. Every
+    backend result is coerced to a Table *here*, so downstream decoding never
+    sees a RecordBatchReader. Values, dimensions and null masks are preserved
+    (casts only change the list container, FLOAT stays float32). The original
+    error, the reader used and its raw return type are recorded; if every reader
     fails, raise: an unreadable file is not legitimate missingness."""
-    schema_names = pq.ParquetFile(path).schema_arrow.names
-    columns = ["article_id", column] + ([flag] if flag in schema_names else [])
+    path = Path(path)
+    source_schema = pq.ParquetFile(path).schema_arrow
+    columns = ["article_id", column] + ([flag] if flag in source_schema.names else [])
     errors = {}
-    try:
-        return pq.read_table(path, columns=columns), {"reader": "pyarrow"}
-    except Exception as error:
-        errors["pyarrow"] = repr(error)
-    try:
-        import duckdb
+    def _pyarrow():
+        raw = pq.read_table(path, columns=columns)
+        return as_arrow_table(raw), type(raw).__name__
 
-        cols = ", ".join(f'"{c}"' if c != column else f'CAST("{c}" AS FLOAT[]) AS "{c}"' for c in columns)
-        table = duckdb.sql(f"SELECT {cols} FROM read_parquet('{path.as_posix()}')").arrow()
-        return table, {"reader": "duckdb", "pyarrow_error": errors["pyarrow"]}
-    except Exception as error:
-        errors["duckdb"] = repr(error)
-    try:
-        import polars as pl
-
-        frame = pl.read_parquet(path, columns=columns)
-        frame = frame.with_columns(pl.col(column).cast(pl.List(pl.Float32)))
-        return frame.to_arrow(), {"reader": "polars", "pyarrow_error": errors["pyarrow"]}
-    except Exception as error:
-        errors["polars"] = repr(error)
+    backends = {"pyarrow": _pyarrow,
+                "duckdb": lambda: _duckdb_table(path, columns, column),
+                "polars": lambda: _polars_table(path, columns, column)}
+    for name in readers:
+        try:
+            table, raw_type = backends[name]()
+            if not isinstance(table, pa.Table):
+                raise TypeError(f"{name} backend returned {type(table).__name__}, not a Table")
+            info = {"reader": name, "raw_return_type": raw_type,
+                    "source_vector_type": str(source_schema.field(column).type)}
+            if errors:
+                info["earlier_reader_errors"] = dict(errors)
+            return table, info
+        except Exception as error:
+            errors[name] = repr(error)
     raise RuntimeError(f"Could not decode vectors at {path}; reader errors: {errors}. "
                        "This is a file-loading failure, not legitimate missingness.")
+
+
+def vector_file_check(paths: DataPaths, expected_dims: dict) -> dict:
+    """Independent preflight of every original vector file: reader used, raw
+    return type, rows, dimension, null/flag/length/finite counts. Raises if a
+    file cannot be decoded by any reader (never treated as missing vectors)."""
+    out = {}
+    for kind, table_paths, column, flag in (("text", paths.text_vectors, "text_embedding", "has_text_embedding"),
+                                            ("image", paths.image_vectors, "image_embedding", "has_image_embedding")):
+        for source, path in table_paths.items():
+            key = f"{kind}.{source}"
+            if path is None:
+                out[key] = {"status": "file_not_found"}
+                continue
+            table, info = read_vector_table(path, column, flag)
+            _, matrix, diag = _decode_vector_column(table, column, flag, expected_dims.get(kind))
+            out[key] = {"path": str(path), **info, **diag,
+                        "passed": bool(diag["dimension"] == expected_dims.get(kind) and diag["non_finite"] == 0
+                                       and diag["wrong_length"] == 0 and diag["flag_true_but_null"] == 0)}
+    return out
 
 
 def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expected_dim: int | None) -> tuple[np.ndarray, np.ndarray, dict]:
