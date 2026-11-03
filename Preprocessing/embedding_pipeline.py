@@ -16,6 +16,7 @@ from google.genai import errors
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+MAX_TEXT_TOKENS = 8192
 
 
 def make_text(article) -> str | None:
@@ -41,21 +42,46 @@ def validate_vector(values, dimension: int):
     return vector
 
 
+def text_chunks(client, text: str, model: str) -> list[tuple[str, int]]:
+    """Keep all text, splitting oversized inputs near the middle at natural breaks."""
+    count = client.models.count_tokens(model=model, contents=text).total_tokens
+    if not isinstance(count, int) or count < 1:
+        raise ValueError("Gemini returned an invalid token count")
+    if count <= MAX_TEXT_TOKENS:
+        return [(text, count)]
+    if len(text) < 2:
+        raise ValueError("Cannot split input within the model's token limit")
+    start, end = len(text) // 4, 3 * len(text) // 4
+    boundary = text.rfind("\n", start, end)
+    if boundary < 0:
+        boundary = text.rfind(" ", start, end)
+    boundary = boundary + 1 if boundary >= 0 else len(text) // 2
+    return (text_chunks(client, text[:boundary], model)
+            + text_chunks(client, text[boundary:], model))
+
+
 def embed_text(client, text: str, model: str, dimension: int):
-    """One document per regular API request; retry temporary rate/server errors."""
+    """Embed whole text or pool long-text chunks; retry temporary API errors."""
     for attempt in range(5):
         try:
-            count = client.models.count_tokens(model=model, contents=text)
-            if not isinstance(count.total_tokens, int) or count.total_tokens < 1:
-                raise ValueError("Gemini returned an invalid token count")
-            if count.total_tokens > 8192:
-                return None, "input_too_long", "token_limit_exceeded"
-            result = client.models.embed_content(
-                model=model, contents=text, config={"output_dimensionality": dimension},
-            )
-            if result.embeddings is None or len(result.embeddings) != 1:
-                raise ValueError("Expected exactly one text embedding")
-            return validate_vector(result.embeddings[0].values, dimension), "ok", None
+            chunks = text_chunks(client, text, model)
+            vectors = []
+            for chunk, _ in chunks:
+                result = client.models.embed_content(
+                    model=model, contents=chunk, config={"output_dimensionality": dimension},
+                )
+                if result.embeddings is None or len(result.embeddings) != 1:
+                    raise ValueError("Expected exactly one text embedding")
+                vectors.append(validate_vector(result.embeddings[0].values, dimension))
+            if len(vectors) == 1:
+                return vectors[0], "ok", None
+            # Weight by chunk length so a short final chunk does not dominate.
+            vector = np.average(np.asarray(vectors, dtype="float64"), axis=0,
+                                weights=[count for _, count in chunks])
+            norm = np.linalg.norm(vector)
+            if not np.isfinite(norm) or norm == 0:
+                raise ValueError("Cannot normalise pooled text embedding")
+            return validate_vector(vector / norm, dimension), "ok", None
         except errors.APIError as error:
             if error.code in (400, 401, 403, 404):
                 raise RuntimeError(f"Gemini HTTP {error.code}; check API key, model and input") from None

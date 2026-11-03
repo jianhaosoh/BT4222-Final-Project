@@ -3,26 +3,78 @@
 Keep model experiments here so the group can compare results and exchange saved
 predictions and models without rerunning training notebooks.
 
-## Stage-one task: score the recorded impression slate
+## Stage-one task: learn relevance, then shortlist the eligible catalogue
 
-The shared feature tables are **already expanded into impression–candidate
-article pairs**. Load those rows directly and score **every candidate in each
-recorded impression slate**. Do not explode the tables again, retrieve a new
-candidate pool from the catalogue, or label unshown catalogue articles as negatives.
+The intended recommendation pipeline is:
 
-Slate sizes vary. There is **no fixed candidate-count requirement**: pass every
-candidate and its score to the later shared reranking stage. Catalogue and vector
-lookups may enrich the supplied candidates, but must not add or remove candidates.
-Retain older articles and candidates with missing features or embeddings, using
-documented fallbacks and missingness indicators.
+**Eligible article catalogue → Stage 1 personalised top 100 → Stage 2 business
+reranking → final top 5 recommendations.**
+
+Distinguish the inputs used to learn from observed clicks from the pool scored
+when making recommendations:
+
+| Operation | Article pool | Labels and purpose |
+| --- | --- | --- |
+| Training | Each behaviour's recorded `article_ids_inview` slate | Clicked = 1; shown but unclicked = 0. The shared feature tables already contain these expanded pairs. Keep this training setup. |
+| Recorded-slate validation | The same recorded candidate rows in validation | Labelled relevance benchmark for tuning/checkpoint selection. |
+| Catalogue prediction, for each split | Every article eligible at each behaviour's timestamp | Score behaviour × eligible article, then select the top 100. Articles outside the recorded slate have **unknown** outcomes, not negative labels. |
+| Stage 2 | Stage 1's catalogue-derived shortlist | Apply the agreed business priorities and produce the final top 5. |
+
+Do not re-explode the existing training feature tables or create catalogue-wide
+negative labels. Catalogue prediction is a **new inference path**, not merely a
+change to CSV filenames: construct model inputs for the additional pairs, reuse
+the fitted preprocessing and score in batches. The current feature matrix covers
+recorded candidates only; it is not the catalogue prediction matrix.
+
+The top-100 shortlist is the current handoff size, not a requirement that every
+input pool contain 100 articles. Return `min(100, eligible_article_count)` unique
+IDs. Do not pad, automatically keep 50%, or exclude behaviours because their
+recorded slates are small. Keep the recorded-slate benchmark separate from these
+catalogue outputs.
+
+Retain eligible articles with legitimate missing features or embeddings using
+documented fallbacks and missingness indicators. Missing text alone is not a
+reason to remove an article. Do not exclude older articles unless the shared
+eligibility policy explicitly defines an age limit.
+
+### Shared catalogue eligibility and inference features
+
+Use the same versioned catalogue and eligibility rules across models. For each
+behaviour, use only articles published by its timestamp; never score future
+articles as recommendable. Declare any additional availability, access or age
+rules, their source fields, and the treatment of missing publication times. Do
+not invent rules or assume every article in a split was already available when
+the split began. A catalogue snapshot contains only the articles available in
+our supplied artifacts; do not claim coverage of an unknown production catalogue.
+
+Keep `(user_id, impression_id)` and its timestamp/context as the recommendation
+request. Use only context known before making that recommendation. Audit every
+feature: it must be constructible for an article outside `article_ids_inview`
+without using clicks or later outcomes. Recompute any pool-dependent features
+for the declared pool, consistently with training, or remove/redesign them and
+retrain. Do not silently fill unavailable inference features with zeros.
+
+Use shared article/history lookups, batch the Cartesian scoring operation, and
+stream full score exports; a giant materialised behaviour × catalogue table is
+not required. Before a full run, estimate eligible-pair counts, output size,
+runtime and storage capacity. Exhaustive exports can contain billions of rows;
+batching reduces memory pressure but does not remove compute or disk costs.
+Article catalogue and embedding coverage can differ substantially: report both,
+and never silently restrict the pool to articles with vectors to reduce its size.
+If the exhaustive path is not feasible, document that limitation and evaluate a
+declared development sample; do not claim a full export or silently switch pools.
+Record catalogue coverage, exclusions and empty eligible pools.
+Include behaviours with empty pools in ranking exports as `[]` rather than
+silently dropping them. Record failures that prevent catalogue scoring and do
+not claim a recorded-slate export implements this path.
 
 ## One workflow, three responsibilities
 
 | Stage | Responsibility |
 | --- | --- |
 | Shared preprocessing — `Preprocessing/` | Prepare the agreed splits, features and embeddings once; publish common inputs on Drive. |
-| Model training — `Experiments/` | Train/load each model, use validation for focused development, explain its behaviour and export predictions and the saved model. |
-| Shared reranking and evaluation | One shared notebook/location consumes every model's train, validation and test CSVs, compares models, develops any ensemble and reranker, and produces the final evaluation tables and analysis for the report. |
+| Stage 1 — `Experiments/` | Train/load each relevance model on observed pairs, validate it, score the eligible catalogue, and export full catalogue scores, top-100 shortlists, recorded-slate diagnostics and the saved model. |
+| Stage 2 — shared reranking and evaluation | Consume each model's catalogue-derived shortlists, apply business priorities, compare final top-5 lists and produce the final evaluation and report analysis. |
 
 Keep cross-model comparisons and final evaluation together in that shared stage.
 Individual experiment notebooks analyse validation only for development; they
@@ -35,8 +87,13 @@ diagnose optimisation, but training predictions are not evidence of generalisati
 The **Project Interim Report**, Section 1.1 (p. 3) and Section 1.2.3 (pp. 4–5),
 defines the objective as **meaningful user engagement and reader retention**
 through relevant recommendations that encourage continued reading and exploration.
-Model scores provide the initial relevance ranking; session continuity,
-freshness and content diversity are additional reranking objectives.
+Stage 1 protects personal relevance through shortlist membership; Stage 2 applies
+session continuity, freshness and content diversity within that shortlist. The
+current intended reranker does not require click probabilities as an input.
+Keep Stage 1 scores in the run bundle for diagnostics and comparisons even when
+Stage 2 does not consume them. Shortlisting alone does not guarantee preserved
+clicks: compare the final top 5 with Stage 1's top 5 and report the relevance and
+business trade-offs. Offline clicks are an engagement proxy, not measured profit.
 
 Start each experiment with a business-linked hypothesis: **what information does
 this model use, why should that improve recommendations, and what validation
@@ -96,13 +153,18 @@ requirements.txt
 outputs/                               # local; ignored by Git
   <run_id>/
     predictions/
-      train_scores.csv
-      validation_scores.csv
-      test_scores.csv
+      train/submission_click_probabilities.csv
+      validation/submission_click_probabilities.csv
+      test/submission_click_probabilities.csv
     rankings/
-      train_ranked_articles.csv
-      validation_ranked_articles.csv
-      test_ranked_articles.csv
+      train/submission_top_100.csv
+      validation/submission_top_100.csv
+      test/submission_top_100.csv
+    diagnostics/
+      recorded_slates/
+        train_scores.csv
+        validation_scores.csv
+        test_scores.csv
     model/
       <saved_model_or_weights>          # loadable saved form for the chosen stack
       preprocessing.pkl                # fitted transforms, if separate
@@ -129,8 +191,9 @@ alone is insufficient. Do not add generated artifacts to ordinary Git history.
 
 Use the group's **BT4222 Shared Final Folder** as the common data source. Download
 the required files or access them through the mounted Drive in Colab before
-running an experiment. Keep the shared train/validation/test split and candidate
-rows unchanged across models.
+running an experiment. Keep the shared train/validation/test requests and
+recorded candidate rows unchanged across models for training and the labelled
+benchmark. Catalogue prediction adds a separate, consistently defined pool.
 
 Each row is already one candidate in an impression. Preserve `split`, `user_id`,
 `impression_id`, `candidate_article_id` and the supplied `clicked` target. Within
@@ -141,7 +204,8 @@ numeric predictors. Never replace unavailable test targets with zeros.
 
 Inspect the mounted schema and manifests rather than hardcoding a historical
 column count. Development sampling must preserve complete impression slates;
-record its rule, seed and counts. Final exports cover the complete agreed splits.
+record its rule, seed and counts. Final exports cover the complete agreed splits
+and the shared eligible catalogue for each request.
 
 Set the data root in one configuration cell. The existing Colab notebooks use:
 
@@ -170,14 +234,17 @@ settings you use. Keep all other input paths relative to it:
 | Log variants | `feature_engineering/log_variants/{split}_features.parquet` |
 | Scaled features | `feature_engineering/scaled_log_variants/{split}_features.parquet` |
 | Feature vocabulary | `feature_engineering/feature_vocabulary.json` |
-| Train/validation article vectors | `embeddings/train_val/{text,image}_embeddings.parquet` |
-| Test article vectors | `embeddings/test/{text,image}_embeddings.parquet` |
+| Train/validation article catalogue | `train_val/articles.parquet` |
+| Test article catalogue | `test/articles.parquet` |
+| Train/validation article vectors | `train_val/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/train_val/`) |
+| Test article vectors | `test/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/test/`) |
 
 Use `train`, `validation`, and `test` consistently in file names and metadata;
 `validation` is the split otherwise called “val”. See the
 [preprocessing guide](../Preprocessing/README.md) for the four feature cases and
 column selection. `scaled` and `log_scaled` use the same physical files with
-different predictor selection.
+different predictor selection. Resolve actual paths from the mounted files and
+manifests; record them rather than assuming a particular embedding layout.
 
 Record the selected feature case, input file versions or hashes, row counts,
 ordered feature columns, embedding source/dimensions and missing-value policy in
@@ -224,6 +291,34 @@ The baseline's metric implementation is a useful reference, but adapt grouping
 to the composite impression key. Previously saved baseline results use a separate
 sample/pipeline and are not directly comparable with new experiment results.
 
+### Catalogue shortlisting and end-to-end checks
+
+For catalogue prediction, report **known-click Recall@100**: for each impression
+with known clicks, divide the number of its clicked article IDs present in the
+shortlist by its original number of clicked article IDs, then average equally
+over those impressions. Keep clicked articles rejected by eligibility in that
+denominator; report their count and exclusion reasons, plus eligible-only recall
+and eligibility coverage separately. Also report shortlist lengths, empty pools,
+scored pair counts and runtime. Use validation to investigate shortlist coverage
+and any proposed size changes; do not silently replace the agreed AUC checkpoint
+selection objective. Save the eligibility policy and shortlist size with results.
+
+This is recovery of **observed** clicks, not an unbiased estimate of catalogue
+relevance, CTR, retention or profit. Unshown articles may be relevant: never label
+them zero for catalogue-wide classification AUC/BCE. Record exposure bias and
+catalogue coverage limitations. Observed-click retrieval metrics alone do not
+establish how readers would respond to newly recommended articles.
+
+Evaluate Stage 2's final top 5 against Stage 1's top 5 for relevance and the
+business measures it targets. For the labelled recorded-slate experiment, apply
+the same shortlist/reranking procedure to the recorded pool and calculate final
+nDCG@5 against the **original full recorded slate's** labels/ideal ranking;
+discarded positives must count against the pipeline. Catalogue recommendations
+can report known-click recovery at 5 and business measures, with the unobserved
+outcome limitation above. Do not present a metric that silently treats every
+unshown catalogue article as an observed negative. Keep the two evaluation pools
+explicit in filenames, metadata and report tables.
+
 State the partition used for tuning and early stopping. If validation is used
 repeatedly for selection, report its scores as **development/validation results**,
 not an untouched final test. Any reserved labelled evaluation partition must be
@@ -255,9 +350,9 @@ Use these headings in this order in every experiment notebook:
 6. **Validation diagnostics and explainability** — use the agreed validation
    metrics and one or two focused explanations to assess the hypothesis. Record
    any justified adjustments, limitations and the selected configuration.
-7. **Predict and export all splits** — generate train, validation and test
-   predictions; save the six required CSVs and the complete
-   model/run bundle before finishing the notebook session.
+7. **Predict and export all splits** — score the eligible catalogue for train,
+   validation and test requests; save the six catalogue/shortlist CSVs, the
+   separate recorded-slate diagnostic scores and the complete model/run bundle.
 8. **Reload check** — load the model and preprocessing from the persistent copy,
    predict a small batch and compare with the original predictions within a
    stated numerical tolerance, without retraining.
@@ -276,7 +371,7 @@ unavailable. Notebook outputs alone do not establish that a model can be reloade
 
 ## Shared behaviour identifier
 
-A behaviour row is one user's impression slate. In both export formats below,
+A behaviour row identifies one user's recommendation request. In the exports below,
 use **`behaviour_id = f"{user_id}:{impression_id}"`**, built from the original
 integer IDs. For example, user `12345` and impression `67890` become
 `12345:67890`. Treat this column as a string. Use the same definition for every
@@ -287,93 +382,107 @@ This preserves the shared grouping key `(user_id, impression_id)`: test
 by the file name. The evaluation owner can recover both original IDs by splitting
 `behaviour_id` at `:` and join labels/context from the shared input tables.
 
-## Required per-candidate score CSVs
+## Required catalogue score CSVs
 
-Every completed run exports **three score CSVs**, one for each split, using the
-file names in the directory tree above. Each row is **one behaviour–article pair**,
-including observed non-clicks. Required columns and one example data row:
+For each split, export
+`predictions/{split}/submission_click_probabilities.csv`. Each row is one
+**behaviour × eligible catalogue article** pair, including articles not in the
+recorded slate. This file is not limited to the shortlist. Required columns and
+one example data row for a probability-producing model:
 
 ```csv
-behaviour_id,article_id,score
-12345:67890,9876543,0.7312
+behaviour_id,article_id,score,click_probability
+12345:67890,9876543,1.0,0.7310585786
 ```
 
 | Column | Contract |
 | --- | --- |
-| `behaviour_id` | Shared behaviour identifier defined above. Repeats for each candidate in the same impression. |
-| `article_id` | Original `candidate_article_id` from that behaviour's `article_ids_inview`; preserve its integer value. |
-| `score` | Finite relevance score; higher means more relevant. May be a probability, logit or ranking score, as declared in metadata. |
+| `behaviour_id` | Shared original-ID request identifier, repeated for every eligible article. |
+| `article_id` | Original integer article ID from the eligible catalogue; not restricted to `article_ids_inview`. |
+| `score` | Finite Stage 1 relevance score; higher is more relevant. Declare whether it is a probability, logit or ranking score. |
+| `click_probability` | Finite value in `[0, 1]` from a genuine click-probability model or documented fitted calibration. Uncalibrated estimates must be described as such. |
 
-The candidate key is **`(behaviour_id, article_id)`**. Preserve every candidate
-row in the agreed split. Decode internal user/article index mappings before
-export. Do not silently drop duplicate keys or candidates; resolve source-key
-problems consistently across experiments. Labels are not included: shared
-evaluation joins observed labels using the candidate key and checks complete
-coverage. Unavailable test labels must never be replaced with zeros.
+Keep logits in `score` and their sigmoid in `click_probability` when that is the
+model's click-prediction interpretation. Do not put logits into a probability
+column or sigmoid an arbitrary ranking score and call it a probability. If an
+experiment produces ranking scores only, use the explicitly named
+`submission_article_scores.csv` with `behaviour_id,article_id,score` instead and
+declare that filename in the export manifest; shared readers must support this
+documented alternative. Do not force probability calibration merely to satisfy
+a filename. Multiple article click probabilities need not sum to one, and raw
+score scales are not automatically comparable across models.
 
-Declare `score_type` (`probability`, `logit` or `ranking_score`), the score source,
-and any conversion or calibration in `run_config.json`. An optional
-`click_probability` column is allowed when the model genuinely estimates click
-probability; it must be finite and in `[0, 1]`. Applying a sigmoid to an arbitrary
-ranking score does not establish a click-probability interpretation. Multiple
-articles may be clicked, so per-candidate click probabilities need not sum to one.
-Raw score scales are not automatically comparable across models for averaging or
-probability-based combinations.
+The unique candidate key is **`(behaviour_id, article_id)`**. For every request,
+cover exactly the eligible catalogue IDs, not just the original slate. Decode
+internal mappings before export. Save the request/eligibility manifest so empty
+pools and full pair counts are verifiable. Labels are not exported; shared
+evaluation joins genuine observed labels separately and leaves other outcomes
+unknown. Never replace unshown or unavailable test labels with zeros.
 
-Write with `index=False`, retain numerical precision and use a consistent row
-order such as `behaviour_id`, `article_id`. Do not export a pandas index column.
-Full exports cover the agreed full splits; mark development-sample runs clearly
-and record the sampling rule and counts.
+Write with `index=False`, retain precision, and use deterministic request/article
+order. Stream batches to avoid holding every pair in memory. Compression or
+partitioned storage may accompany the CSV, with an explicit loader; it does not
+justify silently exporting only top-100 scores. Mark sampled development runs
+clearly; final exports cover all agreed requests.
 
-### Migration from the earlier export proposal
+## Required catalogue top-100 ranking CSVs
 
-This contract replaces `*_click_probabilities.csv` and its mandatory
-`click_probability` column with `*_scores.csv` and `score`. It also replaces the
-earlier fixed-count ranking filenames with `*_ranked_articles.csv`. Update
-exporters and shared readers together; do not silently interpret an old file as
-the new schema. Record `export_schema_version = 2` in run metadata. If a legacy
-consumer remains, document an explicit compatibility adapter/export rather than
-mislabel raw scores as probabilities or truncate candidate slates.
-
-## Required complete-slate ranking CSVs
-
-Export **one row per behaviour**, containing every candidate article ID in that
-recorded impression exactly once. Do not combine candidates across a user's
-impressions or impose a fixed list length.
-
-Required columns and one example data row, for a behaviour with three candidates:
+For each split, export `rankings/{split}/submission_top_100.csv`: **one row per
+behaviour**, containing its highest-scoring eligible catalogue articles. Do not
+combine separate impressions from the same user.
 
 ```csv
 behaviour_id,article_ids
 12345:67890,"[9876543, 8765432, 7654321]"
 ```
 
-`article_ids` is a **JSON array stored in one quoted CSV field**, ordered by
-descending score. Its first element is rank 1. A behaviour with three candidates
-exports three IDs; a behaviour with more candidates exports all of them.
+`article_ids` is a JSON array in one quoted CSV field, ordered by descending
+Stage 1 `score`; the first element is rank 1. The three-ID example applies to a
+pool with only three eligible articles. For each request:
 
-For each split:
+1. Rank all eligible catalogue scores by descending `score`, breaking export
+   ties by ascending original article ID.
+2. Keep the first `min(100, eligible_article_count)` unique IDs. Do not pad or
+   duplicate IDs. An empty eligible pool produces `[]` and an explicit count.
+3. Encode with `json.dumps` and write with `to_csv(..., index=False)`; read back
+   with `json.loads`, never `eval`.
+4. Verify the list against the full catalogue score export: correct membership,
+   exact top-100 ordering/length, and no article published after the request.
 
-1. Start from that split's complete score CSV.
-2. Group by `behaviour_id` and sort candidates by descending `score`, breaking
-   ties by ascending original article ID for reproducible exports.
-3. Retain every candidate. Do not truncate, pad, repeat articles or add articles
-   outside the behaviour's slate.
-4. Encode each ordered list with `json.dumps(article_ids)` and save it with
-   `to_csv(..., index=False)` so CSV quoting is handled correctly. Read it back
-   with `json.loads`; do not use `eval`.
+These files are **Stage 1 shortlists**, not the final business-reranked output.
+Stage 2 receives the shortlist and the article/user information it needs. It need
+not use click probabilities; preserve those separately for analysis. Record
+`shortlist_size = 100` and `final_display_size = 5`. Alternative shortlist sizes
+are validation experiments and require explicit filenames/metadata and an agreed
+handoff update, rather than changing the meaning of `submission_top_100.csv`.
 
-Save the three files under `rankings/`. Every behaviour in its split's score file
-must have exactly one ranking row. Validate that each ranking's length and set of
-article IDs exactly match that behaviour's candidate keys in the source data.
-These are base-model outputs; implement reranking centrally. Metrics use all
-candidate scores and fair score-tie handling, not the export's article-ID ordering.
+## Separate recorded-slate diagnostics and schema migration
+
+Retain `diagnostics/recorded_slates/{split}_scores.csv` with
+`behaviour_id,article_id,score` and optional genuine `click_probability`. These
+files cover **every original recorded candidate exactly once**, including shown
+non-clicks. They support the labelled benchmark; they are not catalogue
+submissions. Obtain them by restricting catalogue scores to the recorded slate
+only when features and eligibility are identical; otherwise generate and label
+the benchmark separately. Investigate and report any recorded candidate absent
+from the eligible pool rather than silently dropping it from evaluation.
+
+Record **`export_schema_version = 3`**, `prediction_pool = "time_eligible_catalogue"`,
+all export paths, score semantics, catalogue version, eligibility rules, counts
+and shortlist size in `run_config.json` or its referenced export manifest.
+Version 2's `predictions/{split}_scores.csv` and
+`rankings/{split}_ranked_articles.csv` describe complete **recorded slates**.
+They cannot be renamed and passed off as catalogue outputs. Update prediction
+feature construction, exporters, validators and downstream readers together.
+Until migrated, existing experiments must state that catalogue inference is not
+implemented; the README contract alone does not implement it.
 
 ## Save a model that someone else can load
 
 Save the selected fitted estimator or inference weights in a format supported by
 the chosen stack. Include the reconstruction configuration, ordered features,
-fitted preprocessing, mappings and any required tokenizer/custom loading code.
+fitted preprocessing, mappings, catalogue feature construction/eligibility code
+and any required tokenizer/custom loading code.
 A weights file alone is insufficient when those dependencies are needed to
 reconstruct the model. Record external artifact identifiers/revisions and which
 components are frozen versus trained.
@@ -387,22 +496,25 @@ during longer runs. Do not claim exact resumption unless it has been checked.
 `run_config.json` must identify the experiment/run, owner, seed, Python/package
 versions, code commit (and whether there were uncommitted changes), input files,
 feature order/case, preprocessing, model settings, chosen checkpoint, prediction
-counts, complete-slate coverage, score semantics, `export_schema_version`, tuning
-objective and persistent artifact location. Copy the actual dependency versions
+counts, recorded-slate and eligible-catalogue coverage, eligibility policy,
+shortlist size, score semantics, `export_schema_version`, tuning objective and
+persistent artifact location. Copy the actual dependency versions
 needed to load the model into the run's `requirements.txt`. If tuning was used,
 include trial configurations/outcomes and a consistent study snapshot; do not
 export an incomplete live database while assuming it is resumable.
 
 Save `metrics.json` with **validation development metrics**, metric definitions,
 evaluated row/impression counts and exclusions. Follow the validation protocol
-above: primary mean impression AUC, secondary nDCG@5. Final cross-model tables,
+above: primary recorded-slate mean impression AUC, secondary recorded-slate
+nDCG@5, plus catalogue known-click Recall@100 and coverage diagnostics. Final cross-model tables,
 train/validation comparisons and reranking results belong in the shared evaluation
 stage, using the same split and candidate rows for every model. The existing saved
 baseline benchmark used its own sample and is not directly comparable by default.
 Do not report a score for unlabelled test data.
 
-The reranking/evaluation owner receives all three splits' complete predictions and
-complete ranked slates. Tune any reranking/ensemble choices on validation or an
+The reranking/evaluation owner receives all three splits' full catalogue scores,
+top-100 shortlists and separate recorded-slate diagnostics. Tune any
+reranking/ensemble choices on validation or an
 agreed inner training split, then freeze them before final evaluation. In-sample train predictions
 must not be treated as out-of-fold predictions for training a stacking model.
 The final report should explain the relevance, continuation, freshness and diversity
@@ -422,10 +534,13 @@ saved metrics or output cells is not a substitute for the fitted model bundle.
 
 Before handing it over, confirm:
 
-- All six CSVs exist with the schemas above, original IDs, finite scores and
-  complete split coverage; each ranking list contains every one of that
-  behaviour's candidates exactly once in score order. Validate optional
-  probabilities separately when provided.
+- The six catalogue score/shortlist CSVs and three recorded-slate diagnostic
+  score CSVs exist with the declared schemas, original IDs and complete request
+  coverage. Full catalogue scores match each request's eligibility manifest;
+  shortlist lists contain exactly its highest-scoring `min(100, pool_size)`
+  unique IDs. Check future-article exclusions, empty pools and probability
+  semantics separately. Do not validate catalogue exports against slate-only
+  row counts.
 - The model, preprocessing, config/tokenizer files, metrics, run configuration
   and dependency versions are included, together with recovery/tuning artifacts
   when applicable.
