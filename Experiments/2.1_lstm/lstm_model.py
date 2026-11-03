@@ -63,11 +63,17 @@ class ModelConfig:
     # Attention and head
     attention_dim: int = 64
     interaction_dim: int = 64
-    n_candidate_features: int = 3
-    n_context_features: int = 22
+    n_candidate_features: int = 2
+    n_context_features: int = 21
     head_hidden: tuple = (256, 128)
     dropout: float = 0.2
     embedding_dropout: float = 0.1
+    # Training-only augmentation: hide the text vector of this share of candidate
+    # articles (flag set to "no text"), so the model learns to score the many
+    # catalogue articles without a text vector from metadata/image instead of
+    # meeting that input combination for the first time at inference.
+    text_dropout: float = 0.0
+    numeric_has_text_index: int = 7
     # Recency normalisation for the attention bias (train-fitted constants)
     gap_mean: float = 0.0
     gap_std: float = 1.0
@@ -113,23 +119,32 @@ class ArticleEncoder(nn.Module):
         """Attach article lookup tensors (not part of the state_dict)."""
         self._table = table
 
-    def encode_rows(self, rows: torch.Tensor) -> torch.Tensor:
+    def encode_rows(self, rows: torch.Tensor, drop_text: bool = False) -> torch.Tensor:
         t = self._table
         topics = t["topics"][rows]
         topic_mask = (topics > 0).unsqueeze(-1).float()
         topic_vec = (self.topic(topics) * topic_mask).sum(-2) / topic_mask.sum(-2).clamp(min=1)
-        text = self.text(self.dropout(t["text"][rows])) * t["has_text"][rows].unsqueeze(-1)
-        image = self.image(self.dropout(t["image"][rows])) * t["has_image"][rows].unsqueeze(-1)
+        has_text = t["has_text"][rows]
+        numeric = t["numeric"][rows]
+        if drop_text and self.training and self.cfg.text_dropout > 0:
+            keep = (torch.rand(has_text.shape, device=has_text.device)
+                    >= self.cfg.text_dropout).float()
+            has_text = has_text * keep
+            numeric = numeric.clone()
+            numeric[:, self.cfg.numeric_has_text_index] *= keep
+        text = self.text(self.dropout(t["text"][t["text_row"][rows]])) * has_text.unsqueeze(-1)
+        image = (self.image(self.dropout(t["image"][t["image_row"][rows]]))
+                 * t["has_image"][rows].unsqueeze(-1))
         parts = [self.category(t["category"][rows]), self.article_type(t["article_type"][rows]),
-                 topic_vec, text, image, t["numeric"][rows]]
+                 topic_vec, text, image, numeric]
         if self.cfg.use_id_embedding:
             parts.append(self.ids(t["id_bucket"][rows]))
         return self.mlp(torch.cat(parts, dim=-1))
 
-    def forward(self, rows: torch.Tensor) -> torch.Tensor:
+    def forward(self, rows: torch.Tensor, drop_text: bool = False) -> torch.Tensor:
         """Encode each distinct article once, then scatter back."""
         unique, inverse = torch.unique(rows, return_inverse=True)
-        encoded = self.encode_rows(unique)
+        encoded = self.encode_rows(unique, drop_text=drop_text)
         return encoded[inverse]
 
 
@@ -189,7 +204,7 @@ class TargetAwareLSTMRanker(nn.Module):
                                      batch["hist_len"])            # [U, L, H]
         U, L, H = states.shape
         cand_user = batch["imp_user"][batch["cand_imp"]]          # [N]
-        cand = self.articles(batch["cand_rows"])                  # [N, D]
+        cand = self.articles(batch["cand_rows"], drop_text=True)  # [N, D]
         lengths = batch["hist_len"][cand_user]                    # [N]
         has_hist = (lengths > 0)
         attention = None
@@ -208,17 +223,47 @@ class TargetAwareLSTMRanker(nn.Module):
                 attention = weights
             else:
                 context = states.new_zeros(len(cand_user), H)
+        logits = self._score(cand, context, has_hist, batch["cand_feats"],
+                             batch["imp_ctx"][batch["cand_imp"]])
+        if return_attention:
+            return logits, attention
+        return logits
+
+    def _score(self, cand, context, has_hist, cand_feats, imp_ctx):
+        """Prediction head shared by the recorded-slate and catalogue paths."""
         context = torch.where(has_hist[:, None], context.to(cand.dtype),
                               self.empty_history.to(cand.dtype).expand_as(context))
         p_c, p_h = self.cand_proj(cand), self.ctx_proj(context)
         product = p_c * p_h
-        dot = product.sum(-1, keepdim=True) / math.sqrt(cfg.interaction_dim)
-        features = torch.cat([cand, context, product, dot, batch["cand_feats"],
-                              batch["imp_ctx"][batch["cand_imp"]]], dim=-1)
-        logits = self.head(features).squeeze(-1)
-        if return_attention:
-            return logits, attention
-        return logits
+        dot = product.sum(-1, keepdim=True) / math.sqrt(self.cfg.interaction_dim)
+        features = torch.cat([cand, context, product, dot, cand_feats, imp_ctx], dim=-1)
+        return self.head(features).squeeze(-1)
+
+    @torch.no_grad()
+    def score_one_request(self, cand, q, states_u, keys_u, length, gap_z,
+                          cand_feats, imp_ctx):
+        """Catalogue path for one request: N candidate articles, one user history.
+
+        cand [N, D] / q [N, A]: cached article encodings and attention queries.
+        states_u [L, H], keys_u [L, A]: the user's LSTM states and keys.
+        gap_z [L]: standardised log hours from each event to this request.
+        Uses a matrix product instead of gathering the history per candidate,
+        but the same arithmetic as ``forward``.
+        """
+        N, L = cand.shape[0], states_u.shape[0]
+        has_hist = torch.full((N,), bool(length > 0), device=cand.device)
+        if self.cfg.variant == "last_state" or L == 0 or length == 0:
+            if self.cfg.variant == "last_state" and length > 0:
+                context = states_u[length - 1].expand(N, -1)
+            else:
+                context = cand.new_zeros(N, self.cfg.lstm_hidden)
+        else:
+            scores = (q.float() @ keys_u[:length].float().T) / math.sqrt(self.cfg.attention_dim)
+            scores = scores + self.recency_weight * gap_z[:length][None, :]
+            weights = torch.softmax(scores, dim=-1)
+            context = weights @ states_u[:length].float()
+        return self._score(cand, context, has_hist, cand_feats,
+                           imp_ctx[None, :].expand(N, -1))
 
     def _attend(self, q, keys, states, cand_user, lengths, has_hist, batch):
         """fp32 masked attention; empty histories get zero weights."""
@@ -249,8 +294,10 @@ def article_table_tensors(table, device) -> dict:
         "article_type": as_t(table.article_type, torch.long),
         "topics": as_t(table.topics, torch.long),
         "numeric": as_t(table.numeric, torch.float32),
+        "text_row": as_t(table.text_row, torch.long),
         "text": as_t(table.text, torch.float32),
         "has_text": as_t(table.has_text, torch.float32),
+        "image_row": as_t(table.image_row, torch.long),
         "image": as_t(table.image, torch.float32),
         "has_image": as_t(table.has_image, torch.float32),
         "id_bucket": as_t(table.id_bucket, torch.long),
@@ -587,3 +634,103 @@ def count_parameters(model) -> dict:
     return {"trainable_parameters": int(trainable),
             "frozen_inputs": "text (768-d) and image (1024-d) article vectors are fixed "
                              "lookup tensors, not parameters; their encoders are not fine-tuned"}
+
+
+# --------------------------------------------------------------------------
+# Catalogue prediction (inference only)
+# --------------------------------------------------------------------------
+
+def select_top_k(logits: torch.Tensor, ids: torch.Tensor, k: int):
+    """Exact top-k by descending score, ties by ascending article ID."""
+    if len(logits) > k:
+        kth = torch.topk(logits, k).values[-1]
+        keep = logits >= kth                      # may exceed k when tied at the cut
+        logits, ids = logits[keep], ids[keep]
+    order = torch.argsort(ids)
+    logits, ids = logits[order], ids[order]
+    order = torch.sort(logits, descending=True, stable=True).indices
+    return ids[order][:k], logits[order][:k]
+
+
+class CatalogueScorer:
+    """Scores every eligible catalogue article for each request of one split.
+
+    The split's eligible articles are sorted by publication time, so a request's
+    pool is the contiguous slice [lo, hi) given by the eligibility rule. Article
+    encodings/queries are computed once for the whole snapshot and user LSTM
+    states once per user; pairs are scored in chunks and never materialised as a
+    behaviour x catalogue table. All arithmetic is fp32 (inference mode).
+    """
+
+    def __init__(self, model, data: "SplitTensors", index, age_stats: dict,
+                 max_age_hours=None, chunk: int = 32768, user_batch: int = 1024,
+                 max_state_gb: float = 4.0):
+        self.model = model.eval()
+        self.data, self.index, self.chunk = data, index, chunk
+        self.age_mean, self.age_std = age_stats["mean"], age_stats["std"]
+        device = data.device
+        self.device = device
+        self.lo, self.hi = index.bounds(data.imp_time.cpu().numpy(), max_age_hours)
+        rows = torch.as_tensor(index.rows, dtype=torch.long, device=device)
+        self.ids = torch.as_tensor(index.article_ids, dtype=torch.long, device=device)
+        self.pub = torch.as_tensor(index.published_s, dtype=torch.long, device=device)
+        with torch.no_grad():
+            enc = [model.articles.encode_rows(rows[i:i + chunk]) for i in range(0, len(rows), chunk)]
+            self.enc = torch.cat(enc) if enc else torch.zeros(0, model.cfg.article_dim, device=device)
+            self.q = model.query(self.enc) if len(self.enc) else self.enc[:, :model.cfg.attention_dim]
+        # User LSTM states: precompute for all users when they fit in memory.
+        U, L = data.hist_rows.shape
+        bytes_needed = U * L * (model.cfg.lstm_hidden + model.cfg.attention_dim) * 4
+        self.precomputed = bytes_needed <= max_state_gb * 1e9
+        self.states = self.keys = None
+        if self.precomputed:
+            states, keys = [], []
+            with torch.no_grad():
+                for s in range(0, U, user_batch):
+                    st = model.encode_history(data.hist_rows[s:s + user_batch],
+                                              data.hist_feats[s:s + user_batch],
+                                              data.hist_len[s:s + user_batch])
+                    states.append(st)
+                    keys.append(model.key(st))
+            self.states, self.keys = torch.cat(states), torch.cat(keys)
+
+    def _user(self, u: int):
+        if self.precomputed:
+            return self.states[u], self.keys[u]
+        d = self.data
+        with torch.no_grad():
+            st = self.model.encode_history(d.hist_rows[u:u + 1], d.hist_feats[u:u + 1],
+                                           d.hist_len[u:u + 1])[0]
+            return st, self.model.key(st)
+
+    @torch.no_grad()
+    def score_request(self, i: int):
+        """(article_ids, logits) for every eligible article of request i, in the
+        snapshot's (publication time, article ID) order."""
+        lo, hi = int(self.lo[i]), int(self.hi[i])
+        if hi <= lo:
+            empty = torch.zeros(0, device=self.device)
+            return empty.long(), empty
+        d = self.data
+        u = int(d.imp_user_row[i])
+        length = int(d.hist_len[u])
+        states_u, keys_u = self._user(u)
+        t = d.imp_time[i]
+        gap_h = (t - d.hist_time[u, :max(length, 1)]).double() / 3600.0
+        gap_z = ((torch.log1p(gap_h.clamp(min=0)) - self.model.cfg.gap_mean)
+                 / self.model.cfg.gap_std).float()
+        out = torch.empty(hi - lo, dtype=torch.float32, device=self.device)
+        for s in range(lo, hi, self.chunk):
+            e = min(s + self.chunk, hi)
+            age_h = (t - self.pub[s:e]).double() / 3600.0
+            log_age = ((torch.log1p(age_h.clamp(min=0)) - self.age_mean) / self.age_std).float()
+            cand_feats = torch.stack([log_age, torch.zeros_like(log_age)], dim=1)
+            out[s - lo:e - lo] = self.model.score_one_request(
+                self.enc[s:e], self.q[s:e], states_u, keys_u, length, gap_z,
+                cand_feats, d.imp_ctx[i])
+        return self.ids[lo:hi], out
+
+    def shortlist(self, i: int, k: int):
+        ids, logits = self.score_request(i)
+        top_ids, top_logits = select_top_k(logits, ids, k)
+        return top_ids, top_logits, ids, logits

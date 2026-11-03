@@ -35,7 +35,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 SPLITS = ("train", "validation", "test")
-EXPORT_SCHEMA_VERSION = 2
+EXPORT_SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
 # Paths
@@ -169,7 +169,7 @@ KEY_COLUMNS = ["user_id", "impression_id", "candidate_article_id"]
 CONTEXT_BOOL_COLUMNS = ["is_sso_user", "is_subscriber", "is_front_page"]
 BASE_FEATURE_COLUMNS = (
     KEY_COLUMNS + ["impression_time", "clicked", "hour", "day_of_week",
-                   "slate_size", "article_age_h", "article_age_missing"]
+                   "article_age_h", "article_age_missing"]
     + CONTEXT_BOOL_COLUMNS
 )
 
@@ -470,26 +470,36 @@ def normalise_token(value) -> str | None:
     return str(int(number)) if number.is_integer() else text
 
 
-def load_catalogue(paths: list[Path]) -> tuple[pd.DataFrame, dict]:
+def load_catalogue(paths: list[Path], batch_size: int = 20_000) -> tuple[pd.DataFrame, dict]:
     """Union of article catalogues; the first catalogue wins on overlap.
 
-    Future article totals (total_inviews, total_pageviews, total_read_time) are
-    never read.
+    Also returns each catalogue's own ID set (the per-split eligibility
+    snapshots). Body text is read in batches only to count words. Future
+    article totals (total_inviews, total_pageviews, total_read_time) are never
+    read.
     """
     needed = ["article_id", "category", "article_type", "premium",
-              "published_time", "topics", "body", "sentiment_score"]
-    frames, info = [], {}
+              "published_time", "topics", "sentiment_score"]
+    frames, info, snapshot_ids = [], {}, {}
     for path in paths:
-        names = pq.ParquetFile(path).schema_arrow.names
-        absent = sorted(set(needed) - set(names) - {"sentiment_score"})
+        parquet = pq.ParquetFile(path)
+        names = parquet.schema_arrow.names
+        absent = sorted(set(needed + ["body"]) - set(names) - {"sentiment_score"})
         if absent:
             raise ValueError(f"{path} lacks {absent}")
-        part = pd.read_parquet(path, columns=[c for c in needed if c in names])
+        columns = [c for c in needed if c in names]
+        part = pd.read_parquet(path, columns=columns)
         part["article_id"] = part["article_id"].astype("int64")
-        part["body_word_count"] = part["body"].map(
-            lambda t: len(t.split()) if isinstance(t, str) and t.strip() else np.nan)
-        part = part.drop(columns="body")
-        info[str(path)] = len(part)
+        words = []
+        for batch in parquet.iter_batches(batch_size=batch_size, columns=["body"]):
+            words.extend(len(t.split()) if isinstance(t, str) and t.strip() else np.nan
+                         for t in batch.column(0).to_pylist())
+        part["body_word_count"] = np.asarray(words, dtype="float64")
+        if part["article_id"].duplicated().any():
+            raise ValueError(f"{path}: duplicate article IDs")
+        snapshot_ids[str(path)] = np.sort(part["article_id"].to_numpy())
+        info[str(path)] = {"articles": len(part),
+                           "published_time_missing": int(part["published_time"].isna().sum())}
         frames.append(part)
     catalogue = pd.concat(frames, ignore_index=True)
     before = len(catalogue)
@@ -497,7 +507,7 @@ def load_catalogue(paths: list[Path]) -> tuple[pd.DataFrame, dict]:
     info["overlapping_ids_first_kept"] = before - len(catalogue)
     catalogue = catalogue.set_index("article_id", verify_integrity=True)
     catalogue["published_time"] = pd.to_datetime(catalogue["published_time"])
-    return catalogue, info
+    return catalogue, {"info": info, "snapshot_ids": snapshot_ids}
 
 
 FIXED_SIZE_LIST_ERROR = "Expected all lists to be of size"
@@ -685,7 +695,12 @@ def union_vectors(sources: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
 
 @dataclass
 class ArticleTable:
-    """Index-aligned article inputs. Row 0 is padding."""
+    """Index-aligned article inputs. Row 0 is padding.
+
+    Frozen vectors are stored compactly: ``text_row``/``image_row`` point into
+    ``text``/``image`` matrices whose row 0 is a zero placeholder used only
+    together with the ``has_text``/``has_image`` = False flags.
+    """
     article_ids: np.ndarray        # [A] original IDs, row 0 = -1
     category: np.ndarray           # [A] int64: 0 pad, 1 missing, 2 unknown, 3+ vocab
     article_type: np.ndarray       # [A] int64, same convention
@@ -694,12 +709,13 @@ class ArticleTable:
     numeric_names: list
     published_s: np.ndarray        # [A] int64 epoch seconds (0 = missing)
     published_missing: np.ndarray  # [A] bool
-    text: np.ndarray               # [A, Dt] float32 (zeros where missing)
+    text_row: np.ndarray           # [A] int64 row in ``text`` (0 = none)
+    text: np.ndarray               # [1 + n_text, Dt] float32
     has_text: np.ndarray           # [A] bool
-    image: np.ndarray              # [A, Di] float32 (zeros where missing)
+    image_row: np.ndarray          # [A] int64 row in ``image`` (0 = none)
+    image: np.ndarray              # [1 + n_image, Di] float32
     has_image: np.ndarray          # [A] bool
     id_bucket: np.ndarray          # [A] int64 learned-ID index (0 = OOV / off)
-    index: dict                    # original ID -> row
 
     def rows_for(self, article_ids: np.ndarray) -> np.ndarray:
         ids = np.asarray(article_ids, dtype=np.int64)
@@ -727,73 +743,69 @@ def fit_article_stats(catalogue: pd.DataFrame, train_article_ids: np.ndarray) ->
     return stats
 
 
+NUMERIC_NAMES = ["log_body_words_z", "body_words_missing", "sentiment_z",
+                 "sentiment_missing", "premium", "premium_missing", "in_catalogue",
+                 "has_text_vector", "has_image_vector"]
+
+
 def build_article_table(catalogue: pd.DataFrame, all_ids: np.ndarray, vocab: dict,
                         article_stats: dict, text_lookup: dict, image_lookup: dict,
                         text_dim: int, image_dim: int, max_topics: int = 8,
                         id_vocab: dict | None = None) -> tuple[ArticleTable, dict]:
+    """One row per article in ``all_ids`` (catalogue articles and any referenced
+    ID). IDs absent from the catalogue are kept with missing metadata flags."""
     ids = np.unique(np.asarray(all_ids, dtype=np.int64))
     ids = ids[ids > 0]
     n = len(ids) + 1
     category_vocab = {normalise_token(v): i + 3 for i, v in enumerate(vocab["category"])}
     type_vocab = {normalise_token(v): i + 3 for i, v in enumerate(vocab["article_type"])}
     topic_vocab = {str(v): i + 2 for i, v in enumerate(vocab["topics"])}
-    in_catalogue = np.zeros(n, bool)
+    found = np.isin(ids, catalogue.index.to_numpy())
+    sub = catalogue.reindex(ids)
+
     category = np.zeros(n, np.int64)
     article_type = np.zeros(n, np.int64)
+    category[1:] = [1 if c is None or (isinstance(c, float) and math.isnan(c)) or pd.isna(c)
+                    else category_vocab.get(normalise_token(c), 2) for c in sub["category"]]
+    article_type[1:] = [1 if t is None or (isinstance(t, float) and math.isnan(t))
+                        else type_vocab.get(str(t), 2) for t in sub["article_type"]]
     topics = np.zeros((n, max_topics), np.int64)
-    published_s = np.zeros(n, np.int64)
-    published_missing = np.ones(n, bool)
-    log_words = np.full(n, np.nan)
-    sentiment = np.full(n, np.nan)
-    premium = np.full(n, np.nan)
-    text = np.zeros((n, text_dim), np.float32)
-    image = np.zeros((n, image_dim), np.float32)
-    has_text = np.zeros(n, bool)
-    has_image = np.zeros(n, bool)
-    sub = catalogue.reindex(ids)
-    found = sub["category"].notna().to_numpy() | sub["article_type"].notna().to_numpy() \
-        | sub["published_time"].notna().to_numpy()
-    found |= np.isin(ids, catalogue.index.to_numpy())
-    in_catalogue[1:] = found
-    category[1:] = 1
-    article_type[1:] = 1
-    for row, (cat, typ, tops) in enumerate(zip(sub["category"], sub["article_type"],
-                                               sub["topics"]), start=1):
-        token = normalise_token(cat) if not (cat is None or pd.isna(cat)) else None
-        if token is not None:
-            category[row] = category_vocab.get(token, 2)
-        token = None if typ is None or (isinstance(typ, float) and pd.isna(typ)) else str(typ)
-        if token is not None:
-            article_type[row] = type_vocab.get(token, 2)
+    for row, tops in enumerate(sub["topics"], start=1):
         if isinstance(tops, (list, tuple, np.ndarray)):
             unique_topics = list(dict.fromkeys(str(t) for t in tops if t is not None))
             for j, topic in enumerate(unique_topics[:max_topics]):
                 topics[row, j] = topic_vocab.get(topic, 1)
     published = sub["published_time"]
     ok = published.notna().to_numpy()
+    published_s = np.zeros(n, np.int64)
     published_s[1:][ok] = (published[ok].astype("datetime64[us]").astype("int64")
                            .to_numpy() // 1_000_000)
+    published_missing = np.ones(n, bool)
     published_missing[1:] = ~ok
-    log_words[1:] = np.log1p(sub["body_word_count"].astype("float64").to_numpy())
-    if "sentiment_score" in sub:
-        sentiment[1:] = sub["sentiment_score"].astype("float64").to_numpy()
-    premium[1:] = sub["premium"].map(
-        lambda v: np.nan if v is None or pd.isna(v) else float(bool(v))).to_numpy()
-    for row, article_id in enumerate(ids.tolist(), start=1):
-        vector = text_lookup.get(article_id)
-        if vector is not None:
-            text[row] = vector
-            has_text[row] = True
-        vector = image_lookup.get(article_id)
-        if vector is not None:
-            image[row] = vector
-            has_image[row] = True
 
     def standardise(values, key):
         missing = ~np.isfinite(values)
         scaled = (values - article_stats[key]["mean"]) / article_stats[key]["std"]
         return np.where(missing, 0.0, scaled), missing.astype(float)
 
+    log_words = np.r_[np.nan, np.log1p(sub["body_word_count"].astype("float64").to_numpy())]
+    sentiment = np.r_[np.nan, sub["sentiment_score"].astype("float64").to_numpy()
+                      if "sentiment_score" in sub else np.full(n - 1, np.nan)]
+    premium = np.r_[np.nan, sub["premium"].map(
+        lambda v: np.nan if v is None or pd.isna(v) else float(bool(v))).to_numpy(dtype=float)]
+
+    def compact(lookup, dim):
+        rows = np.zeros(n, np.int64)
+        present = [i for i, a in enumerate(ids.tolist(), start=1) if a in lookup]
+        matrix = np.zeros((len(present) + 1, dim), np.float32)
+        for k, i in enumerate(present, start=1):
+            matrix[k] = lookup[int(ids[i - 1])]
+            rows[i] = k
+        return rows, matrix, rows > 0
+
+    text_row, text, has_text = compact(text_lookup, text_dim)
+    image_row, image, has_image = compact(image_lookup, image_dim)
+    in_catalogue = np.r_[False, found]
     words, words_missing = standardise(log_words, "log_body_words")
     sent, sent_missing = standardise(sentiment, "sentiment")
     prem_missing = ~np.isfinite(premium)
@@ -803,21 +815,17 @@ def build_article_table(catalogue: pd.DataFrame, all_ids: np.ndarray, vocab: dic
         in_catalogue.astype(float), has_text.astype(float), has_image.astype(float),
     ]).astype(np.float32)
     numeric[0] = 0.0
-    names = ["log_body_words_z", "body_words_missing", "sentiment_z",
-             "sentiment_missing", "premium", "premium_missing", "in_catalogue",
-             "has_text_vector", "has_image_vector"]
-    full_ids = np.r_[-1, ids]
     id_bucket = np.zeros(n, np.int64)
     if id_vocab:
         id_bucket[1:] = [id_vocab.get(a, 0) for a in ids.tolist()]
-    table = ArticleTable(full_ids, category, article_type, topics, numeric, names,
-                         published_s, published_missing, text, has_text, image,
-                         has_image, id_bucket,
-                         {a: i for i, a in enumerate(ids.tolist(), start=1)})
+    table = ArticleTable(np.r_[-1, ids], category, article_type, topics, numeric,
+                         list(NUMERIC_NAMES), published_s, published_missing,
+                         text_row, text, has_text, image_row, image, has_image, id_bucket)
     info = {"articles": len(ids), "not_in_catalogue": int((~found).sum()),
             "category_unknown": int((category == 2).sum()),
             "category_missing": int((category[1:] == 1).sum()),
             "type_unknown": int((article_type == 2).sum()),
+            "published_time_missing": int(published_missing[1:].sum()),
             "with_text_vector": int(has_text.sum()),
             "with_image_vector": int(has_image.sum())}
     return table, info
@@ -839,8 +847,33 @@ def _z(values, stats):
     return (values - stats["mean"]) / stats["std"]
 
 
+def candidate_age_hours(published_s: np.ndarray, published_missing: np.ndarray,
+                        request_time_s: np.ndarray) -> np.ndarray:
+    """Article age at the request in hours; NaN if unknown or published later.
+
+    Same rule as the shared Step 3 ``article_age_h``, but computed from the
+    catalogue so it is constructible for any article, inside or outside the
+    recorded slate.
+    """
+    age = (np.asarray(request_time_s, dtype=np.int64)
+           - np.asarray(published_s, dtype=np.int64)) / 3600.0
+    return np.where(np.asarray(published_missing) | (age < 0), np.nan, age)
+
+
+def candidate_features(age_h: np.ndarray, stats: dict) -> np.ndarray:
+    """[log_age_h_z, age_missing]. Pool-independent by design (no slate size or
+    within-slate rank, which a catalogue request does not have)."""
+    missing = ~np.isfinite(age_h)
+    log_age = np.log1p(np.clip(np.where(missing, 0.0, age_h), 0, None))
+    return np.column_stack([np.where(missing, 0.0, _z(log_age, stats["log_candidate_age_h"])),
+                            missing.astype(float)]).astype(np.float32)
+
+
+CANDIDATE_FEATURE_NAMES = ["log_age_h_z", "age_missing"]
+
+
 def fit_numeric_stats(frame: pd.DataFrame, hist: HistoryArrays,
-                      impression_offsets: np.ndarray) -> dict:
+                      impression_offsets: np.ndarray, articles: ArticleTable) -> dict:
     """Train-only standardisation constants for candidate, context and history."""
     def moments(values):
         values = np.asarray(values, dtype=np.float64)
@@ -851,21 +884,20 @@ def fit_numeric_stats(frame: pd.DataFrame, hist: HistoryArrays,
         return {"mean": float(values.mean()), "std": std if std > 1e-6 else 1.0}
 
     starts = impression_offsets[:-1]
-    age = frame["article_age_h"].to_numpy(dtype="float64", na_value=np.nan)
-    users = frame["user_id"].to_numpy()[starts]
-    rows = hist.rows_for(users)
     imp_time = (frame["impression_time"].astype("datetime64[us]").astype("int64")
                 .to_numpy()[starts] // 1_000_000)
+    rows_c = articles.rows_for(frame["candidate_article_id"].to_numpy())
+    age = candidate_age_hours(articles.published_s[rows_c], articles.published_missing[rows_c],
+                              np.repeat(imp_time, np.diff(impression_offsets)))
+    users = frame["user_id"].to_numpy()[starts]
+    rows = hist.rows_for(users)
     mask = np.arange(hist.times_s.shape[1])[None, :] < hist.lengths[rows][:, None]
     gaps = (imp_time[:, None] - hist.times_s[rows]) / 3600.0
-    valid_rows = np.arange(hist.times_s.shape[0])[:, None]
     hmask = np.arange(hist.times_s.shape[1])[None, :] < hist.lengths[:, None]
     prev_gap = np.diff(hist.times_s, axis=1, prepend=0) / 3600.0
     prev_mask = hmask & (np.arange(hist.times_s.shape[1])[None, :] > 0)
-    del valid_rows
     return {
         "log_candidate_age_h": moments(np.log1p(np.clip(age, 0, None))),
-        "log_slate_size": moments(np.log1p(frame["slate_size"].to_numpy()[starts])),
         "log_history_length": moments(np.log1p(hist.full_lengths[rows])),
         "log_gap_to_impression_h": moments(np.log1p(np.clip(gaps[mask], 0, None))),
         "log_read_time": moments(np.log1p(hist.read_time[hmask])),
@@ -878,12 +910,12 @@ def fit_numeric_stats(frame: pd.DataFrame, hist: HistoryArrays,
 @dataclass
 class SplitArrays:
     split: str
-    user_id: np.ndarray            # [I] per impression
+    user_id: np.ndarray            # [I] per impression (request)
     impression_id: np.ndarray      # [I]
     imp_time_s: np.ndarray         # [I] int64
     imp_user_row: np.ndarray       # [I] row into history arrays
-    imp_context: np.ndarray        # [I, C] float32
-    offsets: np.ndarray            # [I+1]
+    imp_context: np.ndarray        # [I, C] float32 (request context, pool-independent)
+    offsets: np.ndarray            # [I+1] recorded-slate offsets
     cand_article_id: np.ndarray    # [N] original
     cand_article_row: np.ndarray   # [N] article table row
     cand_features: np.ndarray      # [N, K] float32
@@ -915,7 +947,8 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
                 .to_numpy() // 1_000_000)
     user_rows = hist.rows_for(first["user_id"].to_numpy())
 
-    # Context: available at impression time; same for every candidate in a slate.
+    # Request context: known before recommending and independent of the article
+    # pool (the recorded slate size is deliberately not used).
     hour = first["hour"].to_numpy(dtype="float64")
     dow = first["day_of_week"].to_numpy(dtype="int64")
     ctx = [np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)]
@@ -930,9 +963,6 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
                             .to_numpy(dtype=float)))
         ctx.append(missing.astype(float))
         names += [column, f"{column}_missing"]
-    ctx.append(_z(np.log1p(first["slate_size"].to_numpy(dtype="float64")),
-                  stats["log_slate_size"]))
-    names.append("log_slate_size_z")
     for column in device_columns:
         ctx.append(first[column].to_numpy(dtype="float64"))
         names.append(column)
@@ -942,24 +972,13 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
     names += ["log_history_length_z", "history_empty"]
     imp_context = np.column_stack(ctx).astype(np.float32)
 
-    # Candidate features: shared article age (null if unknown/future) plus its
-    # within-slate percentile rank (impression-time information only).
-    age = frame["article_age_h"].to_numpy(dtype="float64", na_value=np.nan)
-    age_missing = ~np.isfinite(age)
-    log_age = np.log1p(np.clip(np.where(age_missing, 0.0, age), 0, None))
-    imp_index = np.repeat(np.arange(len(starts)), np.diff(offsets))
-    rank_frame = pd.DataFrame({"g": imp_index, "a": np.where(age_missing, np.nan, age)})
-    pct = rank_frame.groupby("g")["a"].rank(method="average", pct=True).to_numpy()
-    cand = np.column_stack([
-        np.where(age_missing, 0.0, _z(log_age, stats["log_candidate_age_h"])),
-        age_missing.astype(float),
-        np.where(np.isfinite(pct), pct, 0.5),
-    ]).astype(np.float32)
-    cand_names = ["log_age_h_z", "age_missing", "age_rank_pct_in_slate"]
-
     article_rows = articles.rows_for(frame["candidate_article_id"].to_numpy())
     if (article_rows == 0).any():
         raise AssertionError("candidate missing from article table")
+    age = candidate_age_hours(articles.published_s[article_rows],
+                              articles.published_missing[article_rows],
+                              np.repeat(imp_time, np.diff(offsets)))
+    cand = candidate_features(age, stats)
 
     # History event features (per user, impression-independent).
     hist_rows = articles.rows_for(hist.article_ids)
@@ -1010,7 +1029,8 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
         hist_article_row=hist_rows, hist_times_s=hist.times_s,
         hist_features=events, hist_lengths=hist.lengths,
         hist_full_lengths=hist.full_lengths,
-        context_names=names, candidate_names=cand_names, event_names=event_names)
+        context_names=names, candidate_names=list(CANDIDATE_FEATURE_NAMES),
+        event_names=event_names)
 
 
 def permute_history(arrays: SplitArrays, seed: int) -> SplitArrays:
@@ -1048,6 +1068,309 @@ def coverage_report(split: SplitArrays, articles: ArticleTable) -> dict:
             "category_known": float((articles.category[rows] >= 3).mean()) if len(rows) else None,
         }
     return out
+
+
+# --------------------------------------------------------------------------
+# Catalogue eligibility (prediction pool for recommendation requests)
+# --------------------------------------------------------------------------
+
+@dataclass
+class EligibilityPolicy:
+    """Versioned rule for which articles a request may be recommended.
+
+    An article is eligible for a request at time t when it is in the split's
+    catalogue snapshot, has a known publication time, and was published at or
+    before t (never a future article). ``max_age_hours`` is an optional,
+    explicitly declared freshness limit; None means no age limit.
+    """
+    snapshot_by_split: dict
+    max_age_hours: float | None = None
+    require_published_time: bool = True
+    version: str = "time_eligible_catalogue_v1"
+
+    def to_json(self) -> dict:
+        return {"version": self.version, "prediction_pool": "time_eligible_catalogue",
+                "snapshot_by_split": dict(self.snapshot_by_split),
+                "published_at_or_before_request": True,
+                "missing_published_time": "ineligible (availability cannot be verified)",
+                "require_published_time": self.require_published_time,
+                "max_age_hours": self.max_age_hours}
+
+
+@dataclass
+class CatalogueIndex:
+    """A split's eligible-article snapshot, sorted by (published time, article ID),
+    so the articles eligible at time t form one contiguous slice."""
+    split: str
+    snapshot: str
+    rows: np.ndarray            # [P] article-table rows, sorted
+    published_s: np.ndarray     # [P] sorted publication times
+    article_ids: np.ndarray     # [P] original IDs in the same order
+    in_snapshot: np.ndarray     # [A] bool over the article table
+    snapshot_size: int
+    excluded_missing_published: int
+    cum_text: np.ndarray        # [P+1] prefix counts of text-vector availability
+    cum_image: np.ndarray       # [P+1]
+
+    def bounds(self, request_time_s, max_age_hours=None):
+        t = np.asarray(request_time_s, dtype=np.int64)
+        hi = np.searchsorted(self.published_s, t, side="right")
+        if max_age_hours is None:
+            lo = np.zeros_like(hi)
+        else:
+            lo = np.searchsorted(self.published_s, t - int(round(max_age_hours * 3600)),
+                                 side="left")
+        return lo.astype(np.int64), hi.astype(np.int64)
+
+
+def build_catalogue_index(split: str, snapshot: str, snapshot_ids: np.ndarray,
+                          articles: ArticleTable) -> CatalogueIndex:
+    rows = articles.rows_for(snapshot_ids)
+    if (rows == 0).any():
+        raise AssertionError(f"{snapshot}: catalogue IDs missing from the article table")
+    missing = articles.published_missing[rows]
+    rows = rows[~missing]
+    order = np.lexsort((articles.article_ids[rows], articles.published_s[rows]))
+    rows = rows[order]
+    in_snapshot = np.zeros(len(articles.article_ids), bool)
+    in_snapshot[articles.rows_for(snapshot_ids)] = True
+    return CatalogueIndex(
+        split=split, snapshot=snapshot, rows=rows, published_s=articles.published_s[rows],
+        article_ids=articles.article_ids[rows], in_snapshot=in_snapshot,
+        snapshot_size=int(len(snapshot_ids)), excluded_missing_published=int(missing.sum()),
+        cum_text=np.r_[0, np.cumsum(articles.has_text[rows])],
+        cum_image=np.r_[0, np.cumsum(articles.has_image[rows])])
+
+
+def eligibility_summary(arrays: SplitArrays, index: CatalogueIndex,
+                        max_age_hours=None, bytes_per_score_row: float | None = None) -> dict:
+    lo, hi = index.bounds(arrays.imp_time_s, max_age_hours)
+    count = hi - lo
+    pairs = int(count.sum())
+    text_pairs = int((index.cum_text[hi] - index.cum_text[lo]).sum())
+    image_pairs = int((index.cum_image[hi] - index.cum_image[lo]).sum())
+    out = {
+        "split": arrays.split, "snapshot": index.snapshot,
+        "snapshot_articles": index.snapshot_size,
+        "snapshot_excluded_missing_published_time": index.excluded_missing_published,
+        "snapshot_with_text_vector": int(index.cum_text[-1]),
+        "snapshot_with_image_vector": int(index.cum_image[-1]),
+        "requests": int(arrays.n_impressions), "eligible_pairs": pairs,
+        "empty_pools": int((count == 0).sum()),
+        "pool_size_min_median_max": ([int(count.min()), float(np.median(count)),
+                                      int(count.max())] if len(count) else None),
+        "pair_share_with_text_vector": text_pairs / pairs if pairs else None,
+        "pair_share_with_image_vector": image_pairs / pairs if pairs else None,
+        "max_age_hours": max_age_hours,
+    }
+    if bytes_per_score_row:
+        out["estimated_full_score_csv_gb"] = pairs * bytes_per_score_row / 1e9
+    return out
+
+
+CLICK_EXCLUSION_REASONS = ("not_in_catalogue_snapshot", "published_time_missing",
+                           "published_after_request", "older_than_max_age")
+
+
+def clicked_eligibility(arrays: SplitArrays, index: CatalogueIndex,
+                        articles: ArticleTable, max_age_hours=None) -> dict:
+    """Classify every recorded clicked article as eligible or excluded (with reason)."""
+    if np.isnan(arrays.labels).all():
+        return {"labelled": False}
+    sizes = np.diff(arrays.offsets)
+    imp = np.repeat(np.arange(arrays.n_impressions), sizes)
+    clicked = arrays.labels == 1
+    rows = arrays.cand_article_row[clicked]
+    t = arrays.imp_time_s[imp[clicked]]
+    reason = np.full(len(rows), "", dtype=object)
+    reason[~index.in_snapshot[rows]] = "not_in_catalogue_snapshot"
+    pub_missing = articles.published_missing[rows]
+    reason[(reason == "") & pub_missing] = "published_time_missing"
+    pub = articles.published_s[rows]
+    reason[(reason == "") & (pub > t)] = "published_after_request"
+    if max_age_hours is not None:
+        reason[(reason == "") & (pub < t - int(round(max_age_hours * 3600)))] = "older_than_max_age"
+    eligible = reason == ""
+    return {"labelled": True, "impression": imp[clicked], "article_id": arrays.cand_article_id[clicked],
+            "eligible": eligible, "reason": reason,
+            "summary": {"clicked_articles": int(len(rows)),
+                        "eligible": int(eligible.sum()),
+                        "eligibility_coverage": float(eligible.mean()) if len(rows) else None,
+                        **{r: int((reason == r).sum()) for r in CLICK_EXCLUSION_REASONS}}}
+
+
+def known_click_recall(shortlists: dict, clicks: dict, ks=(100, 5)) -> dict:
+    """Known-click Recall@K over impressions with recorded clicks.
+
+    ``shortlists``: impression index -> ordered article IDs. ``clicks`` is the
+    output of ``clicked_eligibility``. The main recall keeps clicks rejected by
+    eligibility in the denominator; eligible-only recall is reported separately.
+    """
+    if not clicks.get("labelled"):
+        return {"labelled": False}
+    frame = pd.DataFrame({"imp": clicks["impression"], "aid": clicks["article_id"],
+                          "eligible": clicks["eligible"]})
+    scored = frame["imp"].isin(list(shortlists))
+    result = {"impressions_with_known_clicks": int(frame["imp"].nunique()),
+              "impressions_with_known_clicks_scored": int(frame.loc[scored, "imp"].nunique()),
+              **clicks["summary"]}
+    frame = frame[scored].copy()
+    for k in ks:
+        top = {i: set(shortlists[i][:k]) for i in frame["imp"].unique().tolist()}
+        hit = np.fromiter((aid in top[i] for i, aid in zip(frame["imp"], frame["aid"])),
+                          dtype=bool, count=len(frame))
+        frame[f"hit@{k}"] = hit
+        per = frame.groupby("imp").agg(h=(f"hit@{k}", "sum"), n=("aid", "size"),
+                                       e=("eligible", "sum"))
+        result[f"known_click_recall@{k}"] = float((per["h"] / per["n"]).mean()) if len(per) else None
+        elig = per[per["e"] > 0]
+        result[f"eligible_only_recall@{k}"] = float((elig["h"] / elig["e"]).mean()) if len(elig) else None
+        result[f"eligible_only_impressions@{k}"] = int(len(elig))
+    return result
+
+
+def top_k_reference(scores: np.ndarray, article_ids: np.ndarray, k: int) -> np.ndarray:
+    """Reference ordering: descending score, ties by ascending article ID."""
+    order = np.lexsort((article_ids, -np.asarray(scores, dtype=np.float64)))
+    return np.asarray(article_ids)[order[:k]]
+
+
+class ShortlistWriter:
+    """Streams schema-v3 catalogue outputs for one split.
+
+    * rankings/{split}/submission_top_100.csv - one row per request
+    * predictions/{split}/eligibility_manifest.csv - pool size per request
+    * full catalogue scores (all requests, or a declared request sample)
+    """
+
+    def __init__(self, run_dir: Path, split: str, shortlist_size: int,
+                 full_scores: bool, flush_every: int = 5000):
+        self.split, self.k = split, shortlist_size
+        self.rank_path = Path(run_dir) / "rankings" / split / f"submission_top_{shortlist_size}.csv"
+        self.manifest_path = Path(run_dir) / "predictions" / split / "eligibility_manifest.csv"
+        name = "submission_click_probabilities.csv"
+        self.score_path = (Path(run_dir) / "predictions" / split / name if full_scores else
+                           Path(run_dir) / "predictions" / split / "sampled_requests" / name)
+        for path in (self.rank_path, self.manifest_path, self.score_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.unlink(missing_ok=True)
+        self.flush_every = flush_every
+        self._ranks, self._manifest = [], []
+        self._score_header = True
+        self.score_rows = 0
+        self.requests = 0
+
+    def add(self, behaviour_id: str, request_time: str, eligible_count: int,
+            shortlist_ids, scores=None, article_ids=None):
+        if len(shortlist_ids) != min(self.k, eligible_count):
+            raise AssertionError(f"{behaviour_id}: shortlist length {len(shortlist_ids)}")
+        if len(set(shortlist_ids)) != len(shortlist_ids):
+            raise AssertionError(f"{behaviour_id}: duplicate shortlist IDs")
+        self._ranks.append((behaviour_id, json.dumps([int(a) for a in shortlist_ids])))
+        self._manifest.append((behaviour_id, request_time, int(eligible_count),
+                               int(len(shortlist_ids)), scores is not None))
+        if scores is not None:
+            frame = pd.DataFrame({"behaviour_id": behaviour_id,
+                                  "article_id": np.asarray(article_ids, dtype=np.int64),
+                                  "score": np.asarray(scores, dtype=np.float64)})
+            frame["click_probability"] = 1.0 / (1.0 + np.exp(-frame["score"].to_numpy()))
+            frame = frame.sort_values("article_id", kind="stable")
+            frame.to_csv(self.score_path, mode="a", header=self._score_header, index=False)
+            self._score_header = False
+            self.score_rows += len(frame)
+        self.requests += 1
+        if len(self._ranks) >= self.flush_every:
+            self.flush()
+
+    def flush(self):
+        if self._ranks:
+            pd.DataFrame(self._ranks, columns=["behaviour_id", "article_ids"]).to_csv(
+                self.rank_path, mode="a", header=not self.rank_path.exists(), index=False)
+            pd.DataFrame(self._manifest, columns=["behaviour_id", "request_time",
+                                                  "eligible_count", "shortlist_length",
+                                                  "scores_exported"]).to_csv(
+                self.manifest_path, mode="a", header=not self.manifest_path.exists(), index=False)
+            self._ranks, self._manifest = [], []
+
+    def close(self) -> dict:
+        self.flush()
+        if not self.rank_path.exists():   # zero requests: still write headers
+            pd.DataFrame(columns=["behaviour_id", "article_ids"]).to_csv(self.rank_path, index=False)
+        return {"rankings": str(self.rank_path), "manifest": str(self.manifest_path),
+                "scores": str(self.score_path) if self.score_rows else None,
+                "requests": self.requests, "score_rows": self.score_rows}
+
+
+def validate_catalogue_exports(split_arrays: SplitArrays, index: CatalogueIndex,
+                               outputs: dict, shortlist_size: int,
+                               max_age_hours=None, max_score_requests: int = 200) -> dict:
+    """Re-read the written files and check them against the eligibility rule and,
+    for requests with exported scores, against the full score rows."""
+    ranks = pd.read_csv(outputs["rankings"], dtype={"behaviour_id": str})
+    manifest = pd.read_csv(outputs["manifest"], dtype={"behaviour_id": str})
+    expected = behaviour_ids(split_arrays.user_id, split_arrays.impression_id)
+    if ranks["behaviour_id"].duplicated().any():
+        raise AssertionError("duplicate behaviours in the shortlist file")
+    if set(ranks["behaviour_id"]) != set(expected):
+        raise AssertionError("shortlist behaviours differ from the split's requests")
+    lo, hi = index.bounds(split_arrays.imp_time_s, max_age_hours)
+    expected_counts = pd.Series(hi - lo, index=expected)
+    got_counts = manifest.set_index("behaviour_id")["eligible_count"]
+    if not got_counts.reindex(expected).eq(expected_counts).all():
+        raise AssertionError("eligible counts differ from the eligibility rule")
+    lists = ranks.set_index("behaviour_id")["article_ids"].map(json.loads)
+    lengths = lists.map(len)
+    if not lengths.reindex(expected).eq(np.minimum(shortlist_size, expected_counts)).all():
+        raise AssertionError("shortlist length != min(K, eligible count)")
+    # Membership: every listed article is eligible for that request.
+    position = {b: i for i, b in enumerate(expected)}
+    pub_by_id = dict(zip(index.article_ids.tolist(), index.published_s.tolist()))
+    bad = 0
+    for behaviour_id, ids in lists.items():
+        i = position[behaviour_id]
+        t = split_arrays.imp_time_s[i]
+        floor = -np.inf if max_age_hours is None else t - max_age_hours * 3600
+        for a in ids:
+            p = pub_by_id.get(a)
+            if p is None or p > t or p < floor:
+                bad += 1
+    if bad:
+        raise AssertionError(f"{bad} shortlisted articles are not eligible for their request")
+    checked_against_scores = 0
+    if outputs.get("scores"):
+        # Stream the score file and fully check up to ``max_score_requests``
+        # requests (all rows of each), so multi-GB exports never load at once.
+        exported = manifest.loc[manifest["scores_exported"].astype(bool), "behaviour_id"]
+        selected = set(exported.head(max_score_requests).tolist())
+        groups = {}
+        for chunk in pd.read_csv(outputs["scores"], dtype={"behaviour_id": str},
+                                 float_precision="round_trip", chunksize=2_000_000):
+            p = chunk["click_probability"].to_numpy()
+            if not (np.isfinite(chunk["score"]).all() and np.isfinite(p).all()
+                    and (p >= 0).all() and (p <= 1).all()):
+                raise AssertionError("non-finite score or probability outside [0, 1]")
+            unknown = set(chunk["behaviour_id"].unique()) - set(exported)
+            if unknown:
+                raise AssertionError(f"scores for requests not marked as exported: {list(unknown)[:3]}")
+            part = chunk[chunk["behaviour_id"].isin(selected)]
+            for behaviour_id, group in part.groupby("behaviour_id", sort=False):
+                groups.setdefault(behaviour_id, []).append(group)
+        for behaviour_id in selected:
+            group = pd.concat(groups.get(behaviour_id, [pd.DataFrame(columns=["article_id", "score"])]))
+            if group["article_id"].duplicated().any():
+                raise AssertionError(f"{behaviour_id}: duplicate article rows")
+            if len(group) != expected_counts[behaviour_id]:
+                raise AssertionError(f"{behaviour_id}: score rows != eligible count")
+            reference = top_k_reference(group["score"].to_numpy(dtype=float),
+                                        group["article_id"].to_numpy(dtype=np.int64),
+                                        shortlist_size)
+            if list(reference) != lists[behaviour_id]:
+                raise AssertionError(f"{behaviour_id}: shortlist differs from its scores")
+            checked_against_scores += 1
+    return {"requests": int(len(ranks)), "eligible_pairs": int(expected_counts.sum()),
+            "empty_pools": int((expected_counts == 0).sum()),
+            "shortlists_checked_against_full_scores": checked_against_scores,
+            "membership_and_length_checked": True}
 
 
 # --------------------------------------------------------------------------
