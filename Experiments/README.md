@@ -3,6 +3,19 @@
 Keep model experiments here so the group can compare results and exchange saved
 predictions and models without rerunning training notebooks.
 
+## Current notebook drafts
+
+- [LSTM with target-aware attention](2.1_lstm/experiment.ipynb)
+- [HUIM-inspired attention network](2.2_huim/experiment.ipynb)
+
+These notebooks and their supporting modules are published on `main` for sharing
+the current structure. They have not been trained/evaluated in the committed
+notebooks. Follow-up implementation fixes are in progress: both still select by
+recorded-slate AUC and must adopt the catalogue Recall@100 protocol below; the
+HUIM full-file vector fallback also needs its reader-to-table fix. The shared
+protocol below is the intended contract, not a claim that these drafts already
+implement every requirement. Later fixes can update the same experiment folders.
+
 ## Stage-one task: learn relevance, then shortlist the eligible catalogue
 
 The intended recommendation pipeline is:
