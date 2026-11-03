@@ -430,7 +430,7 @@ def load_behaviours(path: Path, split: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path} lacks {sorted(missing)}")
     if "article_ids_clicked" not in available:
-        raise ValueError(f"{split}: expected labelled project data; rebuild Step 1 and Step 3")
+        raise ValueError(f"{split}: expected labelled project behaviour data")
     columns = BEHAVIOUR_COLUMNS_REQUIRED + [c for c in BEHAVIOUR_COLUMNS_OPTIONAL
                 if c in available and (c != "article_ids_clicked" or split in DEVELOPMENT_SPLITS)]
     frame = pd.read_parquet(path, columns=columns)
@@ -489,7 +489,7 @@ def load_recorded_pairs(feature_path: Path, split: str, behaviours: pd.DataFrame
         pairs["clicked"] = pairs.clicked.astype("int8")
     else:
         if pairs.clicked.isna().any() or not pairs.clicked.isin([0, 1]).all():
-            raise ValueError("Project holdout needs complete binary labels on disk; rebuild Step 1 and Step 3.")
+            raise ValueError("Expected complete binary labels in the project holdout feature file.")
         pairs["clicked"] = np.nan  # reserved ground truth, masked during development
     return pairs
 

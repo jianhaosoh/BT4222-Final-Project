@@ -21,7 +21,7 @@ implement this intended pipeline.
 
 ## Dataset
 
-This project uses the **EB-NeRD SMALL** dataset from Ekstra Bladet, a Danish news publisher. We use its training split, our selected validation users, and a labelled project holdout sampled from unused original validation users. The dataset contains anonymized user interactions and Danish news articles; the training and validation behavior logs cover consecutive seven-day periods in May and June 2023.
+This project uses the **EB-NeRD SMALL** dataset from Ekstra Bladet, a Danish news publisher. We retain its training split and sample disjoint validation and labelled test users from its original validation period, giving an approximate 80–10–10 split by behaviour rows. The dataset contains anonymized user interactions and Danish news articles; the training and validation behavior logs cover consecutive seven-day periods in May and June 2023.
 
 - `behaviors.parquet`: Impression logs with the articles shown (`article_ids_inview`), articles clicked (`article_ids_clicked`), timestamps, and context such as device type.
 - `history.parquet`: Each user's prior article clicks, with timestamps and reading interactions.
@@ -52,10 +52,3 @@ and their scores for every train, validation and test request, alongside scores
 for every original recorded-slate candidate in separate diagnostic files.
 Recorded slates and known clicks are never inserted into the genuine shortlist.
 Exhaustive catalogue-score exports are not required.
-
-Run the updated `Preprocessing/step1_val_test_split.ipynb`, then
-`step3_feature_engineering.ipynb`, before the next model run. Train and validation
-memberships stay unchanged. Step 3 rebuilds test files using the saved train
-transformations. Validation tunes models and the reranker; the labelled project
-test is evaluated after both stages are frozen. It is separate from the official
-unlabelled challenge test.

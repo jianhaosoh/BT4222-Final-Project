@@ -8,22 +8,21 @@ MyDrive/Colab Notebooks/BT4222 Shared Final Folder/feature_engineering/
 
 Each row is one candidate article shown in an impression. All project splits have binary `clicked` on disk (1 for a clicked candidate, 0 otherwise). Test is the labelled project holdout; development loaders hide its targets. Every feature file has the same column names for its case. The history features are already joined into these files; `*_history_profiles.parquet` is for inspecting the intermediate per-user profiles.
 
-## Labelled project holdout
+## Dataset splits
 
-Run Step 1 then Step 3 in Colab. Step 1 keeps the existing validation users and
-samples whole users from the unused original SMALL validation data, excluding
-validation users, with seed 43 and a target of `train rows / 8`. It saves their
-behaviours and matching original validation histories under `test/`.
-Validation and holdout share the original validation week and have no users in
-common; earlier train-user overlap is allowed. The 80–10–10 ratio is approximate
-by behaviour rows. The official challenge test is a separate unlabelled dataset.
+The original SMALL training split is retained. Validation and test are sampled
+from the original validation split, keeping every selected user's behaviours
+together and targeting `train rows / 8` each. Validation uses seed 42; test uses
+seed 43 and excludes validation users. Their matching fixed histories come from
+the original validation history file. The ratio is approximately 80–10–10 by
+behaviour rows, not expanded candidate pairs. Both evaluation splits cover the
+same period; users may also appear in the earlier training period.
 
-Step 3 rebuilds test features/profiles/log/scaled files only, reusing saved
-train-fitted state. Article catalogues, embeddings and train/validation feature
-files stay unchanged. `split_manifest.json` records the new membership and source.
-The final evaluator joins keys and `clicked` from `test_features.parquet` after
-model and reranker settings are frozen; `load_xy("test", ...)` keeps returning
-`y=None` during development. The preview notebook shows holdout counts only.
+Feature engineering processes all three splits. Vocabularies, log-transform
+choices, imputation and scaling are fitted on train only. Test labels are retained
+in the saved files for final evaluation, but development loaders return `y=None`
+for test. The preview notebook reports holdout schema and counts without targets.
+The split manifest records source data, sampling seeds and membership.
 
 ## Four input cases
 

@@ -98,10 +98,3 @@ Internal recovery helpers remain available for development, but the submitted no
 The planned shared evaluation notebook loads these selected bundles without retraining. It will use saved histories and trials for learning/search plots, compare identical validation requests and pools, inspect representative recommendations and history/feature groups, and assess coverage, missing-vector effects, uncertainty and Stage 2 relevance/freshness/diversity/continuity trade-offs. Attention weights alone are not causal explanations. Keep test outcomes out of selection and reranker tuning.
 
 Static/synthetic checks use `python3 -m unittest discover -s tests -v` from this directory. They do not run training or an Optuna search. Source ZIP regeneration must include exactly the current `huim/*.py` files.
-
-Before running, execute the updated Step 1 and Step 3 preprocessing notebooks.
-Project test now comes from unused original validation users and their histories;
-train and validation membership stays unchanged. The split manifest is saved
-with the run. Tune both stages on validation, then evaluate the labelled holdout
-after the whole pipeline is frozen. Top-200 and separate slate exports stay the
-same. The independent official challenge test remains unlabelled.

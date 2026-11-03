@@ -229,7 +229,7 @@ def load_candidate_table(path: Path, split: str) -> tuple[pd.DataFrame, dict]:
             "device_columns": device_columns}
     if split == "test":
         if labels.isna().any() or not labels.isin([0, 1]).all():
-            raise ValueError("Project holdout needs complete binary labels on disk; rebuild Step 1 and Step 3.")
+            raise ValueError("Expected complete binary labels in the project holdout feature file.")
         # Source ground truth is reserved for the later frozen-pipeline evaluator.
         frame["clicked"] = np.nan
         info.update({"labelled": False, "source_labelled": True,

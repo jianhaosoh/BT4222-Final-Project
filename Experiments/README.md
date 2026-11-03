@@ -24,23 +24,20 @@ This does not require another owner's running experiment to adopt our technology
 or restart. Existing CSV outputs are legacy artifacts; migrate their reader with
 an explicit adapter when combining results.
 
-## Project holdout
+## Dataset partitions
 
-Run the updated Step 1 then Step 3 preprocessing notebooks before a full model
-run. Keep train and current validation unchanged; project test is a seed-43
-whole-user sample from unused original SMALL validation users, excluding current
-validation users, with their original validation histories. Target `train rows / 8`
-for the approximate 80–10–10 behaviour-row ratio. Validation and holdout share the
-original validation week and are user-disjoint from each other, not necessarily
-from the earlier train week. Step 3 rebuilds test features only using saved train
-transformations; article/embedding assets stay unchanged. The split manifest
-identifies `ebnerd_small_labelled_user_holdout_v1`.
+The project retains the original SMALL training split. Validation and the labelled
+test holdout are whole-user samples from the original validation period, with
+seeds 42 and 43 respectively. They have no users in common with each other;
+users may also appear in the earlier training period. Each evaluation split
+targets `train rows / 8`, giving an approximate 80–10–10 behaviour-row ratio.
 
-All three project datasets retain labels. Training notebooks mask holdout targets
-and export top 200 plus separate slate scores. Tune models and the reranker on
-validation; final evaluation joins holdout labels after the whole pipeline is
-frozen. The separate official challenge test is still unlabelled. Other model
-owners should adopt the same inputs and split roles.
+All project splits retain click labels. Models and preprocessing are fitted on
+train; validation selects models, checkpoints and reranker settings. Training
+notebooks mask test targets and export recommendations without outcome metrics.
+The final evaluator joins holdout labels after the complete pipeline is frozen.
+`split_manifest.json` records the common source and membership. The official
+unlabelled challenge test is separate from this project holdout.
 
 ## Stage-one task: learn relevance, then shortlist the eligible catalogue
 
