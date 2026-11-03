@@ -7,6 +7,7 @@ predictions and models without rerunning training notebooks.
 
 - [LSTM with target-aware attention](2.1_lstm/experiment.ipynb)
 - [HUIM-inspired attention network](2.2_huim/experiment.ipynb)
+- [Pretrained similarity experiment](3.1_pretrained_similarity/experiment.ipynb)
 
 These notebooks and their supporting modules are published on `main` for sharing
 the current structure. They have not been trained/evaluated in the committed
@@ -15,6 +16,13 @@ recorded-slate AUC and must adopt the catalogue Recall@100 protocol below; the
 HUIM full-file vector fallback also needs its reader-to-table fix. The shared
 protocol below is the intended contract, not a claim that these drafts already
 implement every requirement. Later fixes can update the same experiment folders.
+
+The 3.1 implementation supplies the reference workflow for catalogue construction,
+request sampling and audit-first development below. Its current development run
+does not need to be interrupted to adopt another model's tools or architecture.
+The neural experiments should align their inference pools and comparison requests
+with that workflow; model-specific feature transforms and training methods remain
+independent. No committed notebook outputs establish training results yet.
 
 ## Stage-one task: learn relevance, then shortlist the eligible catalogue
 
@@ -52,13 +60,34 @@ eligibility policy explicitly defines an age limit.
 
 ### Shared catalogue eligibility and inference features
 
-Use the same versioned catalogue and eligibility rules across models. For each
-behaviour, use only articles published by its timestamp; never score future
-articles as recommendable. Declare any additional availability, access or age
-rules, their source fields, and the treatment of missing publication times. Do
-not invent rules or assume every article in a split was already available when
-the split began. A catalogue snapshot contains only the articles available in
-our supplied artifacts; do not claim coverage of an unknown production catalogue.
+Use the 3.1 policy **`published_at_or_before_request_v1`** for shared comparisons:
+
+1. Construct one ordered union from `train_val/articles.parquet`, then
+   `test/articles.parquet`, for **every** split. Keep the first source record for
+   each article ID, including its missing fields. Do not use separate smaller
+   train/validation and larger test pools for a like-for-like comparison.
+2. An article is eligible only when its publication timestamp is known and
+   `published_time <= impression_time`. Unknown dates and future publications are
+   excluded; original known clicks on those articles still count in metric ideals.
+   The reference policy adds no age/access cutoff and no embedding-coverage filter.
+3. Combine vector sources in the same order, keeping the first source record for
+   overlapping article IDs **including legitimate missing vectors**. Do not fill
+   an earlier source's missing vector from a later snapshot. Missing vectors do
+   not remove articles from the pool. Model-specific normalisation/projection and
+   optional modalities remain legitimate architecture choices.
+
+For each selected request, score its **full eligible union catalogue**, with no
+sampled article negatives or vector-covered-only subset. Sampling requests is a
+separate development/resource decision; it does not change the article pool for
+any selected request. Use test-snapshot article metadata only as the declared
+catalogue artifact, with the timestamp cutoff; this does not permit using test
+outcomes for training/tuning or fitting learned transforms on test data.
+
+Record source versions/order, duplicate precedence, catalogue ID fingerprint and
+eligibility rules. Alternative policies must be explicitly named and compared
+separately, never silently mixed in a results table. A supplied union is not proof
+of complete historical production availability or an unknown production catalogue's
+coverage. Do not assume every article existed when a split began.
 
 Keep `(user_id, impression_id)` and its timestamp/context as the recommendation
 request. Use only context known before making that recommendation. Audit every
@@ -80,6 +109,29 @@ Record catalogue coverage, exclusions and empty eligible pools.
 Include behaviours with empty pools in ranking exports as `[]` rather than
 silently dropping them. Record failures that prevent catalogue scoring and do
 not claim a recorded-slate export implements this path.
+
+### Audit, development and final execution
+
+An audit-only phase is a supported workflow: inspect schemas, source identity,
+feature reconstruction, vectors, eligible-pair counts and storage/runtime budgets
+before training or exporting. Stream inputs/use disk indexes when useful; do not
+require every model to materialise the full feature table in memory.
+
+Sampled development runs are valid. The 3.1 reference currently uses up to 5,000
+complete training requests, 100 validation-selection requests and 25 export
+requests per split. Each sampled export request still uses its full eligible
+article pool and has complete scores/top-100 output for that pool. Record these
+three limits separately: training, selection and export counts are not interchangeable.
+Do not force all models to use the same software, optimiser, trial count or feature
+columns. For controlled comparisons, match data/pool/evaluation scope; report
+different training budgets or modalities as differences rather than attributing
+all performance differences to architecture.
+
+Final/full scope uses all agreed training and export requests and the same pool
+policy, after feasibility checks. A development run may have a complete persistent
+bundle while remaining a sampled run; it must not be called a full submission.
+Do not change a running development experiment solely to match another model's
+larger request budget. Re-evaluate selected models on common requests later.
 
 ## One workflow, three responsibilities
 
@@ -325,6 +377,38 @@ Each experiment must implement its own validation evaluation now; do not wait
 for the later shared evaluation notebook. That shared stage consolidates model
 comparisons and final results, while experiment owners need validation feedback
 to develop their models.
+
+### Shared request sampling and comparable metric scopes
+
+Use 3.1's deterministic sampling for shared development comparisons. Build the
+original integer-ID `behaviour_id`, then compute
+`hashlib.blake2b(f"{seed}:{split}:{behaviour_id}".encode(), digest_size=8).hexdigest()`.
+Order by this hash and then `behaviour_id`, take the first N requests, and process
+the selected set chronologically (timestamp, user ID, impression ID). The
+reference request-sampling seed is **42**, independent of model-training seeds.
+Record selected request IDs; a seed alone does not prove two runs used the same
+requests. Prefer reusing the running 3.1 run's saved IDs rather than asking its
+owner to restart. Smaller N is a prefix of the same hash-priority order.
+
+Keep every recorded candidate for a selected training/diagnostic request, and
+every eligible catalogue article for a selected inference request. Keep the
+declared fixed histories complete subject to the model's documented history
+length/cutoff; request sampling does not turn later behaviour clicks into history.
+This policy replaces independently sampled positional/request sets for shared
+comparisons; earlier samples remain valid development runs with different scope.
+
+The 3.1 workflow deliberately distinguishes **selection-validation** (100 requests
+by default) from **exported-validation** (25 by default). Never compare those two
+scores as if they used the same evaluation requests. The shared evaluator must
+identify metric purpose, split, request IDs/count, pool fingerprint and selected
+model. It may read each experiment's native JSON through a small adapter rather
+than forcing the running implementation to rename its fields/files. For example,
+3.1's `selection_validation` and `exported_validation` are separate metric scopes.
+Compare models on identical request IDs and the same catalogue policy, then
+report training budgets/modalities alongside results. A full-pool result on a
+request sample is not a full-split result or an untouched test result.
+
+### Development steps
 
 1. **Fix the development data and protocol first.** Use the agreed train and
    validation partitions. Declare any reserved labelled final-evaluation partition
@@ -596,6 +680,13 @@ training resumption is supported, save the optimiser/scheduler state, progress,
 relevant random states and any precision state needed to resume, as applicable.
 Use atomic checkpoint writes and copy completed snapshots to persistent storage
 during longer runs. Do not claim exact resumption unless it has been checked.
+
+A persistent selected inference checkpoint is useful even when exact optimiser
+resumption is not implemented. State that distinction. An `_in_progress` folder
+is a recovery aid, not a completed handoff bundle. Input content hashes are
+optional when expensive: label path/size/mtime/schema fingerprints honestly and
+do not call them SHA256 hashes. At minimum, verify persistent file coverage/sizes
+and a numerical reload probe from that copy; record stronger hash checks when run.
 
 `run_config.json` must identify the experiment/run, owner, seed, Python/package
 versions, code commit (and whether there were uncommitted changes), input files,
