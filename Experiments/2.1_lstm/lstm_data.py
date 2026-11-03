@@ -318,13 +318,23 @@ def select_requests(user_id, impression_id, time_us, split: str, seed: int,
     if limit is not None:
         if int(limit) < 1:
             raise ValueError("request limits must be positive or None for all")
-        keyed = sorted(range(len(bids)), key=lambda k: (request_priority(seed, split, bids[k]), bids[k]))
-        chosen = np.asarray(keyed[:int(limit)], dtype=np.int64)
+        import heapq
+        smallest = heapq.nsmallest(int(limit), ((request_priority(seed, split, b), b, k)
+                                                for k, b in enumerate(bids)))
+        chosen = np.asarray([k for _, _, k in smallest], dtype=np.int64)
     else:
         chosen = np.arange(len(bids), dtype=np.int64)
     order = np.lexsort((impression_id[chosen], user_id[chosen], time_us[chosen]))
     chosen = chosen[order]
     return chosen, [bids[k] for k in chosen.tolist()]
+
+
+def first_by_priority(indices, bids, split: str, seed: int, k: int) -> np.ndarray:
+    """Deterministic (non-RNG) sub-sample: the k requests with the smallest shared
+    hash priority among ``indices`` (aligned ``bids``), in the original order."""
+    ranked = sorted(range(len(bids)), key=lambda j: (request_priority(seed, split, bids[j]), bids[j]))
+    keep = set(ranked[:int(k)])
+    return np.asarray([i for j, i in enumerate(np.asarray(indices).tolist()) if j in keep], dtype=np.int64)
 
 
 def subset_requests_frame(frame: pd.DataFrame, offsets: np.ndarray, requests: np.ndarray):

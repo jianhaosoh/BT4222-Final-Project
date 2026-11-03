@@ -532,6 +532,12 @@ def train_model(model, train: SplitTensors, select_fn, selection: dict,
         # Load to CPU: model/optimizer tensors are moved to the parameters' device
         # by load_state_dict, and RNG states must stay CPU uint8 tensors.
         state = torch.load(recovery, map_location="cpu", weights_only=False)
+        saved_cfg = {k: v for k, v in (state.get("train_config") or {}).items() if k != "max_epochs"}
+        current_cfg = {k: v for k, v in asdict(cfg).items() if k != "max_epochs"}
+        if saved_cfg != current_cfg:
+            raise RuntimeError(f"{recovery} was trained with different settings "
+                               f"({sorted(k for k in current_cfg if saved_cfg.get(k) != current_cfg[k])}); "
+                               "start a new run instead of resuming it.")
         if state.get("selection") != selection:
             raise RuntimeError(
                 f"{recovery} was selected with {state.get('selection', {}).get('objective', 'AUC (legacy)')}"

@@ -44,6 +44,7 @@ Training, selection-validation and export limits are independent. The IDs are sa
 - **Recorded-slate AUC** is a diagnostic only, and nDCG@5 is left to Stage 2.
 - **Checkpoints record the selection declaration**, including a protocol fingerprint (pool policy, source files, union-ID hash, sample IDs and encoder identity). Resuming a checkpoint selected under a different declaration is refused. That includes legacy AUC selection and the earlier per-split pools.
 - **Load-only runs of an older protocol** may reuse its weights for a new evaluation or export under the current protocol. The original selection provenance is kept, and controls are refused in that case.
+- **Provenance follows the weights.** `weights_selected_under` points back to the training run's protocol and objective, including through a load of a load run. A resume with changed training settings is refused; raising `max_epochs` is still allowed.
 
 **Metric scopes.** Selection-validation metrics (selection requests, at the selected checkpoint) and exported-validation metrics (export requests) are reported separately in `metrics.json`. With these limits, the exported validation requests are a subset of the selection requests. Compare models only on identical request IDs and pools; each scope records its ID hash. Test has no outcome metrics.
 
