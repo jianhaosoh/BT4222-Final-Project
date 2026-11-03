@@ -298,32 +298,44 @@ def cross_check_behaviours(frame: pd.DataFrame, behaviours_path: Path,
     return result
 
 
-def select_development_sample(frame: pd.DataFrame, offsets: np.ndarray,
-                              user_fraction: float | None, seed: int,
-                              max_users: int | None = None):
-    """Keep whole users (and so whole impressions) by a seeded hash rule."""
-    if user_fraction is None and max_users is None:
-        return frame, offsets, None
-    users = np.sort(frame["user_id"].unique())
-    rng = np.random.default_rng(seed)
-    priority = rng.random(len(users))
-    order = users[np.argsort(priority, kind="stable")]
-    count = len(users)
-    if user_fraction is not None:
-        count = max(1, int(round(len(users) * user_fraction)))
-    if max_users is not None:
-        count = min(count, max_users)
-    keep_users = set(order[:count].tolist())
-    keep_rows = frame["user_id"].isin(keep_users).to_numpy()
+def request_priority(seed: int, split: str, behaviour_id: str) -> str:
+    """Shared request-sampling hash (as in 3.1): BLAKE2b-64 of 'seed:split:behaviour_id'."""
+    return hashlib.blake2b(f"{seed}:{split}:{behaviour_id}".encode(), digest_size=8).hexdigest()
+
+
+def select_requests(user_id, impression_id, time_us, split: str, seed: int,
+                    limit: int | None) -> tuple[np.ndarray, list]:
+    """Shared request selection on REQUESTS (never on articles).
+
+    Take the ``limit`` smallest (hash, behaviour_id) from the complete request
+    population (all requests if None), then return their indices in processing
+    order (timestamp, user_id, impression_id), plus their behaviour IDs.
+    """
+    user_id = np.asarray(user_id, dtype=np.int64)
+    impression_id = np.asarray(impression_id, dtype=np.int64)
+    time_us = np.asarray(time_us, dtype=np.int64)
+    bids = [f"{u}:{i}" for u, i in zip(user_id.tolist(), impression_id.tolist())]
+    if limit is not None:
+        if int(limit) < 1:
+            raise ValueError("request limits must be positive or None for all")
+        keyed = sorted(range(len(bids)), key=lambda k: (request_priority(seed, split, bids[k]), bids[k]))
+        chosen = np.asarray(keyed[:int(limit)], dtype=np.int64)
+    else:
+        chosen = np.arange(len(bids), dtype=np.int64)
+    order = np.lexsort((impression_id[chosen], user_id[chosen], time_us[chosen]))
+    chosen = chosen[order]
+    return chosen, [bids[k] for k in chosen.tolist()]
+
+
+def subset_requests_frame(frame: pd.DataFrame, offsets: np.ndarray, requests: np.ndarray):
+    """Keep complete recorded slates of the given request indices (original
+    within-slate order; requests in the given order)."""
+    requests = np.asarray(requests, dtype=np.int64)
     sizes = np.diff(offsets)
-    keep_imp = keep_rows[offsets[:-1]]
-    new = frame.loc[keep_rows].reset_index(drop=True)
-    new_offsets = np.r_[0, np.cumsum(sizes[keep_imp])].astype(np.int64)
-    rule = {"rule": "whole users chosen by seeded random priority",
-            "seed": seed, "user_fraction": user_fraction, "max_users": max_users,
-            "users_kept": count, "users_total": len(users),
-            "impressions_kept": int(keep_imp.sum()), "candidate_rows_kept": len(new)}
-    return new, new_offsets, rule
+    rows = np.concatenate([np.arange(offsets[r], offsets[r + 1]) for r in requests]) \
+        if len(requests) else np.zeros(0, np.int64)
+    new = frame.iloc[rows].reset_index(drop=True)
+    return new, np.r_[0, np.cumsum(sizes[requests])].astype(np.int64)
 
 
 # --------------------------------------------------------------------------
@@ -671,16 +683,23 @@ def write_compatible_vectors(source: Path, destination: Path, vector_column: str
 
 def union_vectors(sources: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
                   check_overlap: bool = True) -> tuple[dict, dict]:
-    """First source wins (train/validation lookup first, then test)."""
+    """Ordered union of vector sources (train_val first, then test).
+
+    The FIRST source record per article ID wins, even when its vector is
+    legitimately missing: a later source never backfills it. This matches the
+    shared catalogue rule (first snapshot per article ID, missing fields kept).
+    """
     lookup: dict[int, np.ndarray] = {}
     known: set[int] = set()
-    mismatches = overlaps = 0
+    mismatches = overlaps = not_backfilled = 0
     for ids, matrix, available in sources:
         rows = np.cumsum(available) - 1
         for i, article_id in enumerate(ids.tolist()):
             vector = matrix[rows[i]] if available[i] else None
             if article_id in known:
                 overlaps += 1
+                if vector is not None and article_id not in lookup:
+                    not_backfilled += 1    # first record missing, later present: kept missing
                 if check_overlap and vector is not None and article_id in lookup:
                     if not np.allclose(lookup[article_id], vector, atol=1e-6):
                         mismatches += 1
@@ -690,6 +709,8 @@ def union_vectors(sources: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
                 lookup[article_id] = vector
     return lookup, {"ids_known": len(known), "ids_with_vector": len(lookup),
                     "overlapping_ids": overlaps, "overlap_vector_mismatches": mismatches,
+                    "first_record_missing_later_present_not_backfilled": not_backfilled,
+                    "rule": "first source record per article ID wins, including missing vectors",
                     "known_ids": known}
 
 
@@ -707,8 +728,9 @@ class ArticleTable:
     topics: np.ndarray             # [A, T] int64: 0 pad, 1 unknown, 2+ vocab
     numeric: np.ndarray            # [A, F] float32 standardised + flags
     numeric_names: list
-    published_s: np.ndarray        # [A] int64 epoch seconds (0 = missing)
+    published_s: np.ndarray        # [A] int64 epoch seconds (0 = missing; features)
     published_missing: np.ndarray  # [A] bool
+    published_us: np.ndarray       # [A] int64 epoch microseconds (eligibility, exact)
     text_row: np.ndarray           # [A] int64 row in ``text`` (0 = none)
     text: np.ndarray               # [1 + n_text, Dt] float32
     has_text: np.ndarray           # [A] bool
@@ -777,9 +799,9 @@ def build_article_table(catalogue: pd.DataFrame, all_ids: np.ndarray, vocab: dic
                 topics[row, j] = topic_vocab.get(topic, 1)
     published = sub["published_time"]
     ok = published.notna().to_numpy()
-    published_s = np.zeros(n, np.int64)
-    published_s[1:][ok] = (published[ok].astype("datetime64[us]").astype("int64")
-                           .to_numpy() // 1_000_000)
+    published_us = np.zeros(n, np.int64)
+    published_us[1:][ok] = published[ok].astype("datetime64[us]").astype("int64").to_numpy()
+    published_s = published_us // 1_000_000
     published_missing = np.ones(n, bool)
     published_missing[1:] = ~ok
 
@@ -819,7 +841,7 @@ def build_article_table(catalogue: pd.DataFrame, all_ids: np.ndarray, vocab: dic
     if id_vocab:
         id_bucket[1:] = [id_vocab.get(a, 0) for a in ids.tolist()]
     table = ArticleTable(np.r_[-1, ids], category, article_type, topics, numeric,
-                         list(NUMERIC_NAMES), published_s, published_missing,
+                         list(NUMERIC_NAMES), published_s, published_missing, published_us,
                          text_row, text, has_text, image_row, image, has_image, id_bucket)
     info = {"articles": len(ids), "not_in_catalogue": int((~found).sum()),
             "category_unknown": int((category == 2).sum()),
@@ -912,7 +934,7 @@ class SplitArrays:
     split: str
     user_id: np.ndarray            # [I] per impression (request)
     impression_id: np.ndarray      # [I]
-    imp_time_s: np.ndarray         # [I] int64
+    imp_time_s: np.ndarray         # [I] int64 seconds (features)
     imp_user_row: np.ndarray       # [I] row into history arrays
     imp_context: np.ndarray        # [I, C] float32 (request context, pool-independent)
     offsets: np.ndarray            # [I+1] recorded-slate offsets
@@ -928,6 +950,7 @@ class SplitArrays:
     context_names: list
     candidate_names: list
     event_names: list
+    imp_time_us: np.ndarray = None # [I] int64 microseconds (eligibility, request order)
 
     @property
     def n_impressions(self):
@@ -943,8 +966,8 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
                        device_columns: list) -> SplitArrays:
     starts = offsets[:-1]
     first = frame.iloc[starts]
-    imp_time = (first["impression_time"].astype("datetime64[us]").astype("int64")
-                .to_numpy() // 1_000_000)
+    imp_time_us = first["impression_time"].astype("datetime64[us]").astype("int64").to_numpy()
+    imp_time = imp_time_us // 1_000_000
     user_rows = hist.rows_for(first["user_id"].to_numpy())
 
     # Request context: known before recommending and independent of the article
@@ -1030,7 +1053,7 @@ def build_split_arrays(split: str, frame: pd.DataFrame, offsets: np.ndarray,
         hist_features=events, hist_lengths=hist.lengths,
         hist_full_lengths=hist.full_lengths,
         context_names=names, candidate_names=list(CANDIDATE_FEATURE_NAMES),
-        event_names=event_names)
+        event_names=event_names, imp_time_us=imp_time_us)
 
 
 def permute_history(arrays: SplitArrays, seed: int) -> SplitArrays:
@@ -1054,6 +1077,27 @@ def permute_history(arrays: SplitArrays, seed: int) -> SplitArrays:
                           "hist_features": take(arrays.hist_features)})
 
 
+def subset_split_arrays(arrays: SplitArrays, requests) -> SplitArrays:
+    """The same split restricted to the given requests (complete recorded slates,
+    in the given order); history arrays are shared unchanged."""
+    requests = np.asarray(requests, dtype=np.int64)
+    sizes = np.diff(arrays.offsets)
+    rows = (np.concatenate([np.arange(arrays.offsets[r], arrays.offsets[r + 1]) for r in requests])
+            if len(requests) else np.zeros(0, np.int64))
+    return SplitArrays(**{**arrays.__dict__,
+                          "user_id": arrays.user_id[requests],
+                          "impression_id": arrays.impression_id[requests],
+                          "imp_time_s": arrays.imp_time_s[requests],
+                          "imp_time_us": arrays.imp_time_us[requests],
+                          "imp_user_row": arrays.imp_user_row[requests],
+                          "imp_context": arrays.imp_context[requests],
+                          "offsets": np.r_[0, np.cumsum(sizes[requests])].astype(np.int64),
+                          "cand_article_id": arrays.cand_article_id[rows],
+                          "cand_article_row": arrays.cand_article_row[rows],
+                          "cand_features": arrays.cand_features[rows],
+                          "labels": arrays.labels[rows]})
+
+
 def coverage_report(split: SplitArrays, articles: ArticleTable) -> dict:
     cand = split.cand_article_row
     mask = np.arange(split.hist_article_row.shape[1])[None, :] < split.hist_lengths[:, None]
@@ -1074,27 +1118,36 @@ def coverage_report(split: SplitArrays, articles: ArticleTable) -> dict:
 # Catalogue eligibility (prediction pool for recommendation requests)
 # --------------------------------------------------------------------------
 
+POOL_POLICY_NAME = "published_at_or_before_request_v1"
+
+
 @dataclass
 class EligibilityPolicy:
-    """Versioned rule for which articles a request may be recommended.
+    """Shared pool rule ``published_at_or_before_request_v1`` (as in 3.1):
 
-    An article is eligible for a request at time t when it is in the split's
-    catalogue snapshot, has a known publication time, and was published at or
-    before t (never a future article). ``max_age_hours`` is an optional,
-    explicitly declared freshness limit; None means no age limit.
+    * one catalogue for every split's requests: the ordered union of
+      ``train_val/articles.parquet`` then ``test/articles.parquet``, keeping the
+      first record per article ID (including its missing fields);
+    * eligible when the publication time is known and <= the request time
+      (microsecond comparison); unknown publication time is excluded;
+    * no age or access cutoff, and no requirement for an embedding.
     """
-    snapshot_by_split: dict
+    sources: list
     max_age_hours: float | None = None
-    require_published_time: bool = True
-    version: str = "time_eligible_catalogue_v1"
+    name: str = POOL_POLICY_NAME
+
+    def __post_init__(self):
+        if self.max_age_hours is not None:
+            raise ValueError(f"{self.name} has no age cutoff; an age limit is a different policy")
 
     def to_json(self) -> dict:
-        return {"version": self.version, "prediction_pool": "time_eligible_catalogue",
-                "snapshot_by_split": dict(self.snapshot_by_split),
-                "published_at_or_before_request": True,
-                "missing_published_time": "ineligible (availability cannot be verified)",
-                "require_published_time": self.require_published_time,
-                "max_age_hours": self.max_age_hours}
+        return {"name": self.name, "prediction_pool": "time_eligible_catalogue",
+                "publication_field": "published_time", "missing_publication": "exclude",
+                "comparison": "published_time <= impression_time (microseconds)",
+                "age_limit_hours": None, "access_filter": None, "embedding_required": False,
+                "snapshot": "ordered union of declared catalogues; first snapshot wins",
+                "sources_in_order": list(self.sources),
+                "same_pool_for_splits": list(SPLITS)}
 
 
 @dataclass
@@ -1104,7 +1157,8 @@ class CatalogueIndex:
     split: str
     snapshot: str
     rows: np.ndarray            # [P] article-table rows, sorted
-    published_s: np.ndarray     # [P] sorted publication times
+    published_s: np.ndarray     # [P] publication times in seconds (features)
+    published_us: np.ndarray    # [P] sorted publication times in microseconds
     article_ids: np.ndarray     # [P] original IDs in the same order
     in_snapshot: np.ndarray     # [A] bool over the article table
     snapshot_size: int
@@ -1112,15 +1166,13 @@ class CatalogueIndex:
     cum_text: np.ndarray        # [P+1] prefix counts of text-vector availability
     cum_image: np.ndarray       # [P+1]
 
-    def bounds(self, request_time_s, max_age_hours=None):
-        t = np.asarray(request_time_s, dtype=np.int64)
-        hi = np.searchsorted(self.published_s, t, side="right")
-        if max_age_hours is None:
-            lo = np.zeros_like(hi)
-        else:
-            lo = np.searchsorted(self.published_s, t - int(round(max_age_hours * 3600)),
-                                 side="left")
-        return lo.astype(np.int64), hi.astype(np.int64)
+    def bounds(self, request_time_us, max_age_hours=None):
+        """Eligible slice [lo, hi) for request times in MICROSECONDS."""
+        if max_age_hours is not None:
+            raise ValueError("the shared pool policy has no age cutoff")
+        t = np.asarray(request_time_us, dtype=np.int64)
+        hi = np.searchsorted(self.published_us, t, side="right")
+        return np.zeros_like(hi).astype(np.int64), hi.astype(np.int64)
 
 
 def build_catalogue_index(split: str, snapshot: str, snapshot_ids: np.ndarray,
@@ -1130,12 +1182,13 @@ def build_catalogue_index(split: str, snapshot: str, snapshot_ids: np.ndarray,
         raise AssertionError(f"{snapshot}: catalogue IDs missing from the article table")
     missing = articles.published_missing[rows]
     rows = rows[~missing]
-    order = np.lexsort((articles.article_ids[rows], articles.published_s[rows]))
+    order = np.lexsort((articles.article_ids[rows], articles.published_us[rows]))
     rows = rows[order]
     in_snapshot = np.zeros(len(articles.article_ids), bool)
     in_snapshot[articles.rows_for(snapshot_ids)] = True
     return CatalogueIndex(
         split=split, snapshot=snapshot, rows=rows, published_s=articles.published_s[rows],
+        published_us=articles.published_us[rows],
         article_ids=articles.article_ids[rows], in_snapshot=in_snapshot,
         snapshot_size=int(len(snapshot_ids)), excluded_missing_published=int(missing.sum()),
         cum_text=np.r_[0, np.cumsum(articles.has_text[rows])],
@@ -1145,7 +1198,7 @@ def build_catalogue_index(split: str, snapshot: str, snapshot_ids: np.ndarray,
 def eligibility_summary(arrays: SplitArrays, index: CatalogueIndex,
                         max_age_hours=None, bytes_per_score_row: float | None = None,
                         requests=None) -> dict:
-    times = arrays.imp_time_s if requests is None else arrays.imp_time_s[np.asarray(requests)]
+    times = arrays.imp_time_us if requests is None else arrays.imp_time_us[np.asarray(requests)]
     lo, hi = index.bounds(times, max_age_hours)
     count = hi - lo
     pairs = int(count.sum())
@@ -1172,7 +1225,7 @@ def eligibility_summary(arrays: SplitArrays, index: CatalogueIndex,
 
 
 CLICK_EXCLUSION_REASONS = ("not_in_catalogue_snapshot", "published_time_missing",
-                           "published_after_request", "older_than_max_age")
+                           "published_after_request")
 
 
 def clicked_eligibility(arrays: SplitArrays, index: CatalogueIndex,
@@ -1184,15 +1237,13 @@ def clicked_eligibility(arrays: SplitArrays, index: CatalogueIndex,
     imp = np.repeat(np.arange(arrays.n_impressions), sizes)
     clicked = arrays.labels == 1
     rows = arrays.cand_article_row[clicked]
-    t = arrays.imp_time_s[imp[clicked]]
+    t = arrays.imp_time_us[imp[clicked]]
     reason = np.full(len(rows), "", dtype=object)
     reason[~index.in_snapshot[rows]] = "not_in_catalogue_snapshot"
     pub_missing = articles.published_missing[rows]
     reason[(reason == "") & pub_missing] = "published_time_missing"
-    pub = articles.published_s[rows]
+    pub = articles.published_us[rows]
     reason[(reason == "") & (pub > t)] = "published_after_request"
-    if max_age_hours is not None:
-        reason[(reason == "") & (pub < t - int(round(max_age_hours * 3600)))] = "older_than_max_age"
     eligible = reason == ""
     return {"labelled": True, "impression": imp[clicked], "article_id": arrays.cand_article_id[clicked],
             "eligible": eligible, "reason": reason,
@@ -1388,7 +1439,7 @@ def validate_catalogue_exports(split_arrays: SplitArrays, index: CatalogueIndex,
         raise AssertionError("duplicate behaviours in the shortlist file")
     if set(ranks["behaviour_id"]) != set(expected):
         raise AssertionError("shortlist behaviours differ from the split's requests")
-    lo, hi = index.bounds(split_arrays.imp_time_s[keep], max_age_hours)
+    lo, hi = index.bounds(split_arrays.imp_time_us[keep], max_age_hours)
     expected_counts = pd.Series(hi - lo, index=expected)
     got_counts = manifest.set_index("behaviour_id")["eligible_count"]
     if not got_counts.reindex(expected).eq(expected_counts).all():
@@ -1399,15 +1450,14 @@ def validate_catalogue_exports(split_arrays: SplitArrays, index: CatalogueIndex,
         raise AssertionError("shortlist length != min(K, eligible count)")
     # Membership: every listed article is eligible for that request.
     position = {b: i for i, b in enumerate(expected)}
-    pub_by_id = dict(zip(index.article_ids.tolist(), index.published_s.tolist()))
+    pub_by_id = dict(zip(index.article_ids.tolist(), index.published_us.tolist()))
     bad = 0
     for behaviour_id, ids in lists.items():
         i = keep[position[behaviour_id]]
-        t = split_arrays.imp_time_s[i]
-        floor = -np.inf if max_age_hours is None else t - max_age_hours * 3600
+        t = split_arrays.imp_time_us[i]
         for a in ids:
             p = pub_by_id.get(a)
-            if p is None or p > t or p < floor:
+            if p is None or p > t:
                 bad += 1
     if bad:
         raise AssertionError(f"{bad} shortlisted articles are not eligible for their request")

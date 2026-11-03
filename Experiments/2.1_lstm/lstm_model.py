@@ -314,6 +314,8 @@ class SplitTensors:
         self.n_candidates = arrays.n_candidates
         self.offsets = t(arrays.offsets, torch.long)
         self.imp_time = t(arrays.imp_time_s, torch.long)
+        # Exact request times (microseconds, CPU) for catalogue eligibility bounds.
+        self.imp_time_us = np.asarray(arrays.imp_time_us, dtype=np.int64)
         self.imp_user_row = t(arrays.imp_user_row, torch.long)
         self.imp_ctx = t(arrays.imp_context, torch.float32)
         self.cand_rows = t(arrays.cand_article_row, torch.long)
@@ -702,7 +704,7 @@ class CatalogueScorer:
         self.age_mean, self.age_std = age_stats["mean"], age_stats["std"]
         device = data.device
         self.device = device
-        self.lo, self.hi = index.bounds(data.imp_time.cpu().numpy(), max_age_hours)
+        self.lo, self.hi = index.bounds(data.imp_time_us, max_age_hours)
         rows = torch.as_tensor(index.rows, dtype=torch.long, device=device)
         self.ids = torch.as_tensor(index.article_ids, dtype=torch.long, device=device)
         self.pub = torch.as_tensor(index.published_s, dtype=torch.long, device=device)
