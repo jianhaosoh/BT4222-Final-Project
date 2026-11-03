@@ -591,7 +591,9 @@ def train_model(model, train: SplitTensors, select_fn, selection: dict,
                 log(f"  epoch {epoch} step {step}/{len(batches)} "
                     f"loss {total / count:.4f} ({time.time() - t0:.0f}s)")
         train_seconds = time.time() - t0
+        t_sel = time.time()
         metrics = select_fn(model)
+        selection_seconds = time.time() - t_sel
         objective = metrics.get(selection["objective"])
         if objective is None or metrics.get(selection["tiebreak"]) is None:
             raise ValueError(f"{selection['objective']} is undefined: the validation selection "
@@ -603,6 +605,7 @@ def train_model(model, train: SplitTensors, select_fn, selection: dict,
         row = {"epoch": epoch, "train_bce": total / max(count, 1),
                **{name: metrics.get(name) for name in selection["logged_metrics"]},
                "learning_rate": lr, "train_seconds": train_seconds,
+               "selection_seconds": selection_seconds,
                "seconds": time.time() - t0}
         history.append(row)
         improved = best["key"] is None or tuple(key) > tuple(best["key"])
@@ -691,7 +694,9 @@ class CatalogueScorer:
 
     def __init__(self, model, data: "SplitTensors", index, age_stats: dict,
                  max_age_hours=None, chunk: int = 32768, user_batch: int = 1024,
-                 max_state_gb: float = 4.0):
+                 max_state_gb: float = 4.0, requests=None):
+        """``requests``: if given, only those requests' users get precomputed LSTM
+        states (used for the per-epoch selection sample)."""
         self.model = model.eval()
         self.data, self.index, self.chunk = data, index, chunk
         self.age_mean, self.age_std = age_stats["mean"], age_stats["std"]
@@ -705,25 +710,34 @@ class CatalogueScorer:
             enc = [model.articles.encode_rows(rows[i:i + chunk]) for i in range(0, len(rows), chunk)]
             self.enc = torch.cat(enc) if enc else torch.zeros(0, model.cfg.article_dim, device=device)
             self.q = model.query(self.enc) if len(self.enc) else self.enc[:, :model.cfg.attention_dim]
-        # User LSTM states: precompute for all users when they fit in memory.
+        # User LSTM states: precompute (for all users, or the requests' users) when
+        # they fit in memory; otherwise compute per request.
         U, L = data.hist_rows.shape
-        bytes_needed = U * L * (model.cfg.lstm_hidden + model.cfg.attention_dim) * 4
+        if requests is None:
+            users = torch.arange(U, device=device)
+        else:
+            users = torch.unique(data.imp_user_row[torch.as_tensor(np.asarray(requests),
+                                                                   dtype=torch.long, device=device)])
+        bytes_needed = len(users) * L * (model.cfg.lstm_hidden + model.cfg.attention_dim) * 4
         self.precomputed = bytes_needed <= max_state_gb * 1e9
         self.states = self.keys = None
+        self.user_slot = torch.full((U,), -1, dtype=torch.long, device=device)
         if self.precomputed:
+            self.user_slot[users] = torch.arange(len(users), device=device)
             states, keys = [], []
             with torch.no_grad():
-                for s in range(0, U, user_batch):
-                    st = model.encode_history(data.hist_rows[s:s + user_batch],
-                                              data.hist_feats[s:s + user_batch],
-                                              data.hist_len[s:s + user_batch])
+                for s in range(0, len(users), user_batch):
+                    rows = users[s:s + user_batch]
+                    st = model.encode_history(data.hist_rows[rows], data.hist_feats[rows],
+                                              data.hist_len[rows])
                     states.append(st)
                     keys.append(model.key(st))
             self.states, self.keys = torch.cat(states), torch.cat(keys)
 
     def _user(self, u: int):
-        if self.precomputed:
-            return self.states[u], self.keys[u]
+        slot = int(self.user_slot[u]) if self.precomputed else -1
+        if slot >= 0:
+            return self.states[slot], self.keys[slot]
         d = self.data
         with torch.no_grad():
             st = self.model.encode_history(d.hist_rows[u:u + 1], d.hist_feats[u:u + 1],
