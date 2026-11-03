@@ -3,6 +3,27 @@
 Keep model experiments here so the group can compare results and exchange saved
 predictions and models without rerunning training notebooks.
 
+## Current notebook drafts
+
+- [LSTM with target-aware attention](2.1_lstm/experiment.ipynb)
+- [HUIM-inspired attention network](2.2_huim/experiment.ipynb)
+- [Pretrained similarity experiment](3.1_pretrained_similarity/experiment.ipynb)
+
+These notebooks and their supporting modules are published on `main` for sharing
+the current structure. They have not been trained/evaluated in the committed
+notebooks. Follow-up implementation fixes are in progress: both still select by
+recorded-slate AUC and must adopt the catalogue Recall@100 protocol below; the
+HUIM full-file vector fallback also needs its reader-to-table fix. The shared
+protocol below is the intended contract, not a claim that these drafts already
+implement every requirement. Later fixes can update the same experiment folders.
+
+The 3.1 implementation supplies the reference workflow for catalogue construction,
+request sampling and audit-first development below. Its current development run
+does not need to be interrupted to adopt another model's tools or architecture.
+The neural experiments should align their inference pools and comparison requests
+with that workflow; model-specific feature transforms and training methods remain
+independent. No committed notebook outputs establish training results yet.
+
 ## Stage-one task: learn relevance, then shortlist the eligible catalogue
 
 The intended recommendation pipeline is:
@@ -13,12 +34,12 @@ reranking → final top 5 recommendations.**
 Distinguish the inputs used to learn from observed clicks from the pool scored
 when making recommendations:
 
-| Operation | Article pool | Labels and purpose |
-| --- | --- | --- |
-| Training | Each behaviour's recorded `article_ids_inview` slate | Clicked = 1; shown but unclicked = 0. The shared feature tables already contain these expanded pairs. Keep this training setup. |
-| Recorded-slate validation | The same recorded candidate rows in validation | Labelled click-ranking diagnostic; not the primary shortlist-selection objective. |
+| Operation                            | Article pool                                         | Labels and purpose                                                                                                                               |
+| ------------------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Training                             | Each behaviour's recorded `article_ids_inview` slate | Clicked = 1; shown but unclicked = 0. The shared feature tables already contain these expanded pairs. Keep this training setup.                  |
+| Recorded-slate validation            | The same recorded candidate rows in validation       | Labelled click-ranking diagnostic; not the primary shortlist-selection objective.                                                                |
 | Catalogue prediction, for each split | Every article eligible at each behaviour's timestamp | Score behaviour × eligible article, then select the top 100. Articles outside the recorded slate have **unknown** outcomes, not negative labels. |
-| Stage 2 | Stage 1's catalogue-derived shortlist | Apply the agreed business priorities and produce the final top 5. |
+| Stage 2                              | Stage 1's catalogue-derived shortlist                | Apply the agreed business priorities and produce the final top 5.                                                                                |
 
 Do not re-explode the existing training feature tables or create catalogue-wide
 negative labels. Catalogue prediction is a **new inference path**, not merely a
@@ -39,13 +60,34 @@ eligibility policy explicitly defines an age limit.
 
 ### Shared catalogue eligibility and inference features
 
-Use the same versioned catalogue and eligibility rules across models. For each
-behaviour, use only articles published by its timestamp; never score future
-articles as recommendable. Declare any additional availability, access or age
-rules, their source fields, and the treatment of missing publication times. Do
-not invent rules or assume every article in a split was already available when
-the split began. A catalogue snapshot contains only the articles available in
-our supplied artifacts; do not claim coverage of an unknown production catalogue.
+Use the 3.1 policy **`published_at_or_before_request_v1`** for shared comparisons:
+
+1. Construct one ordered union from `train_val/articles.parquet`, then
+   `test/articles.parquet`, for **every** split. Keep the first source record for
+   each article ID, including its missing fields. Do not use separate smaller
+   train/validation and larger test pools for a like-for-like comparison.
+2. An article is eligible only when its publication timestamp is known and
+   `published_time <= impression_time`. Unknown dates and future publications are
+   excluded; original known clicks on those articles still count in metric ideals.
+   The reference policy adds no age/access cutoff and no embedding-coverage filter.
+3. Combine vector sources in the same order, keeping the first source record for
+   overlapping article IDs **including legitimate missing vectors**. Do not fill
+   an earlier source's missing vector from a later snapshot. Missing vectors do
+   not remove articles from the pool. Model-specific normalisation/projection and
+   optional modalities remain legitimate architecture choices.
+
+For each selected request, score its **full eligible union catalogue**, with no
+sampled article negatives or vector-covered-only subset. Sampling requests is a
+separate development/resource decision; it does not change the article pool for
+any selected request. Use test-snapshot article metadata only as the declared
+catalogue artifact, with the timestamp cutoff; this does not permit using test
+outcomes for training/tuning or fitting learned transforms on test data.
+
+Record source versions/order, duplicate precedence, catalogue ID fingerprint and
+eligibility rules. Alternative policies must be explicitly named and compared
+separately, never silently mixed in a results table. A supplied union is not proof
+of complete historical production availability or an unknown production catalogue's
+coverage. Do not assume every article existed when a split began.
 
 Keep `(user_id, impression_id)` and its timestamp/context as the recommendation
 request. Use only context known before making that recommendation. Audit every
@@ -68,13 +110,36 @@ Include behaviours with empty pools in ranking exports as `[]` rather than
 silently dropping them. Record failures that prevent catalogue scoring and do
 not claim a recorded-slate export implements this path.
 
+### Audit, development and final execution
+
+An audit-only phase is a supported workflow: inspect schemas, source identity,
+feature reconstruction, vectors, eligible-pair counts and storage/runtime budgets
+before training or exporting. Stream inputs/use disk indexes when useful; do not
+require every model to materialise the full feature table in memory.
+
+Sampled development runs are valid. The 3.1 reference currently uses up to 5,000
+complete training requests, 100 validation-selection requests and 25 export
+requests per split. Each sampled export request still uses its full eligible
+article pool and has complete scores/top-100 output for that pool. Record these
+three limits separately: training, selection and export counts are not interchangeable.
+Do not force all models to use the same software, optimiser, trial count or feature
+columns. For controlled comparisons, match data/pool/evaluation scope; report
+different training budgets or modalities as differences rather than attributing
+all performance differences to architecture.
+
+Final/full scope uses all agreed training and export requests and the same pool
+policy, after feasibility checks. A development run may have a complete persistent
+bundle while remaining a sampled run; it must not be called a full submission.
+Do not change a running development experiment solely to match another model's
+larger request budget. Re-evaluate selected models on common requests later.
+
 ## One workflow, three responsibilities
 
-| Stage | Responsibility |
-| --- | --- |
-| Shared preprocessing — `Preprocessing/` | Prepare the agreed splits, features and embeddings once; publish common inputs on Drive. |
-| Stage 1 — `Experiments/` | Train/load each relevance model on observed pairs, validate it, score the eligible catalogue, and export full catalogue scores, top-100 shortlists, recorded-slate diagnostics and the saved model. |
-| Stage 2 — shared reranking and evaluation | Consume each model's catalogue-derived shortlists, apply business priorities, compare final top-5 lists and produce the final evaluation and report analysis. |
+| Stage                                     | Responsibility                                                                                                                                                                                      |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shared preprocessing — `Preprocessing/`   | Prepare the agreed splits, features and embeddings once; publish common inputs on Drive.                                                                                                            |
+| Stage 1 — `Experiments/`                  | Train/load each relevance model on observed pairs, validate it, score the eligible catalogue, and export full catalogue scores, top-100 shortlists, recorded-slate diagnostics and the saved model. |
+| Stage 2 — shared reranking and evaluation | Consume each model's catalogue-derived shortlists, apply business priorities, compare final top-5 lists and produce the final evaluation and report analysis.                                       |
 
 Keep cross-model comparisons and final evaluation together in that shared stage.
 Individual experiment notebooks analyse validation only for development; they
@@ -105,12 +170,12 @@ keeping, including when a simpler model is sufficient.
 Use the following links to guide the explanation, rather than requiring every
 model to address every objective:
 
-| Business link | Example explanation in a model notebook | Evidence brought together in shared evaluation |
-| --- | --- | --- |
-| Relevant recommendations | Does category/topic affinity, reading history or content similarity explain why an article scores highly? | Stage 1 catalogue known-click Recall@100 and observed-click nDCG@100; Stage 2 final-list relevance, alongside representative examples. |
-| Continued reading | If using historical reading depth or sequence information, explain how it could represent a reader's interests over time. | Session-continuation performance where suitable outcome labels exist; distinguish this from click prediction. |
-| Fresh content | Does recency information help the model consider timely articles? Explain any relevance/freshness trade-off. | Article-age distribution of top-ranked items before and after reranking. |
-| Exploration and variety | Do the highest-scoring articles repeatedly concentrate on the same topics? Explain the model's behaviour and implications for reranking. | Topic/category diversity before and after reranking, alongside relevance metrics. |
+| Business link            | Example explanation in a model notebook                                                                                                  | Evidence brought together in shared evaluation                                                                                         |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Relevant recommendations | Does category/topic affinity, reading history or content similarity explain why an article scores highly?                                | Stage 1 catalogue known-click Recall@100 and observed-click nDCG@100; Stage 2 final-list relevance, alongside representative examples. |
+| Continued reading        | If using historical reading depth or sequence information, explain how it could represent a reader's interests over time.                | Session-continuation performance where suitable outcome labels exist; distinguish this from click prediction.                          |
+| Fresh content            | Does recency information help the model consider timely articles? Explain any relevance/freshness trade-off.                             | Article-age distribution of top-ranked items before and after reranking.                                                               |
+| Exploration and variety  | Do the highest-scoring articles repeatedly concentrate on the same topics? Explain the model's behaviour and implications for reranking. | Topic/category diversity before and after reranking, alongside relevance metrics.                                                      |
 
 Include one or two focused pieces of **validation** evidence suited to the model:
 for example, feature importance or permutation importance, a targeted feature
@@ -127,11 +192,11 @@ handoff to the shared evaluation/report owner.
 
 ## Tracks and numbering
 
-| Track | ID prefix | Naming examples |
-| --- | --- | --- |
-| Traditional models | `1` | `1.1_<short_name>`, `1.2_<short_name>` |
-| Neural networks | `2` | `2.1_<short_name>`, `2.2_<short_name>` |
-| Pretrained models | `3` | `3.1_<model_name>` |
+| Track              | ID prefix | Naming examples                        |
+| ------------------ | --------- | -------------------------------------- |
+| Traditional models | `1`       | `1.1_<short_name>`, `1.2_<short_name>` |
+| Neural networks    | `2`       | `2.1_<short_name>`, `2.2_<short_name>` |
+| Pretrained models  | `3`       | `3.1_<model_name>`                     |
 
 Each experiment directory sits directly under `Experiments/` and is named
 `<ID>_<short_model_name>`. The first number identifies the track; there is no
@@ -228,16 +293,16 @@ Mount Drive first in Colab and adjust `DRIVE_ROOT` to the location of your copy 
 shortcut. Apply `SEED` to the random-number generators and model/framework
 settings you use. Keep all other input paths relative to it:
 
-| Input | Path under `DRIVE_ROOT` |
-| --- | --- |
-| Raw engineered features | `feature_engineering/{split}_features.parquet` |
-| Log variants | `feature_engineering/log_variants/{split}_features.parquet` |
-| Scaled features | `feature_engineering/scaled_log_variants/{split}_features.parquet` |
-| Feature vocabulary | `feature_engineering/feature_vocabulary.json` |
-| Train/validation article catalogue | `train_val/articles.parquet` |
-| Test article catalogue | `test/articles.parquet` |
-| Train/validation article vectors | `train_val/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/train_val/`) |
-| Test article vectors | `test/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/test/`) |
+| Input                              | Path under `DRIVE_ROOT`                                                                                   |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Raw engineered features            | `feature_engineering/{split}_features.parquet`                                                            |
+| Log variants                       | `feature_engineering/log_variants/{split}_features.parquet`                                               |
+| Scaled features                    | `feature_engineering/scaled_log_variants/{split}_features.parquet`                                        |
+| Feature vocabulary                 | `feature_engineering/feature_vocabulary.json`                                                             |
+| Train/validation article catalogue | `train_val/articles.parquet`                                                                              |
+| Test article catalogue             | `test/articles.parquet`                                                                                   |
+| Train/validation article vectors   | `train_val/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/train_val/`) |
+| Test article vectors               | `test/article embeddings/{text,image}_embeddings.parquet` (some layouts use `embeddings/test/`)           |
 
 Use `train`, `validation`, and `test` consistently in file names and metadata;
 `validation` is the split otherwise called “val”. See the
@@ -271,12 +336,12 @@ separate from a file-loading failure.
 Stage 1 selects a catalogue-derived shortlist for Stage 2, so its model-selection
 metric must measure that task:
 
-| Role | Metric and evaluation pool |
-| --- | --- |
-| **Stage 1 primary** | **Mean known-click Recall@100** over validation requests, using the full time-eligible catalogue for each request. Maximise this for hyperparameter, checkpoint and early-stopping decisions. |
-| **Stage 1 secondary** | **Mean observed-click nDCG@100** on the same catalogue predictions, measuring the order within the shortlist. |
-| Recorded-slate diagnostic | Mean impression AUC on the original shown candidates; useful for debugging click ranking, not the final Stage 1 selection objective. |
-| Stage 2 final-list evaluation | nDCG@5 for the final five recommendations, alongside the agreed business metrics and explicit observed-outcome limitations. |
+| Role                          | Metric and evaluation pool                                                                                                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stage 1 primary**           | **Mean known-click Recall@100** over validation requests, using the full time-eligible catalogue for each request. Maximise this for hyperparameter, checkpoint and early-stopping decisions. |
+| **Stage 1 secondary**         | **Mean observed-click nDCG@100** on the same catalogue predictions, measuring the order within the shortlist.                                                                                 |
+| Recorded-slate diagnostic     | Mean impression AUC on the original shown candidates; useful for debugging click ranking, not the final Stage 1 selection objective.                                                          |
+| Stage 2 final-list evaluation | nDCG@5 for the final five recommendations, alongside the agreed business metrics and explicit observed-outcome limitations.                                                                   |
 
 Stage 2 can reorder a retained clicked article but cannot recover one discarded
 by Stage 1. That is why shortlist membership (Recall@100) is primary and its
@@ -312,6 +377,38 @@ Each experiment must implement its own validation evaluation now; do not wait
 for the later shared evaluation notebook. That shared stage consolidates model
 comparisons and final results, while experiment owners need validation feedback
 to develop their models.
+
+### Shared request sampling and comparable metric scopes
+
+Use 3.1's deterministic sampling for shared development comparisons. Build the
+original integer-ID `behaviour_id`, then compute
+`hashlib.blake2b(f"{seed}:{split}:{behaviour_id}".encode(), digest_size=8).hexdigest()`.
+Order by this hash and then `behaviour_id`, take the first N requests, and process
+the selected set chronologically (timestamp, user ID, impression ID). The
+reference request-sampling seed is **42**, independent of model-training seeds.
+Record selected request IDs; a seed alone does not prove two runs used the same
+requests. Prefer reusing the running 3.1 run's saved IDs rather than asking its
+owner to restart. Smaller N is a prefix of the same hash-priority order.
+
+Keep every recorded candidate for a selected training/diagnostic request, and
+every eligible catalogue article for a selected inference request. Keep the
+declared fixed histories complete subject to the model's documented history
+length/cutoff; request sampling does not turn later behaviour clicks into history.
+This policy replaces independently sampled positional/request sets for shared
+comparisons; earlier samples remain valid development runs with different scope.
+
+The 3.1 workflow deliberately distinguishes **selection-validation** (100 requests
+by default) from **exported-validation** (25 by default). Never compare those two
+scores as if they used the same evaluation requests. The shared evaluator must
+identify metric purpose, split, request IDs/count, pool fingerprint and selected
+model. It may read each experiment's native JSON through a small adapter rather
+than forcing the running implementation to rename its fields/files. For example,
+3.1's `selection_validation` and `exported_validation` are separate metric scopes.
+Compare models on identical request IDs and the same catalogue policy, then
+report training budgets/modalities alongside results. A full-pool result on a
+request sample is not a full-split result or an untouched test result.
+
+### Development steps
 
 1. **Fix the development data and protocol first.** Use the agreed train and
    validation partitions. Declare any reserved labelled final-evaluation partition
@@ -486,11 +583,11 @@ behaviour_id,article_id,score,click_probability
 12345:67890,9876543,1.0,0.7310585786
 ```
 
-| Column | Contract |
-| --- | --- |
-| `behaviour_id` | Shared original-ID request identifier, repeated for every eligible article. |
-| `article_id` | Original integer article ID from the eligible catalogue; not restricted to `article_ids_inview`. |
-| `score` | Finite Stage 1 relevance score; higher is more relevant. Declare whether it is a probability, logit or ranking score. |
+| Column              | Contract                                                                                                                                            |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `behaviour_id`      | Shared original-ID request identifier, repeated for every eligible article.                                                                         |
+| `article_id`        | Original integer article ID from the eligible catalogue; not restricted to `article_ids_inview`.                                                    |
+| `score`             | Finite Stage 1 relevance score; higher is more relevant. Declare whether it is a probability, logit or ranking score.                               |
 | `click_probability` | Finite value in `[0, 1]` from a genuine click-probability model or documented fitted calibration. Uncalibrated estimates must be described as such. |
 
 Keep logits in `score` and their sigmoid in `click_probability` when that is the
@@ -583,6 +680,13 @@ training resumption is supported, save the optimiser/scheduler state, progress,
 relevant random states and any precision state needed to resume, as applicable.
 Use atomic checkpoint writes and copy completed snapshots to persistent storage
 during longer runs. Do not claim exact resumption unless it has been checked.
+
+A persistent selected inference checkpoint is useful even when exact optimiser
+resumption is not implemented. State that distinction. An `_in_progress` folder
+is a recovery aid, not a completed handoff bundle. Input content hashes are
+optional when expensive: label path/size/mtime/schema fingerprints honestly and
+do not call them SHA256 hashes. At minimum, verify persistent file coverage/sizes
+and a numerical reload probe from that copy; record stronger hash checks when run.
 
 `run_config.json` must identify the experiment/run, owner, seed, Python/package
 versions, code commit (and whether there were uncommitted changes), input files,
