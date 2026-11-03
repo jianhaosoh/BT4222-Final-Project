@@ -32,6 +32,8 @@ from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 VARIANTS = ("attention", "last_state", "attention_shuffled", "attention_no_lstm")
+# Positions in lstm_data.build_split_arrays event features (asserted in the notebook).
+GAP_PREV_FEATURE, GAP_PREV_MISSING = 4, 5
 
 
 @dataclass
@@ -199,17 +201,9 @@ class TargetAwareLSTMRanker(nn.Module):
             if L:
                 keys = self.key(states)                               # [U, L, A]
                 q = self.query(cand)                                  # [N, A]
-                scores = torch.einsum("na,nla->nl", q.float(), keys[cand_user].float())
-                scores = scores / math.sqrt(cfg.attention_dim)
-                gap_h = (batch["imp_time"][:, None] - batch["hist_time"][batch["imp_user"]]
-                         ).float() / 3600.0                          # [I, L]
-                gap = (torch.log1p(gap_h.clamp(min=0)) - cfg.gap_mean) / cfg.gap_std
-                scores = scores + self.recency_weight * gap[batch["cand_imp"]]
-                mask = torch.arange(L, device=scores.device)[None, :] < lengths[:, None]
-                scores = scores.masked_fill(~mask, float("-inf"))
-                scores = torch.where(has_hist[:, None], scores, torch.zeros_like(scores))
-                weights = torch.softmax(scores, dim=-1) * mask
-                context = torch.einsum("nl,nlh->nh", weights, states[cand_user].float())
+                with torch.autocast(device_type=states.device.type, enabled=False):
+                    context, weights = self._attend(q.float(), keys.float(), states.float(),
+                                                    cand_user, lengths, has_hist, batch)
                 attention = weights
             else:
                 context = states.new_zeros(len(cand_user), H)
@@ -224,6 +218,23 @@ class TargetAwareLSTMRanker(nn.Module):
         if return_attention:
             return logits, attention
         return logits
+
+    def _attend(self, q, keys, states, cand_user, lengths, has_hist, batch):
+        """fp32 masked attention; empty histories get zero weights."""
+        cfg = self.cfg
+        L = keys.shape[1]
+        scores = torch.einsum("na,nla->nl", q, keys[cand_user])
+        scores = scores / math.sqrt(cfg.attention_dim)
+        gap_h = (batch["imp_time"][:, None] - batch["hist_time"][batch["imp_user"]]
+                 ).float() / 3600.0                          # [I, L]
+        gap = (torch.log1p(gap_h.clamp(min=0)) - cfg.gap_mean) / cfg.gap_std
+        scores = scores + self.recency_weight * gap[batch["cand_imp"]]
+        mask = torch.arange(L, device=scores.device)[None, :] < lengths[:, None]
+        scores = scores.masked_fill(~mask, float("-inf"))
+        scores = torch.where(has_hist[:, None], scores, torch.zeros_like(scores))
+        weights = torch.softmax(scores, dim=-1) * mask
+        context = torch.einsum("nl,nlh->nh", weights, states[cand_user])
+        return context, weights
 
 
 # --------------------------------------------------------------------------
@@ -306,6 +317,13 @@ def drop_history_events(rows, feats, times, lengths, p, generator=None):
     latest = pos == (lengths[:, None] - 1)
     rand = torch.rand((U, L), device=device, generator=generator)
     keep = valid & ((rand >= p) | latest)
+    # A survivor whose predecessor was dropped no longer has a valid "gap to
+    # previous event": mark it missing (as for a first event) instead of stale.
+    prev_kept = torch.cat([torch.ones_like(keep[:, :1]), keep[:, :-1]], dim=1)
+    stale = keep & ~prev_kept
+    feats = feats.clone()
+    feats[..., GAP_PREV_FEATURE] = feats[..., GAP_PREV_FEATURE].masked_fill(stale, 0.0)
+    feats[..., GAP_PREV_MISSING] = feats[..., GAP_PREV_MISSING].masked_fill(stale, 1.0)
     order = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)
     gather = lambda a: torch.gather(a, 1, order if a.dim() == 2 else
                                     order.unsqueeze(-1).expand_as(a))
@@ -325,7 +343,7 @@ def impression_batches(n: int, batch_size: int, shuffle: bool, generator=None):
 
 
 @torch.no_grad()
-def predict_logits(model, data: SplitTensors, batch_size: int = 1024,
+def predict_logits(model, data: SplitTensors, batch_size: int = 256,
                    impression_subset: np.ndarray | None = None) -> np.ndarray:
     """fp32 inference in the split's canonical candidate order."""
     model.eval()
@@ -383,7 +401,7 @@ class TrainConfig:
     min_lr: float = 1e-5
     history_dropout: float = 0.0
     use_amp: bool = True
-    eval_batch_impressions: int = 1024
+    eval_batch_impressions: int = 256
     max_train_impressions_per_epoch: int | None = None
     seed: int = 42
 
@@ -449,7 +467,8 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
-        scaler.load_state_dict(state["scaler"])
+        if state["scaler"]:   # empty when saved from a CPU / non-AMP run
+            scaler.load_state_dict(state["scaler"])
         history, best, stale = state["history"], state["best"], state["stale"]
         start_epoch = state["epoch"] + 1
         restore_rng_state(state["rng"])
@@ -474,14 +493,14 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 logits = model(batch)
                 loss = loss_fn(logits.float(), batch["labels"])
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite loss at epoch {epoch} step {step}")
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"non-finite loss at epoch {epoch} step {step}")
             total += float(loss) * len(batch["labels"])
             count += len(batch["labels"])
             if step % 200 == 0:
@@ -490,6 +509,9 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         scores = predict_logits(model, validation, cfg.eval_batch_impressions)
         metrics = evaluate(scores)
         auc = metrics["mean_impression_auc"]
+        if auc is None:
+            raise ValueError("No validation impression has both a click and a non-click, so "
+                             "AUC-based selection is impossible; enlarge the (smoke) sample.")
         lr = optimizer.param_groups[0]["lr"]
         scheduler.step(auc)
         row = {"epoch": epoch, "train_bce": total / max(count, 1),
@@ -507,7 +529,8 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         log(f"epoch {epoch}: train BCE {row['train_bce']:.4f} | val AUC {auc:.4f} "
             f"nDCG@5 {row['validation_ndcg@5']:.4f} | lr {lr:.2e} | "
             f"{row['seconds']:.0f}s{' *best*' if improved else ''}")
-        finished = stale > cfg.early_stopping_patience or epoch == cfg.max_epochs
+        # Stop after `early_stopping_patience` consecutive epochs without improvement.
+        finished = stale >= cfg.early_stopping_patience or epoch == cfg.max_epochs
         atomic_torch_save({
             "epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
@@ -524,7 +547,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
                 import optuna
                 raise optuna.TrialPruned()
         if finished:
-            if stale > cfg.early_stopping_patience:
+            if stale >= cfg.early_stopping_patience:
                 log(f"Early stopping: no validation AUC gain for {stale} epochs.")
             break
 

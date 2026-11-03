@@ -615,10 +615,10 @@ class ArticleTable:
 
     def rows_for(self, article_ids: np.ndarray) -> np.ndarray:
         ids = np.asarray(article_ids, dtype=np.int64)
-        flat = ids.ravel()
-        out = np.fromiter((self.index.get(a, 0) for a in flat.tolist()),
-                          dtype=np.int64, count=flat.size)
-        return out.reshape(ids.shape)
+        # article_ids is [-1, sorted IDs...], so a binary search maps ID -> row.
+        pos = np.searchsorted(self.article_ids, ids)
+        pos = np.clip(pos, 0, len(self.article_ids) - 1)
+        return np.where(self.article_ids[pos] == ids, pos, 0).astype(np.int64)
 
 
 def fit_article_stats(catalogue: pd.DataFrame, train_article_ids: np.ndarray) -> dict:
@@ -1025,8 +1025,12 @@ def user_cluster_bootstrap(users: np.ndarray, a: np.ndarray, b: np.ndarray,
     sums = np.bincount(codes, weights=diff)
     counts = np.bincount(codes).astype(float)
     rng = np.random.default_rng(seed)
-    draws = rng.integers(0, len(uniques), size=(n_boot, len(uniques)))
-    boot = sums[draws].sum(axis=1) / counts[draws].sum(axis=1)
+    boot = np.empty(n_boot)
+    chunk = max(1, int(2e7 // max(len(uniques), 1)))
+    for start in range(0, n_boot, chunk):
+        stop = min(n_boot, start + chunk)
+        draws = rng.integers(0, len(uniques), size=(stop - start, len(uniques)))
+        boot[start:stop] = sums[draws].sum(axis=1) / counts[draws].sum(axis=1)
     return {"mean_difference": float(diff.mean()) if len(diff) else None,
             "ci95": [float(np.quantile(boot, 0.025)), float(np.quantile(boot, 0.975))]
             if len(diff) else None,
@@ -1117,8 +1121,22 @@ def write_csv_atomic(frame: pd.DataFrame, path: Path) -> None:
 def write_json(obj, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(obj, indent=2, default=_json_default) + "\n")
+    temporary.write_text(json.dumps(_finite(obj), indent=2, default=_json_default,
+                                    allow_nan=False) + "\n")
     os.replace(temporary, path)
+
+
+def _finite(value):
+    """Replace NaN/inf with None so the JSON is strict."""
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _finite(value.tolist())
+    if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
+        return None
+    return value
 
 
 def _json_default(value):
