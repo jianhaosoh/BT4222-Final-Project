@@ -1,7 +1,8 @@
 """Time-eligible catalogue scoring, top-100 shortlists and streamed v3 exports.
 
-Eligibility (declared, shared policy): for request (user_id, impression_id) at
-time t, an article of the split's declared catalogue is eligible iff its
+Eligibility (shared policy published_at_or_before_request_v1): for request
+(user_id, impression_id) at time t, an article of the ordered train_val -> test
+union catalogue (the same pool for every split) is eligible iff its
 published_time is present and published_time <= t. Articles with a missing
 publication time are excluded (cannot be verified as non-future) and counted.
 No recency window, access rule or vector-coverage restriction is applied.
@@ -9,6 +10,7 @@ No recency window, access rule or vector-coverage restriction is applied.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import time
@@ -22,6 +24,7 @@ import pyarrow.csv as pacsv
 import torch
 
 from .features import NO_PUB
+from .metrics import request_retrieval
 from .io_utils import atomic_write_json, read_json
 
 SHORTLIST_SIZE = 100
@@ -29,7 +32,9 @@ FINAL_DISPLAY_SIZE = 5
 EXPORT_SCHEMA_VERSION = 3
 PREDICTION_POOL = "time_eligible_catalogue"
 ELIGIBILITY_RULES = [
-    "article belongs to the split's declared catalogue snapshot (see catalogue_versions)",
+    "policy published_at_or_before_request_v1: article belongs to the ordered union train_val/articles.parquet "
+    "then test/articles.parquet (first record per article_id wins, incl. missing fields), the SAME pool for "
+    "train, validation and test requests",
     "published_time is not missing (missing -> excluded, counted)",
     "published_time <= request impression_time (future publications excluded)",
     "no recency window, access, premium or embedding-coverage restriction",
@@ -42,7 +47,8 @@ SCORE_SEMANTICS = {
 MANIFEST_COLUMNS = [
     "behaviour_id", "user_id", "impression_id", "impression_time", "eligible_count", "shortlist_length",
     "n_recorded", "n_recorded_ineligible", "n_clicked", "n_clicked_eligible", "n_clicked_not_in_catalogue",
-    "n_clicked_missing_pub", "n_clicked_future", "n_clicked_in_shortlist", "n_clicked_in_top5",
+    "n_clicked_missing_pub", "n_clicked_future", "n_clicked_in_shortlist",
+    "observed_dcg_at_100", "ideal_dcg_at_100", "tie_crosses_cutoff",
     "shortlist_share_with_text", "shortlist_median_age_h", "shortlist_distinct_categories",
 ]
 
@@ -62,26 +68,33 @@ def catalogue_eligibility(ctx, art) -> dict:
             "catalogue_published_after_last_request": int((pub_sorted > req_s.max()).sum()) if len(pub_sorted) else 0}
 
 
-def click_eligibility(ctx, art) -> list[dict]:
+def click_eligibility(ctx, art, positions=None) -> list[dict | None]:
     """Per request: clicked IDs split into eligible / not in catalogue / missing
-    pub / future. Original clicked IDs stay in the recall denominator."""
-    out = []
-    catalogue_ids = art.ids[ctx.catalogue_idx]
+    pub / future. Original clicked IDs stay in the recall denominator.
+
+    Returns a list indexed by request position; only `positions` (default: all)
+    are computed, others are None. Membership uses a boolean mask over the global
+    article index (O(clicks log N) per request), not a scan of the ~10^5-article pool."""
+    n = len(ctx.requests)
+    out: list[dict | None] = [None] * n
+    in_pool = np.zeros(len(art.ids), dtype=bool)
+    in_pool[ctx.catalogue_idx] = True
+    in_pool[0] = False  # unknown article index
     pub = art.tensors["pub_s"].numpy()
     req_s = ctx.tensors["req_s"].numpy()
     clicked = ctx.requests["article_ids_clicked"]
-    for i in range(len(ctx.requests)):
+    for i in (range(n) if positions is None else np.asarray(positions, dtype=np.int64)):
         ids = clicked.iloc[i]
         if ids is None:
-            out.append(None)
             continue
-        ids = np.asarray(ids, dtype=np.int64)
-        in_cat = np.isin(ids, catalogue_ids)
-        p = pub[art.lookup(ids)]
+        ids = np.unique(np.asarray(ids, dtype=np.int64))  # a clicked article counts once
+        idx = art.lookup(ids)
+        in_cat = in_pool[idx]
+        p = pub[idx]
         missing = in_cat & (p == NO_PUB)
         future = in_cat & ~missing & (p > req_s[i])
         eligible = in_cat & ~missing & ~future
-        out.append({"ids": ids, "eligible": eligible, "not_in_catalogue": ~in_cat, "missing": missing, "future": future})
+        out[i] = {"ids": ids, "eligible": eligible, "not_in_catalogue": ~in_cat, "missing": missing, "future": future}
     return out
 
 
@@ -183,11 +196,19 @@ class CatalogueScorer:
     @staticmethod
     def rank(logits: torch.Tensor, eligible: torch.Tensor, k: int = SHORTLIST_SIZE):
         """Descending score; export ties broken by ascending article_id (= ascending
-        catalogue position, via a stable sort). Returns positions [R,k] and lengths."""
+        catalogue position, via a stable sort). Returns positions [R,k], lengths and
+        a flag for requests whose score at rank k equals the score at rank k+1
+        (a tie crossing the cutoff, resolved by the article-ID rule)."""
         masked = torch.where(eligible, logits, torch.full_like(logits, float("-inf")))
-        order = torch.sort(masked, dim=1, descending=True, stable=True).indices[:, :k]
-        lengths = torch.minimum(eligible.sum(1), torch.tensor(k, device=logits.device))
-        return order, lengths
+        values, indices = torch.sort(masked, dim=1, descending=True, stable=True)
+        order = indices[:, :k]
+        n_elig = eligible.sum(1)
+        lengths = torch.minimum(n_elig, torch.tensor(k, device=logits.device))
+        if values.shape[1] > k:
+            ties = (n_elig > k) & (values[:, k - 1] == values[:, k])
+        else:
+            ties = torch.zeros_like(n_elig, dtype=torch.bool)
+        return order, lengths, ties
 
 
 # ------------------------------------------------------------------ export --
@@ -240,7 +261,7 @@ def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.
     progress_path = out_root / "diagnostics" / "catalogue" / f"{split}_export_progress.json"
     request_positions = np.asarray(request_positions, dtype=np.int64)
     signature = {"split": split, "n_requests": int(len(request_positions)),
-                 "requests_sha": str(pd.util.hash_array(request_positions).sum()),
+                 "requests_sha": hashlib.sha256(request_positions.tobytes()).hexdigest(),  # order-sensitive
                  "write_full_scores": bool(write_full_scores), "request_block": int(request_block),
                  "model_digest": model_digest, "catalogue_sha": str(pd.util.hash_array(ctx.catalogue_idx).sum())}
     progress = None
@@ -284,7 +305,8 @@ def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.
             block = request_positions[i:i + request_block]
             logits = scorer.logits(block)
             elig = scorer.eligible_mask(block)
-            order, lengths = scorer.rank(logits, elig)
+            order, lengths, ties = scorer.rank(logits, elig)
+            ties_np = ties.cpu().numpy()
             lengths_np = lengths.cpu().numpy()
             order_np = order.cpu().numpy()
             # Shortlist diagnostics (freshness / diversity / vector coverage)
@@ -326,14 +348,14 @@ def export_split(scorer: CatalogueScorer, out_root: Path, request_positions: np.
                 ids = cat_ids[order_np[j, :lengths_np[j]]].tolist()
                 rank_writer.writerow([behaviour_ids[pos], json.dumps(ids)])
                 info = click_info[pos] if click_info is not None else None
-                if info is None:
-                    clicks = [""] * 7
+                if info is None:  # unlabelled (test): outcomes unknown, nothing computed
+                    clicks = [""] * 8
                 else:
-                    shortlist = set(ids)
-                    top5 = set(ids[:FINAL_DISPLAY_SIZE])
-                    clicks = [len(info["ids"]), int(info["eligible"].sum()), int(info["not_in_catalogue"].sum()),
-                              int(info["missing"].sum()), int(info["future"].sum()),
-                              sum(int(c) in shortlist for c in info["ids"]), sum(int(c) in top5 for c in info["ids"])]
+                    n_clicked, hits, dcg, ideal = request_retrieval(ids, info["ids"], SHORTLIST_SIZE)
+                    clicks = [n_clicked, int(info["eligible"].sum()), int(info["not_in_catalogue"].sum()),
+                              int(info["missing"].sum()), int(info["future"].sum()), hits,
+                              f"{dcg:.10f}", f"{ideal:.10f}"]
+                clicks.append(int(bool(ties_np[j])))
                 n_rec = int(rec_offsets[pos + 1] - rec_offsets[pos]) if rec_offsets is not None else ""
                 n_rec_bad = recorded_counts[pos] if recorded_counts is not None else ""
                 n_cat = len(set(cats[j, :lengths_np[j]].tolist()))

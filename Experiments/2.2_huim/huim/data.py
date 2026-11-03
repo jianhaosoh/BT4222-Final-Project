@@ -211,18 +211,23 @@ def _decode_vector_column(table: pa.Table, column: str, flag: str, expected_dim:
     vector is null, flagged unavailable, wrong length or non-finite are reported
     separately; no vector is invented."""
     ids = table["article_id"].to_numpy().astype("int64")
+    table = as_arrow_table(table)
     col = table[column].combine_chunks()
-    if pa.types.is_fixed_size_list(col.type):
+    if pa.types.is_fixed_size_list(col.type) or pa.types.is_large_list(col.type):
         col = col.cast(pa.list_(col.type.value_type))
+    if not pa.types.is_floating(col.type.value_type):
+        raise TypeError(f"{column} has non-float values: {col.type}")
     lengths = pc.list_value_length(col).to_numpy(zero_copy_only=False)
     lengths = np.where(np.isnan(lengths.astype("float64")), -1, lengths).astype("int64") \
         if lengths.dtype.kind == "f" else np.asarray(lengths, dtype="float64")
     valid = col.is_valid().to_numpy(zero_copy_only=False)
     lengths = np.where(valid, np.nan_to_num(np.asarray(lengths, dtype="float64"), nan=-1), -1).astype("int64")
     if flag in table.column_names:
-        flag_values = table[flag].to_numpy(zero_copy_only=False)
-        flag_values = np.asarray(pd.Series(flag_values).fillna(False).astype(bool))
+        raw_flags = pd.Series(table[flag].to_numpy(zero_copy_only=False))
+        flag_null = raw_flags.isna().to_numpy()
+        flag_values = np.asarray(raw_flags.fillna(False).astype(bool))
     else:
+        flag_null = np.zeros(len(ids), bool)
         flag_values = valid.copy()
     observed = lengths[lengths > 0]
     dim = int(expected_dim) if expected_dim else (int(np.bincount(observed).argmax()) if observed.size else 0)
@@ -236,56 +241,141 @@ def _decode_vector_column(table: pa.Table, column: str, flag: str, expected_dim:
         "null_vectors": int((~valid).sum()),
         "flag_false": int((~flag_values).sum()),
         "flag_true_but_null": int((flag_values & ~valid).sum()),
+        "flag_false_but_vector_present": int((~flag_values & valid).sum()),
+        "flag_null": int(flag_null.sum()),
         "wrong_length": int((valid & (lengths != dim)).sum()),
         "non_finite": int((~finite).sum()),
         "usable": int(len(kept_ids)),
         "duplicate_ids": int(pd.Series(ids).duplicated().sum()),
     }
+    diagnostics["legitimately_missing"] = int((~valid & ~flag_values).sum())
+    diagnostics["all_row_ids"] = ids  # popped by load_vectors; source-row precedence uses every row
     return kept_ids, matrix[finite], diagnostics
 
 
-def read_vector_table(path: Path, column: str, flag: str) -> tuple[pa.Table, dict]:
-    """Read article_id + vector (+flag). PyArrow first; if it cannot decode the
-    column (e.g. a nullable fixed-size list), retry with DuckDB or Polars when
-    installed, converting to variable-length lists without changing values.
-    The original error and the reader used are recorded; if every reader
+def vector_problems(diag: dict) -> list[str]:
+    """Malformed or inconsistent vector records. These are file problems, never
+    legitimate missingness: the run stops instead of treating them as missing."""
+    checks = {"wrong_length": "vectors with the wrong dimension", "non_finite": "non-finite vectors",
+              "flag_true_but_null": "flag says present but vector is null",
+              "flag_false_but_vector_present": "flag says missing but a vector is present",
+              "flag_null": "null availability flags", "duplicate_ids": "duplicate article IDs within a source"}
+    return [f"{diag[k]} {msg}" for k, msg in checks.items() if diag.get(k)]
+
+
+def as_arrow_table(obj) -> pa.Table:
+    """Coerce reader results to a concrete pyarrow.Table.
+
+    DuckDB >= 1.4 returns a pyarrow.RecordBatchReader from ``.arrow()``; older
+    versions return a Table. Polars returns a Table. Anything else is an error,
+    never silently converted."""
+    if isinstance(obj, pa.Table):
+        return obj
+    if isinstance(obj, pa.RecordBatchReader):
+        return obj.read_all()
+    if isinstance(obj, pa.RecordBatch):
+        return pa.Table.from_batches([obj])
+    if hasattr(obj, "read_all"):  # reader-like objects from other bindings
+        return as_arrow_table(obj.read_all())
+    raise TypeError(f"Unsupported Arrow result type: {type(obj).__name__}")
+
+
+def _duckdb_table(path: Path, columns: list[str], column: str) -> tuple[pa.Table, str]:
+    import duckdb
+
+    def q(name):
+        return '"' + name.replace('"', '""') + '"'
+
+    select = ", ".join(f"CAST({q(c)} AS FLOAT[]) AS {q(c)}" if c == column else q(c) for c in columns)
+    con = duckdb.connect()
+    try:
+        result = con.execute(f"SELECT {select} FROM read_parquet(?)", [str(path)])
+        raw = result.arrow()  # DuckDB >= 1.4: RecordBatchReader; older: Table
+        return as_arrow_table(raw), type(raw).__name__
+    finally:
+        con.close()
+
+
+def _polars_table(path: Path, columns: list[str], column: str) -> tuple[pa.Table, str]:
+    import polars as pl
+
+    frame = pl.read_parquet(path, columns=columns)
+    frame = frame.with_columns(pl.col(column).cast(pl.List(pl.Float32)))
+    raw = frame.to_arrow()
+    return as_arrow_table(raw), type(raw).__name__
+
+
+def read_vector_table(path: Path, column: str, flag: str, readers=("pyarrow", "duckdb", "polars")) -> tuple[pa.Table, dict]:
+    """Read article_id + vector (+flag) as a concrete pyarrow.Table.
+
+    PyArrow first; if it cannot decode the column (e.g. a nullable fixed-size
+    list on some versions), retry with DuckDB or Polars when installed. Every
+    backend result is coerced to a Table *here*, so downstream decoding never
+    sees a RecordBatchReader. Values, dimensions and null masks are preserved
+    (casts only change the list container, FLOAT stays float32). The original
+    error, the reader used and its raw return type are recorded; if every reader
     fails, raise: an unreadable file is not legitimate missingness."""
-    schema_names = pq.ParquetFile(path).schema_arrow.names
-    columns = ["article_id", column] + ([flag] if flag in schema_names else [])
+    path = Path(path)
+    source_schema = pq.ParquetFile(path).schema_arrow
+    columns = ["article_id", column] + ([flag] if flag in source_schema.names else [])
     errors = {}
-    try:
-        return pq.read_table(path, columns=columns), {"reader": "pyarrow"}
-    except Exception as error:
-        errors["pyarrow"] = repr(error)
-    try:
-        import duckdb
+    def _pyarrow():
+        raw = pq.read_table(path, columns=columns)
+        return as_arrow_table(raw), type(raw).__name__
 
-        cols = ", ".join(f'"{c}"' if c != column else f'CAST("{c}" AS FLOAT[]) AS "{c}"' for c in columns)
-        table = duckdb.sql(f"SELECT {cols} FROM read_parquet('{path.as_posix()}')").arrow()
-        return table, {"reader": "duckdb", "pyarrow_error": errors["pyarrow"]}
-    except Exception as error:
-        errors["duckdb"] = repr(error)
-    try:
-        import polars as pl
-
-        frame = pl.read_parquet(path, columns=columns)
-        frame = frame.with_columns(pl.col(column).cast(pl.List(pl.Float32)))
-        return frame.to_arrow(), {"reader": "polars", "pyarrow_error": errors["pyarrow"]}
-    except Exception as error:
-        errors["polars"] = repr(error)
+    backends = {"pyarrow": _pyarrow,
+                "duckdb": lambda: _duckdb_table(path, columns, column),
+                "polars": lambda: _polars_table(path, columns, column)}
+    for name in readers:
+        try:
+            table, raw_type = backends[name]()
+            if not isinstance(table, pa.Table):
+                raise TypeError(f"{name} backend returned {type(table).__name__}, not a Table")
+            info = {"reader": name, "raw_return_type": raw_type,
+                    "source_vector_type": str(source_schema.field(column).type)}
+            if errors:
+                info["earlier_reader_errors"] = dict(errors)
+            return table, info
+        except Exception as error:
+            errors[name] = repr(error)
     raise RuntimeError(f"Could not decode vectors at {path}; reader errors: {errors}. "
                        "This is a file-loading failure, not legitimate missingness.")
 
 
-def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expected_dim: int | None) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Combine vector sources in order (first source wins per article_id).
+def vector_file_check(paths: DataPaths, expected_dims: dict) -> dict:
+    """Independent preflight of every original vector file: reader used, raw
+    return type, rows, dimension, null/flag/length/finite counts. Raises if a
+    file cannot be decoded by any reader (never treated as missing vectors)."""
+    out = {}
+    for kind, table_paths, column, flag in (("text", paths.text_vectors, "text_embedding", "has_text_embedding"),
+                                            ("image", paths.image_vectors, "image_embedding", "has_image_embedding")):
+        for source, path in table_paths.items():
+            key = f"{kind}.{source}"
+            if path is None:
+                out[key] = {"status": "file_not_found"}
+                continue
+            table, info = read_vector_table(path, column, flag)
+            _, matrix, diag = _decode_vector_column(table, column, flag, expected_dims.get(kind))
+            diag.pop("all_row_ids")
+            problems = vector_problems(diag)
+            out[key] = {"path": str(path), **info, **diag, "problems": problems,
+                        "passed": bool(diag["dimension"] == expected_dims.get(kind) and not problems)}
+    return out
 
-    A file that cannot be decoded raises; legitimate missing vectors are kept
-    as missing (reported), never zero-filled."""
+
+def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expected_dim: int | None) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Combine vector sources in order (policy published_at_or_before_request_v1).
+
+    Precedence is by SOURCE RECORD: the first source that has a row for an
+    article ID wins, even when that row's vector is legitimately missing; a
+    later snapshot never backfills it. A file that cannot be decoded, or that
+    contains malformed/inconsistent records, raises; legitimate missing vectors
+    stay missing (reported), never zero-filled."""
     table_paths = paths.text_vectors if kind == "text" else paths.image_vectors
     column, flag = (("text_embedding", "has_text_embedding") if kind == "text"
                     else ("image_embedding", "has_image_embedding"))
-    all_ids, all_vectors, report, seen = [], [], {}, set()
+    kept_ids, kept_vectors, report = [], [], {}
+    claimed = np.zeros(0, dtype=np.int64)  # every article ID with a row in an earlier source
     for source in source_order:
         path = table_paths.get(source)
         if path is None:
@@ -293,30 +383,42 @@ def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expec
             continue
         table, reader = read_vector_table(path, column, flag)
         ids, matrix, diag = _decode_vector_column(table, column, flag, expected_dim)
+        row_ids = diag.pop("all_row_ids")
         diag["reader"] = reader
-        new = np.array([i not in seen for i in ids], dtype=bool)
-        diag["added_after_earlier_sources"] = int(new.sum())
-        diag["already_covered_by_earlier_source"] = int((~new).sum())
-        if len(matrix) and (~new).any():
-            # Check that overlapping IDs carry (nearly) identical vectors.
-            prior = dict(zip(np.concatenate(all_ids) if all_ids else [], range(sum(len(a) for a in all_ids))))
-            stacked = np.concatenate(all_vectors) if all_vectors else np.zeros((0, matrix.shape[1]), "float32")
-            overlap = [(prior[i], j) for j, i in enumerate(ids) if i in prior]
-            if overlap and stacked.shape[1] == matrix.shape[1]:
-                a = stacked[[o[0] for o in overlap]]
-                b = matrix[[o[1] for o in overlap]]
-                diag["overlap_max_abs_diff"] = float(np.abs(a - b).max())
-        seen.update(ids[new].tolist())
-        all_ids.append(ids[new])
-        all_vectors.append(matrix[new])
+        problems = vector_problems(diag)
+        if problems:
+            raise ValueError(f"{kind} vectors at {path}: {problems}. These are file problems, not missingness.")
+        earlier_row = np.isin(row_ids, claimed)
+        earlier_usable = np.isin(ids, claimed)
+        diag["rows_overridden_by_earlier_source"] = int(earlier_row.sum())
+        diag["usable_vectors_overridden_by_earlier_source"] = int(earlier_usable.sum())
+        # later vectors for IDs whose earlier record was legitimately missing: NOT used
+        earlier_missing = np.setdiff1d(claimed, np.concatenate(kept_ids) if kept_ids else np.zeros(0, np.int64))
+        diag["later_vectors_not_backfilled_for_earlier_missing"] = int(np.isin(ids, earlier_missing).sum())
+        if len(matrix) and earlier_usable.any() and kept_ids:
+            prior_ids = np.concatenate(kept_ids)
+            prior_vec = np.concatenate(kept_vectors)
+            # Overlap of usable vectors in both sources (IDs whose earlier record is missing are not in prior_ids).
+            _, ia, ib = np.intersect1d(prior_ids, ids, assume_unique=True, return_indices=True)
+            if len(ia):
+                diag["overlap_max_abs_diff"] = float(np.abs(prior_vec[ia] - matrix[ib]).max())
+        new = ~earlier_usable
+        kept_ids.append(ids[new])
+        kept_vectors.append(matrix[new])
+        claimed = np.union1d(claimed, row_ids)
+        diag["added_usable_vectors"] = int(new.sum())
         diag["path"] = str(path)
         report[source] = diag
-    dims = {v.shape[1] for v in all_vectors if len(v)}
+    dims = {v.shape[1] for v in kept_vectors if len(v)}
     if len(dims) > 1:
         raise ValueError(f"{kind} vector sources disagree on dimension: {dims}")
-    ids = np.concatenate(all_ids) if all_ids else np.zeros(0, "int64")
-    vectors = np.concatenate(all_vectors) if all_vectors else np.zeros((0, expected_dim or 0), "float32")
+    ids = np.concatenate(kept_ids) if kept_ids else np.zeros(0, "int64")
+    vectors = np.concatenate(kept_vectors) if kept_vectors else np.zeros((0, expected_dim or 0), "float32")
     order = np.argsort(ids)
+    report["precedence"] = "first source record per article_id wins, including legitimately missing vectors"
+    report["source_order"] = list(source_order)
+    report["article_ids_with_a_record"] = int(len(claimed))
+    report["usable_vectors"] = int(len(ids))
     return ids[order], vectors[order], report
 
 
