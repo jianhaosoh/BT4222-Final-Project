@@ -1,0 +1,8 @@
+# Experiment 2.1_lstm. Colab provides all of these except optuna (installed on demand).
+torch>=2.3
+numpy>=1.26
+pandas>=2.2
+pyarrow>=15
+matplotlib>=3.8
+# Optional, only when RUN_OPTUNA = True:
+# optuna>=3.6
