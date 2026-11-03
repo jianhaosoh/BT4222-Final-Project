@@ -8,3 +8,10 @@ data/
 /docs/
 /tests/
 /.worktrees/
+# Keep generated experiment outputs and fitted models local.
+/experiments/**/outputs/
+/experiments/**/.ipynb_checkpoints/
+/experiments/**/*.csv
+/experiments/**/*.safetensors
+/experiments/**/*.h5
+/experiments/**/*.pkl

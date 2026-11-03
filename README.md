@@ -22,3 +22,8 @@ See [Preprocessing/README.md](Preprocessing/README.md) for the current engineere
 feature files and the regular-API article embedding script. The script saves
 Gemini text vectors and supplied EB-NeRD image vectors separately, keyed by
 `article_id`, for lookup using `candidate_article_id`.
+
+## Experiments
+
+Use [experiments/README.md](experiments/README.md) for track numbering, the common
+notebook structure, prediction CSV formats and saved-model handoff requirements.
