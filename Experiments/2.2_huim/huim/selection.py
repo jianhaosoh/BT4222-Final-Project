@@ -18,20 +18,16 @@ from . import catalogue as C
 from .metrics import request_retrieval
 
 SELECTION_OBJECTIVE = "validation catalogue known-click Recall@100 (macro over requests with known clicks)"
-SELECTION_PROTOCOL_VERSION = "catalogue_recall@100_v1"
-
-
-def selection_positions(n_requests: int, n_sample: int | None, seed: int) -> np.ndarray:
-    """Fixed whole-request sample (None or >= n_requests: every validation request)."""
-    if n_sample is None or n_sample >= n_requests:
-        return np.arange(n_requests)
-    return np.sort(np.random.default_rng(seed).choice(n_requests, size=int(n_sample), replace=False))
+# v2: shared union pool (published_at_or_before_request_v1) + shared BLAKE2b request sampling.
+# v1 (separate split catalogues, numpy-sampled requests) checkpoints are refused, not reinterpreted.
+SELECTION_PROTOCOL_VERSION = "catalogue_recall@100_v2_union_pool_hash_requests"
 
 
 class CatalogueSelector:
     """Evaluates a model on the fixed validation selection sample."""
 
-    def __init__(self, ctx_cpu, art_cpu, ctx_dev, art_dev, positions: np.ndarray, device, cfg: dict):
+    def __init__(self, ctx_cpu, art_cpu, ctx_dev, art_dev, positions: np.ndarray, device, cfg: dict,
+                 sample_info: dict | None = None, pool: dict | None = None):
         self.ctx_cpu, self.art_cpu, self.ctx_dev, self.art_dev = ctx_cpu, art_cpu, ctx_dev, art_dev
         self.positions = np.asarray(positions, dtype=np.int64)
         self.device, self.cfg = device, cfg
@@ -41,8 +37,10 @@ class CatalogueSelector:
             raise ValueError("selection requires a labelled split (validation)")
         ids = ctx_cpu.requests.behaviour_id.to_numpy()[self.positions]
         self.behaviour_ids = ids.tolist()
-        digest = hashlib.sha256("\n".join(self.behaviour_ids).encode()).hexdigest()
+        digest = hashlib.sha256("\n".join(sorted(self.behaviour_ids)).encode()).hexdigest()
         cat_digest = hashlib.sha256(art_cpu.ids[ctx_cpu.catalogue_idx].tobytes()).hexdigest()
+        if sample_info is not None and sample_info.get("behaviour_ids_sha256") not in (None, digest):
+            raise ValueError("selection positions disagree with their sampling record")
         self.protocol = {
             "version": SELECTION_PROTOCOL_VERSION, "objective": SELECTION_OBJECTIVE, "direction": "maximize",
             "secondary": "observed-click nDCG@100 (ideal over all original known clicks, capped at 100)",
@@ -50,11 +48,15 @@ class CatalogueSelector:
             "shortlist_size": C.SHORTLIST_SIZE, "ranking_order": "descending score, ties by ascending article_id",
             "partition": "official validation split (development data; used repeatedly for selection)",
             "pool": "full time-eligible catalogue for every sampled request (no sampled negatives)",
-            "eligibility_rules": C.ELIGIBILITY_RULES, "catalogue_policy": cfg["catalogue_policy"]["validation"],
-            "catalogue_ids_sha256": cat_digest,
-            "sample": {"requests": int(len(self.positions)), "of_validation_requests": int(len(ctx_cpu.requests)),
-                       "seed": cfg["selection_seed"], "rule": "uniform sample of whole validation requests, fixed "
-                       "before training and shared by every checkpoint, control and trial",
+            "eligibility_rules": C.ELIGIBILITY_RULES, "pool_policy": "published_at_or_before_request_v1",
+            "catalogue_policy": cfg["catalogue_policy"]["validation"], "catalogue_ids_sha256": cat_digest,
+            "pool_fingerprint": pool,
+            "sample": {"scope": "selection_validation", "requests": int(len(self.positions)),
+                       "of_validation_requests": int(len(ctx_cpu.requests)),
+                       "seed": cfg.get("request_sampling_seed"),
+                       "rule": (sample_info or {}).get("rule", "explicit positions"),
+                       "used": (sample_info or {}).get("used"), "reference": (sample_info or {}).get("reference"),
+                       "fixed": "before training; shared by every checkpoint, control and trial",
                        "behaviour_ids_sha256": digest},
             "interval_steps": cfg["selection_interval_steps"], "evaluate_at_epoch_end": True,
             "early_stopping_patience_evaluations": cfg["early_stopping_patience"],

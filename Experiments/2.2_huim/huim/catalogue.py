@@ -1,7 +1,8 @@
 """Time-eligible catalogue scoring, top-100 shortlists and streamed v3 exports.
 
-Eligibility (declared, shared policy): for request (user_id, impression_id) at
-time t, an article of the split's declared catalogue is eligible iff its
+Eligibility (shared policy published_at_or_before_request_v1): for request
+(user_id, impression_id) at time t, an article of the ordered train_val -> test
+union catalogue (the same pool for every split) is eligible iff its
 published_time is present and published_time <= t. Articles with a missing
 publication time are excluded (cannot be verified as non-future) and counted.
 No recency window, access rule or vector-coverage restriction is applied.
@@ -30,7 +31,9 @@ FINAL_DISPLAY_SIZE = 5
 EXPORT_SCHEMA_VERSION = 3
 PREDICTION_POOL = "time_eligible_catalogue"
 ELIGIBILITY_RULES = [
-    "article belongs to the split's declared catalogue snapshot (see catalogue_versions)",
+    "policy published_at_or_before_request_v1: article belongs to the ordered union train_val/articles.parquet "
+    "then test/articles.parquet (first record per article_id wins, incl. missing fields), the SAME pool for "
+    "train, validation and test requests",
     "published_time is not missing (missing -> excluded, counted)",
     "published_time <= request impression_time (future publications excluded)",
     "no recency window, access, premium or embedding-coverage restriction",

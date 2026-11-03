@@ -223,9 +223,11 @@ def _decode_vector_column(table: pa.Table, column: str, flag: str, expected_dim:
     valid = col.is_valid().to_numpy(zero_copy_only=False)
     lengths = np.where(valid, np.nan_to_num(np.asarray(lengths, dtype="float64"), nan=-1), -1).astype("int64")
     if flag in table.column_names:
-        flag_values = table[flag].to_numpy(zero_copy_only=False)
-        flag_values = np.asarray(pd.Series(flag_values).fillna(False).astype(bool))
+        raw_flags = pd.Series(table[flag].to_numpy(zero_copy_only=False))
+        flag_null = raw_flags.isna().to_numpy()
+        flag_values = np.asarray(raw_flags.fillna(False).astype(bool))
     else:
+        flag_null = np.zeros(len(ids), bool)
         flag_values = valid.copy()
     observed = lengths[lengths > 0]
     dim = int(expected_dim) if expected_dim else (int(np.bincount(observed).argmax()) if observed.size else 0)
@@ -239,12 +241,26 @@ def _decode_vector_column(table: pa.Table, column: str, flag: str, expected_dim:
         "null_vectors": int((~valid).sum()),
         "flag_false": int((~flag_values).sum()),
         "flag_true_but_null": int((flag_values & ~valid).sum()),
+        "flag_false_but_vector_present": int((~flag_values & valid).sum()),
+        "flag_null": int(flag_null.sum()),
         "wrong_length": int((valid & (lengths != dim)).sum()),
         "non_finite": int((~finite).sum()),
         "usable": int(len(kept_ids)),
         "duplicate_ids": int(pd.Series(ids).duplicated().sum()),
     }
+    diagnostics["legitimately_missing"] = int((~valid & ~flag_values).sum())
+    diagnostics["all_row_ids"] = ids  # popped by load_vectors; source-row precedence uses every row
     return kept_ids, matrix[finite], diagnostics
+
+
+def vector_problems(diag: dict) -> list[str]:
+    """Malformed or inconsistent vector records. These are file problems, never
+    legitimate missingness: the run stops instead of treating them as missing."""
+    checks = {"wrong_length": "vectors with the wrong dimension", "non_finite": "non-finite vectors",
+              "flag_true_but_null": "flag says present but vector is null",
+              "flag_false_but_vector_present": "flag says missing but a vector is present",
+              "flag_null": "null availability flags", "duplicate_ids": "duplicate article IDs within a source"}
+    return [f"{diag[k]} {msg}" for k, msg in checks.items() if diag.get(k)]
 
 
 def as_arrow_table(obj) -> pa.Table:
@@ -340,21 +356,26 @@ def vector_file_check(paths: DataPaths, expected_dims: dict) -> dict:
                 continue
             table, info = read_vector_table(path, column, flag)
             _, matrix, diag = _decode_vector_column(table, column, flag, expected_dims.get(kind))
-            out[key] = {"path": str(path), **info, **diag,
-                        "passed": bool(diag["dimension"] == expected_dims.get(kind) and diag["non_finite"] == 0
-                                       and diag["wrong_length"] == 0 and diag["flag_true_but_null"] == 0)}
+            diag.pop("all_row_ids")
+            problems = vector_problems(diag)
+            out[key] = {"path": str(path), **info, **diag, "problems": problems,
+                        "passed": bool(diag["dimension"] == expected_dims.get(kind) and not problems)}
     return out
 
 
 def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expected_dim: int | None) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Combine vector sources in order (first source wins per article_id).
+    """Combine vector sources in order (policy published_at_or_before_request_v1).
 
-    A file that cannot be decoded raises; legitimate missing vectors are kept
-    as missing (reported), never zero-filled."""
+    Precedence is by SOURCE RECORD: the first source that has a row for an
+    article ID wins, even when that row's vector is legitimately missing; a
+    later snapshot never backfills it. A file that cannot be decoded, or that
+    contains malformed/inconsistent records, raises; legitimate missing vectors
+    stay missing (reported), never zero-filled."""
     table_paths = paths.text_vectors if kind == "text" else paths.image_vectors
     column, flag = (("text_embedding", "has_text_embedding") if kind == "text"
                     else ("image_embedding", "has_image_embedding"))
-    all_ids, all_vectors, report, seen = [], [], {}, set()
+    kept_ids, kept_vectors, report = [], [], {}
+    claimed = np.zeros(0, dtype=np.int64)  # every article ID with a row in an earlier source
     for source in source_order:
         path = table_paths.get(source)
         if path is None:
@@ -362,30 +383,43 @@ def load_vectors(paths: DataPaths, kind: str, source_order: Iterable[str], expec
             continue
         table, reader = read_vector_table(path, column, flag)
         ids, matrix, diag = _decode_vector_column(table, column, flag, expected_dim)
+        row_ids = diag.pop("all_row_ids")
         diag["reader"] = reader
-        new = np.array([i not in seen for i in ids], dtype=bool)
-        diag["added_after_earlier_sources"] = int(new.sum())
-        diag["already_covered_by_earlier_source"] = int((~new).sum())
-        if len(matrix) and (~new).any():
-            # Check that overlapping IDs carry (nearly) identical vectors.
-            prior = dict(zip(np.concatenate(all_ids) if all_ids else [], range(sum(len(a) for a in all_ids))))
-            stacked = np.concatenate(all_vectors) if all_vectors else np.zeros((0, matrix.shape[1]), "float32")
-            overlap = [(prior[i], j) for j, i in enumerate(ids) if i in prior]
-            if overlap and stacked.shape[1] == matrix.shape[1]:
-                a = stacked[[o[0] for o in overlap]]
-                b = matrix[[o[1] for o in overlap]]
-                diag["overlap_max_abs_diff"] = float(np.abs(a - b).max())
-        seen.update(ids[new].tolist())
-        all_ids.append(ids[new])
-        all_vectors.append(matrix[new])
+        problems = vector_problems(diag)
+        if problems:
+            raise ValueError(f"{kind} vectors at {path}: {problems}. These are file problems, not missingness.")
+        earlier_row = np.isin(row_ids, claimed)
+        earlier_usable = np.isin(ids, claimed)
+        diag["rows_overridden_by_earlier_source"] = int(earlier_row.sum())
+        diag["usable_vectors_overridden_by_earlier_source"] = int(earlier_usable.sum())
+        # later vectors for IDs whose earlier record was legitimately missing: NOT used
+        earlier_missing = np.setdiff1d(claimed, np.concatenate(kept_ids) if kept_ids else np.zeros(0, np.int64))
+        diag["later_vectors_not_backfilled_for_earlier_missing"] = int(np.isin(ids, earlier_missing).sum())
+        if len(matrix) and earlier_usable.any() and kept_ids:
+            prior_ids = np.concatenate(kept_ids)
+            prior_vec = np.concatenate(kept_vectors)
+            order = np.argsort(prior_ids)
+            loc = order[np.searchsorted(prior_ids[order], ids[earlier_usable])]
+            both = prior_ids[loc] == ids[earlier_usable]
+            if both.any():
+                diag["overlap_max_abs_diff"] = float(np.abs(prior_vec[loc[both]] - matrix[earlier_usable][both]).max())
+        new = ~earlier_usable
+        kept_ids.append(ids[new])
+        kept_vectors.append(matrix[new])
+        claimed = np.union1d(claimed, row_ids)
+        diag["added_usable_vectors"] = int(new.sum())
         diag["path"] = str(path)
         report[source] = diag
-    dims = {v.shape[1] for v in all_vectors if len(v)}
+    dims = {v.shape[1] for v in kept_vectors if len(v)}
     if len(dims) > 1:
         raise ValueError(f"{kind} vector sources disagree on dimension: {dims}")
-    ids = np.concatenate(all_ids) if all_ids else np.zeros(0, "int64")
-    vectors = np.concatenate(all_vectors) if all_vectors else np.zeros((0, expected_dim or 0), "float32")
+    ids = np.concatenate(kept_ids) if kept_ids else np.zeros(0, "int64")
+    vectors = np.concatenate(kept_vectors) if kept_vectors else np.zeros((0, expected_dim or 0), "float32")
     order = np.argsort(ids)
+    report["precedence"] = "first source record per article_id wins, including legitimately missing vectors"
+    report["source_order"] = list(source_order)
+    report["article_ids_with_a_record"] = int(len(claimed))
+    report["usable_vectors"] = int(len(ids))
     return ids[order], vectors[order], report
 
 

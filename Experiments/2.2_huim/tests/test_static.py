@@ -417,9 +417,8 @@ class TestPipelineSynthetic(unittest.TestCase):
             for name in ("run_config.json", "metrics.json", "export_manifest.json"):
                 atomic_write_json(run / name, {"synthetic": True})
             (run / "requirements.txt").write_text("torch\n")
-            gate = P.full_score_gate({"eligibility": {s: {"feasibility": {"eligible_pairs": 10, "bytes_per_row_assumed": 50}}
-                                                      for s in ctx}}, dict(cfg, shortlist_splits=["validation"],
-                                                                           full_score_splits=["validation"]), [run], None)
+            gate = P.full_score_gate({s: {"planned_export": {"full_scores_csv_bytes_estimate": 500}} for s in ctx},
+                                     dict(cfg, full_score_splits=["validation"]), [run])
             self.assertTrue(gate["validation"]["write"])
             self.assertFalse(gate["train"]["write"])
             P.persist_run(run, persist, log=lambda *_: None)
@@ -446,9 +445,12 @@ class TestVectorReaders(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         rng = np.random.default_rng(0)
         cls.vectors = [rng.normal(size=1024).astype(np.float32).tolist() if i % 3 else None for i in range(12)]
-        table = pa.table({"article_id": pa.array(np.arange(100, 112), pa.int32()),
-                          # nullable fixed-size list, as in the original full-data image files
-                          "image_embedding": pa.array(cls.vectors, type=pa.list_(pa.float32(), 1024)),
+        cls.ids = np.arange(100, 112)
+        # Portable ON-DISK fixture: nullable VARIABLE-length float32 lists. PyArrow 24 refuses to write
+        # nullable fixed-size lists ("Lists with non-zero length null components are not supported");
+        # fixed-size coercion is covered in memory below, and the fallback paths are forced explicitly.
+        table = pa.table({"article_id": pa.array(cls.ids, pa.int32()),
+                          "image_embedding": pa.array(cls.vectors, type=pa.list_(pa.float32())),
                           "has_image_embedding": [v is not None for v in cls.vectors],
                           "status": ["ok" if v is not None else "missing_input" for v in cls.vectors]})
         cls.path = Path(cls.tmp.name) / "image_embeddings.parquet"
@@ -456,8 +458,10 @@ class TestVectorReaders(unittest.TestCase):
         from huim import data as D
 
         cls.D = D
-        ref_table, _ = D.read_vector_table(cls.path, "image_embedding", "has_image_embedding", readers=("pyarrow",))
-        cls.ref = D._decode_vector_column(ref_table, "image_embedding", "has_image_embedding", 1024)
+        # Reference built from the source values themselves, not from any reader.
+        present = np.array([v is not None for v in cls.vectors])
+        cls.ref = (cls.ids[present].astype(np.int64),
+                   np.array([v for v in cls.vectors if v is not None], dtype=np.float32), present)
 
     @classmethod
     def tearDownClass(cls):
@@ -467,6 +471,10 @@ class TestVectorReaders(unittest.TestCase):
         ids, matrix, diag = self.D._decode_vector_column(table, "image_embedding", "has_image_embedding", 1024)
         np.testing.assert_array_equal(ids, self.ref[0])
         np.testing.assert_array_equal(matrix, self.ref[1])  # exact float32 values
+        self.assertEqual(matrix.shape, (int(self.ref[2].sum()), 1024))
+        null_mask = ~np.asarray(table["image_embedding"].combine_chunks().is_valid())
+        np.testing.assert_array_equal(null_mask, ~self.ref[2])  # null mask preserved row by row
+        self.assertEqual(self.D.vector_problems(diag), [])
         self.assertEqual(diag["null_vectors"], sum(v is None for v in self.vectors))
         self.assertEqual(diag["usable"], sum(v is not None for v in self.vectors))
         self.assertEqual(diag["dimension"], 1024)
@@ -478,6 +486,38 @@ class TestVectorReaders(unittest.TestCase):
         def fail(*args, **kwargs):
             raise pa.ArrowNotImplementedError("simulated nullable fixed-size-list decode failure")
         return mock.patch.object(self.D.pq, "read_table", fail)
+
+    def test_pyarrow_reader_on_disk(self):
+        table, info = self.D.read_vector_table(self.path, "image_embedding", "has_image_embedding", readers=("pyarrow",))
+        self.assertEqual(info["reader"], "pyarrow")
+        self.assert_same_as_reference(table)
+
+    def test_in_memory_nullable_fixed_size_list_coercion(self):
+        """Fixed-size lists (the original file type) decode identically, built in memory only."""
+        import pyarrow as pa
+
+        try:
+            col = pa.array(self.vectors, type=pa.list_(pa.float32(), 1024))
+        except (pa.ArrowNotImplementedError, pa.ArrowInvalid) as error:  # pragma: no cover - version specific
+            self.skipTest(f"this PyArrow cannot build nullable fixed-size lists in memory: {error}")
+        table = pa.table({"article_id": pa.array(self.ids, pa.int32()), "image_embedding": col,
+                          "has_image_embedding": [v is not None for v in self.vectors]})
+        self.assertTrue(pa.types.is_fixed_size_list(table["image_embedding"].type))
+        self.assert_same_as_reference(table)
+        # also through a RecordBatchReader (the DuckDB >= 1.4 return type)
+        reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+        self.assert_same_as_reference(self.D.as_arrow_table(reader))
+
+    @unittest.skipUnless(__import__("os").environ.get("HUIM_DATA_ROOT"), "set HUIM_DATA_ROOT to check original files")
+    def test_original_vector_artifacts_when_accessible(self):
+        """Original full-data vector files (e.g. on a mounted Drive): decode, dims, nulls, no problems."""
+        import os
+
+        paths = self.D.resolve_paths(Path(os.environ["HUIM_DATA_ROOT"]))
+        report = self.D.vector_file_check(paths, {"text": 768, "image": 1024})
+        for key, rep in report.items():
+            if rep.get("status") != "file_not_found":
+                self.assertTrue(rep["passed"], (key, rep))
 
     def test_coercion_of_reader_types(self):
         import pyarrow as pa
@@ -548,7 +588,7 @@ class TestVectorReaders(unittest.TestCase):
 def selection_cfg(**kw):
     cfg = {"lr": 1e-3, "weight_decay": 1e-4, "seed": 1, "batch_size": 8, "max_epochs": 2, "amp": False,
            "early_stopping_patience": 1, "min_improvement": 0.0, "selection_interval_steps": 3,
-           "selection_requests": 6, "selection_seed": 5, "pair_chunk": 64, "request_block": 4, "inference_amp": False,
+           "selection_requests": 6, "request_sampling_seed": 42, "pair_chunk": 64, "request_block": 4, "inference_amp": False,
            "catalogue_policy": {"validation": ["train_val"]}, "checkpoint_every_steps": 0}
     cfg.update(kw)
     return cfg
@@ -660,13 +700,14 @@ class TestSelection(unittest.TestCase):
                 new.load_recovery(Path(tmp) / "recovery/last.pt")
 
     def test_selector_matches_export_manifest_metrics(self):
-        from huim.selection import CatalogueSelector, selection_positions
+        from huim.sampling import resolve_scope
+        from huim.selection import CatalogueSelector
 
         model = make_model(self.pre, self.art)
         cfg = selection_cfg()
-        pos = selection_positions(len(self.ctx.requests), 6, cfg["selection_seed"])
-        self.assertEqual(pos.tolist(), selection_positions(len(self.ctx.requests), 6, cfg["selection_seed"]).tolist())
-        sel = CatalogueSelector(self.ctx, self.art, self.ctx, self.art, pos, torch.device("cpu"), cfg)
+        pos, info = resolve_scope(self.ctx.requests, "validation", "selection_validation", 6, 42)
+        sel = CatalogueSelector(self.ctx, self.art, self.ctx, self.art, pos, torch.device("cpu"), cfg,
+                                sample_info=info, pool={"policy": "published_at_or_before_request_v1"})
         out = sel.evaluate(model)
         self.assertEqual(out["requests_evaluated"], 6)
         scorer = C.CatalogueScorer(model, self.ctx, self.art, torch.device("cpu"), pair_chunk=64)
@@ -703,6 +744,230 @@ class TestTuningRule(unittest.TestCase):
         best = select_best_trial(study)
         self.assertEqual(best["number"], 2)  # recall tie -> higher nDCG -> earlier of the equal pair
         self.assertEqual(len(study.trials), 6)  # pruned trial retained
+
+
+
+class TestVectorPrecedence(unittest.TestCase):
+    """published_at_or_before_request_v1: the first SOURCE RECORD wins, even when its vector is missing."""
+
+    def write(self, root, source, rows):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        d = Path(root) / source / "article embeddings"
+        d.mkdir(parents=True, exist_ok=True)
+        ids = [r[0] for r in rows]
+        vec = [r[1] for r in rows]
+        pq.write_table(pa.table({"article_id": pa.array(ids, pa.int32()),
+                                 "image_embedding": pa.array(vec, type=pa.list_(pa.float32())),
+                                 "has_image_embedding": [v is not None for v in vec]}), d / "image_embeddings.parquet")
+        return d / "image_embeddings.parquet"
+
+    def test_first_source_missing_is_not_backfilled(self):
+        from huim import data as D
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self.write(tmp, "train_val", [(5, None), (7, [1.0, 0.0]), (9, [0.0, 2.0])])
+            b = self.write(tmp, "test", [(5, [3.0, 4.0]), (7, [9.0, 9.0]), (11, [5.0, 5.0])])
+            paths = D.DataPaths(root=Path(tmp), image_vectors={"train_val": a, "test": b})
+            ids, vectors, rep = D.load_vectors(paths, "image", ["train_val", "test"], 2)
+            self.assertEqual(ids.tolist(), [7, 9, 11])          # 5 stays missing: first record (missing) wins
+            np.testing.assert_array_equal(vectors[0], [1.0, 0.0])  # 7: first source value, not the later one
+            self.assertEqual(rep["test"]["rows_overridden_by_earlier_source"], 2)
+            self.assertEqual(rep["test"]["later_vectors_not_backfilled_for_earlier_missing"], 1)
+            self.assertGreater(rep["test"]["overlap_max_abs_diff"], 0)
+            self.assertEqual(rep["article_ids_with_a_record"], 4)
+
+    def test_malformed_records_fail_instead_of_becoming_missing(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from huim import data as D
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "train_val" / "article embeddings"
+            d.mkdir(parents=True)
+            pq.write_table(pa.table({"article_id": pa.array([1, 2], pa.int32()),
+                                     "image_embedding": pa.array([[1.0, 2.0], [1.0, 2.0, 3.0]], type=pa.list_(pa.float32())),
+                                     "has_image_embedding": [True, True]}), d / "image_embeddings.parquet")
+            paths = D.DataPaths(root=Path(tmp), image_vectors={"train_val": d / "image_embeddings.parquet"})
+            with self.assertRaises(ValueError):
+                D.load_vectors(paths, "image", ["train_val"], 2)
+            pq.write_table(pa.table({"article_id": pa.array([1], pa.int32()),
+                                     "image_embedding": pa.array([[1.0, 2.0]], type=pa.list_(pa.float32())),
+                                     "has_image_embedding": [False]}), d / "image_embeddings.parquet")
+            with self.assertRaises(ValueError):  # flag/vector disagreement
+                D.load_vectors(paths, "image", ["train_val"], 2)
+
+
+def requests_frame(n=40, seed=3):
+    rng = np.random.default_rng(seed)
+    users = rng.integers(1, 9, n)
+    imps = rng.choice(np.arange(1000, 5000), n, replace=False)
+    times = pd.Timestamp("2023-05-25 07:00") + pd.to_timedelta(rng.integers(0, 600000, n), unit="s")
+    frame = pd.DataFrame({"user_id": users, "impression_id": imps, "impression_time": times})
+    frame["behaviour_id"] = frame.user_id.astype(str) + ":" + frame.impression_id.astype(str)
+    return frame.sort_values(["user_id", "impression_id"]).reset_index(drop=True)
+
+
+class TestSharedSampling(unittest.TestCase):
+    def test_priority_formula_prefix_and_order(self):
+        import hashlib
+        from huim import sampling as S
+
+        req = requests_frame()
+        self.assertEqual(S.priority(42, "validation", "3:1234"),
+                         hashlib.blake2b(b"42:validation:3:1234", digest_size=8).hexdigest())
+        ten = S.hash_prefix(req, "validation", 10, 42)
+        five = S.hash_prefix(req, "validation", 5, 42)
+        self.assertTrue(set(five) <= set(ten))  # smaller N is a prefix of the same priority order
+        pr = sorted((S.priority(42, "validation", b), b) for b in req.behaviour_id)[:10]
+        self.assertEqual(set(req.behaviour_id.to_numpy()[ten]), {b for _, b in pr})
+        sub = req.iloc[ten]
+        keys = list(zip(pd.to_datetime(sub.impression_time), sub.user_id, sub.impression_id))
+        self.assertEqual(keys, sorted(keys))  # processed chronologically
+        self.assertNotEqual(set(S.hash_prefix(req, "train", 10, 42)), set(ten))  # split is part of the key
+        self.assertEqual(len(S.hash_prefix(req, "validation", None, 42)), len(req))
+
+    def test_reference_ids_preferred_and_checked(self):
+        from huim import sampling as S
+
+        req = requests_frame()
+        own = req.behaviour_id.to_numpy()[S.hash_prefix(req, "validation", 8, 42)].tolist()
+        pos, info = S.resolve_scope(req, "validation", "selection_validation", 8, 42,
+                                    {"ids": list(reversed(own)), "source": "input_audit.json", "seed": 42})
+        self.assertEqual(info["used"], "reference_ids")
+        self.assertTrue(info["reference"]["matches_own_hash_selection"])
+        self.assertEqual(set(req.behaviour_id.to_numpy()[pos]), set(own))
+        other = req.behaviour_id.tolist()[:8]
+        _, info2 = S.resolve_scope(req, "validation", "selection_validation", 8, 42, {"ids": other, "source": "x"})
+        self.assertEqual(info2["reference"]["matches_own_hash_selection"], set(other) == set(own))
+        with self.assertRaises(ValueError):
+            S.resolve_scope(req, "validation", "selection_validation", 8, 42, {"ids": ["999:999"], "source": "x"})
+
+    def test_reads_31_run_folder(self):
+        from huim import sampling as S
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "eligibility").mkdir()
+            (Path(tmp) / "input_audit.json").write_text(json.dumps(
+                {"seed": 42, "selection_requests": ["1:2", "3:4"],
+                 "eligibility_policy": {"name": "published_at_or_before_request_v1"}}))
+            (Path(tmp) / "eligibility/validation_requests.csv").write_text("behaviour_id,impression_time\n1:2,t\n")
+            ref = S.read_reference_ids(Path(tmp))
+            self.assertEqual(ref["selection_validation"]["ids"], ["1:2", "3:4"])
+            self.assertEqual(ref["export_validation"]["ids"], ["1:2"])
+
+    def test_matches_31_reference_implementation(self):
+        """Same requests and processing order as Max's indexer (read-only import; skipped if unavailable)."""
+        import importlib.util
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        ref = Path(__file__).resolve().parents[2] / "3.1_pretrained_similarity" / "catalogue_pipeline.py"
+        if not ref.is_file() or importlib.util.find_spec("sklearn") is None or importlib.util.find_spec("joblib") is None:
+            self.skipTest("3.1 reference implementation or its dependencies unavailable")
+        spec = importlib.util.spec_from_file_location("cp31_readonly", ref)
+        cp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cp)
+        from huim import sampling as S
+
+        req = requests_frame(60)
+        rows = []
+        for r in req.itertuples():
+            for cand in (1, 2):
+                row = {"split": "validation", "user_id": int(r.user_id), "impression_id": int(r.impression_id),
+                       "candidate_article_id": int(r.impression_id * 10 + cand), "impression_time": r.impression_time,
+                       "clicked": int(cand == 1)}
+                row.update({c: 0 for c in cp.REQUEST + cp.ARTICLE})
+                rows.append(row)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "validation_features.parquet"
+            pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False), path)
+            db = Path(tmp) / "v.sqlite"
+            cp.index_shared(path, "validation", db, 42)
+            for n in (7, 25, None):
+                theirs = [r[0] for r in cp.request_iter(db, n)]
+                ours = req.behaviour_id.to_numpy()[S.hash_prefix(req, "validation", n, 42)].tolist()
+                self.assertEqual(ours, theirs, n)  # identical IDs AND processing order
+
+
+class TestUnionPool(unittest.TestCase):
+    def test_same_union_for_every_split_and_first_record_wins(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from huim import data as D
+        from huim import sampling as S
+
+        def cat(rows):
+            return pa.table({"article_id": pa.array([r[0] for r in rows], pa.int32()),
+                             "published_time": pa.array([r[1] for r in rows], pa.timestamp("us")),
+                             "premium": [False] * len(rows), "category": pa.array([1] * len(rows), pa.int16()),
+                             "subcategory": [[1]] * len(rows), "article_type": ["article_default"] * len(rows),
+                             "topics": [["Kendt"]] * len(rows), "sentiment_label": ["Neutral"] * len(rows),
+                             "body": ["a b c"] * len(rows)})
+        t0 = pd.Timestamp("2023-05-01")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a").mkdir()
+            (Path(tmp) / "b").mkdir()
+            pq.write_table(cat([(1, t0), (2, None), (3, t0)]), Path(tmp) / "a/articles.parquet")
+            pq.write_table(cat([(2, t0), (3, t0 + pd.Timedelta(days=9)), (4, t0)]), Path(tmp) / "b/articles.parquet")
+            paths = D.DataPaths(root=Path(tmp), articles={"train_val": Path(tmp) / "a/articles.parquet",
+                                                          "test": Path(tmp) / "b/articles.parquet"})
+            union, cats = D.load_articles(paths, ["train_val", "test"])
+            self.assertEqual(union.article_id.tolist(), [1, 2, 3, 4])
+            self.assertTrue(pd.isna(union.set_index("article_id").published_time[2]))  # missing kept, not backfilled
+            self.assertEqual(union.set_index("article_id").published_time[3], t0)    # first record's time
+            fp1 = S.pool_fingerprint(union.article_id.to_numpy(), F.to_seconds(union.published_time), {})
+            fp2 = S.pool_fingerprint(union.article_id.to_numpy()[:3], F.to_seconds(union.published_time)[:3], {})
+            self.assertNotEqual(fp1["ids_and_published_sha256"], fp2["ids_and_published_sha256"])
+        self.assertEqual(set(map(tuple, P_union_policy().values())), {("train_val", "test")})
+
+
+def P_union_policy():
+    from huim import pipeline as P
+
+    return P.make_config("development")["catalogue_policy"]
+
+
+class TestScopesAndBudgets(unittest.TestCase):
+    def test_presets_keep_limits_separate_and_full_pool(self):
+        from huim import pipeline as P
+
+        dev = P.make_config("development")
+        self.assertEqual((dev["train_requests"], dev["selection_requests"], dev["export_requests"]),
+                         (5000, 100, {"train": 25, "validation": 25, "test": 25}))
+        smoke = P.make_config("smoke")
+        self.assertLess(smoke["train_requests"], dev["train_requests"])
+        full = P.make_config("full")
+        self.assertIsNone(full["train_requests"])
+        self.assertEqual(set(full["export_requests"].values()), {None})
+        for cfg in (dev, smoke, full):
+            self.assertEqual(cfg["request_sampling_seed"], 42)
+            self.assertEqual(cfg["vector_source_order"], ["train_val", "test"])
+
+    def test_budget_counts_full_pools_for_selected_requests(self):
+        from huim import pipeline as P
+
+        articles, beh, events, pairs, pre, art, ctx = synthetic_world(seed=11)
+        ctxs = {s: ctx for s in ("train", "validation", "test")}
+        ws = P.Workspace(None, {}, {}, articles, {}, {}, {}, {}, {}, pre, art, ctxs,
+                         reports={"pool_fingerprint": {"policy": "published_at_or_before_request_v1"}})
+        cfg = P.make_config("development", export_requests={"train": 3, "validation": 4, "test": None},
+                            selection_requests=5, train_requests=2, max_export_pairs=10)
+        scopes = P.resolve_request_scopes(ws, cfg)
+        budget = P.export_budget(ws, cfg, scopes)
+        el = C.catalogue_eligibility(ctx, art)["eligible_count"]
+        self.assertEqual(budget["validation"]["planned_export"]["eligible_pairs"],
+                         int(el[scopes["export_validation"]["positions"]].sum()))
+        self.assertEqual(budget["test"]["planned_export"]["requests"], len(ctx.requests))
+        self.assertEqual(budget["selection_per_evaluation_pairs"],
+                         int(el[scopes["selection_validation"]["positions"]].sum()))
+        with self.assertRaises(RuntimeError):
+            P.check_export_budget(budget)  # never shrink the pool; stop instead
+        # export validation requests are a prefix of the selection ordering when limits nest
+        cfg2 = dict(cfg, export_requests={"train": 3, "validation": 4, "test": 2}, selection_requests=8)
+        sc2 = P.resolve_request_scopes(ws, cfg2)
+        self.assertTrue(set(sc2["export_validation"]["positions"]) <= set(sc2["selection_validation"]["positions"]))
 
 
 if __name__ == "__main__":

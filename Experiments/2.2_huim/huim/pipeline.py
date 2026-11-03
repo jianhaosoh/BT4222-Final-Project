@@ -20,7 +20,10 @@ from .metrics import METRIC_DEFINITIONS, impression_metrics, recall_summary
 from .model import ModelConfig, build_model, parameter_counts
 from .persist import MODEL_FILES, check_article_ids, load_model, save_model_files
 from .io_utils import atomic_write_json, copy_verified
-from .selection import CatalogueSelector, selection_positions
+from . import sampling
+from .io_utils import file_record
+from .sampling import POOL_POLICY
+from .selection import CatalogueSelector
 from .train import Trainer, evaluate_recorded, score_recorded, seed_everything
 from .validate import validate_export, validate_recorded
 
@@ -28,10 +31,10 @@ EXPERIMENT_ID = "2.2_huim"
 
 BASE_CONFIG = {
     "experiment_id": EXPERIMENT_ID,
-    "seed": 42,
-    "feature_case": "not_applicable",  # inputs are built from source tables; see run_config['inputs']
-    # declared catalogue snapshot per split (names refer to DataPaths.articles)
-    "catalogue_policy": {"train": ["train_val"], "validation": ["train_val"], "test": ["test"]},
+    "seed": 42,                            # model-training seed (independent of request sampling)
+    "feature_case": "not_applicable",      # inputs are built from source tables; see run_config['inputs']
+    # Shared pool policy published_at_or_before_request_v1 (3.1): ONE ordered union, same for every split.
+    "catalogue_policy": {"train": ["train_val", "test"], "validation": ["train_val", "test"], "test": ["train_val", "test"]},
     "vector_source_order": ["train_val", "test"],
     "text_dim": 768, "image_dim": 1024,
     # model
@@ -40,34 +43,40 @@ BASE_CONFIG = {
     # optimisation
     "lr": 1e-3, "weight_decay": 1e-4, "batch_size": 4096, "max_epochs": 4,
     "grad_clip": 1.0, "amp": True, "checkpoint_every_steps": 200, "log_every_steps": 200,
-    # selection (Experiments/README.md): catalogue validation Recall@100 on a FIXED request sample,
-    # each sampled request scored against its full eligible catalogue; declared before training
-    "selection_requests": 2000,           # None = every validation request
-    "selection_seed": 20261103,
+    # Shared request sampling (3.1): BLAKE2b-64 priority with seed 42; three SEPARATE limits.
+    # None = every request of the agreed population. Every selected inference request uses its FULL pool.
+    "request_sampling_seed": 42,
+    "train_requests": None,               # complete recorded slates of the selected training requests
+    "selection_requests": 100,            # validation-selection scope (fixed before training)
+    "export_requests": {"train": None, "validation": None, "test": None},   # exported scope per split
+    "reference_31_run": None,             # optional 3.1 run folder: reuse its saved request IDs when present
+    # selection (Experiments/README.md): catalogue validation Recall@100 on the fixed selection requests
     "selection_interval_steps": 300,      # plus an evaluation at every epoch end
     "early_stopping_patience": 3,         # selection evaluations without improvement
     "min_improvement": 0.0,               # 0: any better (Recall, then nDCG) checkpoint resets patience
     "scheduler_patience": 1,              # ReduceLROnPlateau on Recall@100, in evaluations
-    # training subset (None = all supplied train pairs); whole impressions only
-    "train_impression_limit": None,
-    # catalogue scoring/export
+    # catalogue scoring/export and resource guards
     "pair_chunk": 32768, "request_block": 16, "inference_amp": False,
-    # request-sampled development export (whole requests, full eligible pools, full scores written)
-    "dev_sample_requests": {"train": 100, "validation": 500, "test": 100},
-    "shortlist_splits": [],                   # splits whose top-100 is exported for EVERY request (contract paths)
-    "full_score_splits": [],                  # of those, splits whose full catalogue score CSV is also written
-    "full_score_storage_margin": 1.25,        # require free space >= margin x estimate
-    "validation_check_blocks": 50,            # sampled score blocks re-read for full exports
+    "full_score_splits": ["train", "validation", "test"],  # write full score CSVs for exported requests (storage gate)
+    "max_export_pairs": 20_000_000,       # stop before exporting more pairs; raise deliberately for full scope
+    "max_selection_pairs_per_evaluation": 50_000_000,
+    "full_score_storage_margin": 1.25,    # require free space >= margin x estimate
+    "validation_check_blocks": 50,        # sampled score blocks re-read for large exports (None = all)
 }
 
 PRESETS = {
-    # labelled smoke run: tiny, explicitly bounded request samples for selection and export
-    "smoke": {"train_impression_limit": 3000, "max_epochs": 1, "checkpoint_every_steps": 0,
-              "selection_requests": 64, "selection_interval_steps": 3,
-              "dev_sample_requests": {"train": 16, "validation": 64, "test": 16}},
-    # all validation requests are shortlisted (Recall@100 on every request); scores only for the sample
-    "development": {"shortlist_splits": ["validation"]},
-    "full": {"shortlist_splits": ["train", "validation", "test"], "full_score_splits": ["train", "validation", "test"]},
+    # Labelled smoke run: tiny, explicitly bounded request scopes (prefixes of the shared hash order).
+    "smoke": {"train_requests": 1000, "selection_requests": 25,
+              "export_requests": {"train": 5, "validation": 5, "test": 5},
+              "max_epochs": 1, "batch_size": 1024, "selection_interval_steps": 4, "checkpoint_every_steps": 0},
+    # Aligned with the running 3.1 development scope: 5,000 training requests, 100 validation-selection
+    # requests, 25 export requests per split (sampled development, not a submission).
+    "development": {"train_requests": 5000, "selection_requests": 100,
+                    "export_requests": {"train": 25, "validation": 25, "test": 25},
+                    "batch_size": 1024, "max_epochs": 6, "selection_interval_steps": 20},
+    # Explicit full-request scope. Requires raising max_export_pairs after reading the budgets.
+    "full": {"train_requests": None, "selection_requests": 100,
+             "export_requests": {"train": None, "validation": None, "test": None}},
 }
 
 
@@ -112,9 +121,14 @@ def prepare_inputs(cfg: dict, data_root: Path, pre: F.Preprocessor | None = None
     starts = {s: pd.Timestamp(behaviours[s].impression_time.min()) for s in D.SPLITS}
     if not (behaviours["train"].impression_time.max() < starts["validation"]):
         raise ValueError("train and validation periods overlap")
-    names = sorted({n for v in cfg["catalogue_policy"].values() for n in v}, key=["train_val", "test"].index)
-    articles, catalogues = D.load_articles(paths, names)
-    log(f"articles: {len(articles):,} unique IDs from {names}")
+    union = POOL_POLICY["source_order"]
+    if any(list(v) != union for v in cfg["catalogue_policy"].values()):
+        raise ValueError(f"catalogue_policy must use the shared ordered union {union} for every split "
+                         f"({POOL_POLICY['name']}); alternative policies must be named and compared separately")
+    if list(cfg["vector_source_order"]) != union:
+        raise ValueError(f"vector_source_order must be {union} under {POOL_POLICY['name']}")
+    articles, catalogues = D.load_articles(paths, union)
+    log(f"articles: {len(articles):,} unique IDs from {union}")
     text_ids, text_vecs, text_rep = D.load_vectors(paths, "text", cfg["vector_source_order"], cfg["text_dim"])
     image_ids, image_vecs, image_rep = D.load_vectors(paths, "image", cfg["vector_source_order"], cfg["image_dim"])
     log(f"vectors: text {len(text_ids):,}, image {len(image_ids):,}")
@@ -132,10 +146,22 @@ def prepare_inputs(cfg: dict, data_root: Path, pre: F.Preprocessor | None = None
         pre = F.Preprocessor.fit(vocabulary, articles, train_ids, events["train"], cfg["history_len"])
     art = F.build_article_table(articles, pre, text_ids, text_vecs, image_ids, image_vecs)
     ctx = {}
+    members = np.unique(np.concatenate([catalogues["members"][n] for n in union]))  # the same union for every split
     for s in D.SPLITS:
-        members = np.unique(np.concatenate([catalogues["members"][n] for n in cfg["catalogue_policy"][s]]))
         ctx[s] = F.build_split_context(s, behaviours[s], events[s], history[s]["users"], art, pre, members, pairs[s])
+    pool = sampling.pool_fingerprint(art.ids[ctx["train"].catalogue_idx],
+                                     art.tensors["pub_s"].numpy()[ctx["train"].catalogue_idx],
+                                     {n: {k: v for k, v in file_record(paths.articles[n], None).items()
+                                          if k != "sha256"} for n in union})
+    for s in D.SPLITS:
+        assert np.array_equal(ctx[s].catalogue_idx, ctx["train"].catalogue_idx), "pool differs across splits"
+    lookup = {s: {"history_articles_not_in_union": int(len(np.setdiff1d(events[s].article_id.to_numpy(np.int64),
+                                                                       articles.article_id.to_numpy()))),
+                  "recorded_candidates_not_in_union": int(len(np.setdiff1d(pairs[s].candidate_article_id.to_numpy(np.int64),
+                                                                          articles.article_id.to_numpy())))}
+              for s in D.SPLITS}
     reports = {"catalogues": catalogues["report"], "referenced_articles_not_in_any_catalogue": int(len(not_found)),
+               "pool_policy": POOL_POLICY, "pool_fingerprint": pool, "article_lookup_coverage": lookup,
                "history": {s: history[s]["report"] for s in D.SPLITS},
                "contexts": {s: ctx[s].report for s in D.SPLITS}, "article_table": art.report,
                "split_starts": {s: str(v) for s, v in starts.items()},
@@ -163,10 +189,15 @@ def coverage_report(ws: Workspace) -> dict:
     return out
 
 
-def preflight(ws: Workspace, cfg: dict, output_roots: list[Path]) -> dict:
+def preflight(ws: Workspace, cfg: dict, output_roots: list[Path], scopes: dict | None = None) -> dict:
     """Independent checks of the full Drive artifacts before training/export."""
+    scopes = scopes or resolve_request_scopes(ws, cfg)
     report = {"vector_decoding": ws.vector_reports, "coverage": coverage_report(ws), "eligibility": {},
-              "recorded_ineligible": {}, "history": ws.reports["history"]}
+              "recorded_ineligible": {}, "history": ws.reports["history"],
+              "pool_policy": ws.reports["pool_policy"], "pool_fingerprint": ws.reports["pool_fingerprint"],
+              "article_lookup_coverage": ws.reports["article_lookup_coverage"],
+              "request_scopes": {k: v["info"] for k, v in scopes.items()},
+              "budget": export_budget(ws, cfg, scopes)}
     for s, ctx in ws.ctx.items():
         el = C.catalogue_eligibility(ctx, ws.art)
         report["eligibility"][s] = {k: v for k, v in el.items() if k != "eligible_count"}
@@ -203,16 +234,43 @@ def model_config(cfg: dict, pre: F.Preprocessor, art: F.ArticleTable) -> ModelCo
                        recency_edges_h=list(pre.state["recency_edges_h"]))
 
 
-def training_subset(ws: Workspace, cfg: dict) -> tuple[np.ndarray | None, dict]:
-    limit = cfg.get("train_impression_limit")
+def resolve_request_scopes(ws: Workspace, cfg: dict) -> dict:
+    """Training, selection-validation and export request positions (shared hash
+    order; saved 3.1 IDs preferred when a reference run is configured)."""
+    seed = cfg["request_sampling_seed"]
+    ref = sampling.read_reference_ids(Path(cfg["reference_31_run"])) if cfg.get("reference_31_run") else {}
+    scopes = {}
+    pos, info = sampling.resolve_scope(ws.ctx["train"].requests, "train", "training", cfg["train_requests"], seed)
+    scopes["training"] = {"positions": pos, "info": info}
+    pos, info = sampling.resolve_scope(ws.ctx["validation"].requests, "validation", "selection_validation",
+                                       cfg["selection_requests"], seed, ref.get("selection_validation"))
+    scopes["selection_validation"] = {"positions": pos, "info": info}
+    for s in D.SPLITS:
+        pos, info = sampling.resolve_scope(ws.ctx[s].requests, s, f"export_{s}", cfg["export_requests"][s], seed,
+                                           ref.get(f"export_{s}"))
+        scopes[f"export_{s}"] = {"positions": pos, "info": info}
+    if scopes["selection_validation"]["info"]["requests"] < 1:
+        raise ValueError("selection scope is empty")
+    return scopes
+
+
+def scope_ids(ws: Workspace, scopes: dict) -> dict:
+    """Saved request IDs for every scope (written to selection/request_scopes.json)."""
+    split_of = {"training": "train", "selection_validation": "validation",
+                **{f"export_{s}": s for s in D.SPLITS}}
+    return {name: {**sc["info"], "behaviour_ids": ws.ctx[split_of[name]].requests.behaviour_id.to_numpy()[
+        sc["positions"]].tolist()} for name, sc in scopes.items()}
+
+
+def training_subset(ws: Workspace, cfg: dict, scopes: dict | None = None) -> tuple[np.ndarray | None, dict]:
+    """Recorded pairs of the selected training requests (complete slates)."""
+    scopes = scopes or resolve_request_scopes(ws, cfg)
+    sc = scopes["training"]
     rec = ws.ctx["train"].recorded
-    if not limit:
-        return None, {"rule": "all supplied train recorded pairs", "pairs": int(len(rec["req_pos"]))}
-    n_req = len(ws.ctx["train"].requests)
-    chosen = np.sort(np.random.default_rng(cfg["seed"]).choice(n_req, size=min(limit, n_req), replace=False))
-    idx = np.flatnonzero(np.isin(rec["req_pos"], chosen))
-    return idx, {"rule": "uniform sample of whole train impressions (complete recorded slates)",
-                 "seed": cfg["seed"], "impressions": int(len(chosen)), "pairs": int(len(idx))}
+    if cfg["train_requests"] is None:
+        return None, {**sc["info"], "pairs": int(len(rec["req_pos"])), "scope": "all training requests"}
+    idx = np.flatnonzero(np.isin(rec["req_pos"], sc["positions"]))
+    return idx, {**sc["info"], "pairs": int(len(idx)), "scope": "hash-sampled training requests, complete slates"}
 
 
 def device_and_tensors(ws: Workspace, device):
@@ -224,11 +282,17 @@ def device_and_tensors(ws: Workspace, device):
     return ws.device_cache[key]
 
 
-def make_selector(ws: Workspace, cfg: dict, device) -> CatalogueSelector:
-    """The fixed validation selection sample (same for every checkpoint, control and trial)."""
+def make_selector(ws: Workspace, cfg: dict, device, scopes: dict | None = None) -> CatalogueSelector:
+    """The fixed validation-selection requests (same for every checkpoint, control and trial)."""
     art, ctx = device_and_tensors(ws, device)
-    positions = selection_positions(len(ws.ctx["validation"].requests), cfg["selection_requests"], cfg["selection_seed"])
-    return CatalogueSelector(ws.ctx["validation"], ws.art, ctx["validation"], art, positions, device, cfg)
+    scopes = scopes or resolve_request_scopes(ws, cfg)
+    sc = scopes["selection_validation"]
+    el = C.catalogue_eligibility(ws.ctx["validation"], ws.art)["eligible_count"][sc["positions"]]
+    if int(el.sum()) > cfg["max_selection_pairs_per_evaluation"]:
+        raise RuntimeError(f"selection needs {int(el.sum()):,} pairs per evaluation (> max_selection_pairs_per_"
+                           "evaluation); reduce selection_requests or raise the declared budget deliberately")
+    return CatalogueSelector(ws.ctx["validation"], ws.art, ctx["validation"], art, sc["positions"], device, cfg,
+                             sample_info=sc["info"], pool=ws.reports["pool_fingerprint"])
 
 
 def train_model(ws: Workspace, cfg: dict, run_dir: Path, persist_dir: Path | None, device, resume: bool = True,
@@ -239,8 +303,9 @@ def train_model(ws: Workspace, cfg: dict, run_dir: Path, persist_dir: Path | Non
     mcfg = model_config(cfg, ws.pre, ws.art)
     model = build_model(mcfg, ws.pre).to(device)
     art, ctx = device_and_tensors(ws, device)
-    subset, subset_info = training_subset(ws, cfg)
-    selector = selector or make_selector(ws, cfg, device)
+    scopes = resolve_request_scopes(ws, cfg)
+    subset, subset_info = training_subset(ws, cfg, scopes)
+    selector = selector or make_selector(ws, cfg, device, scopes)
     sample_path = Path(run_dir) / "selection" / "selection_requests.json"
     atomic_write_json(sample_path, selector.sample_record())
     if persist_dir is not None:
@@ -385,19 +450,58 @@ def export_catalogue(model, ws: Workspace, cfg: dict, out_root: Path, device, re
     return results
 
 
-def full_score_gate(preflight_report: dict, cfg: dict, out_roots: list, throughput: dict | None) -> dict:
-    """Decide per split whether the full score CSV may be written (storage check).
+def export_budget(ws: Workspace, cfg: dict, scopes: dict, bytes_per_row: float | None = None,
+                  pairs_per_second: float | None = None) -> dict:
+    """Exact eligible-pair counts for the PLANNED exports (union pool) and for
+    every agreed request, plus selection cost per evaluation and training pairs."""
+    out = {}
+    for s in D.SPLITS:
+        el = C.catalogue_eligibility(ws.ctx[s], ws.art)
+        counts = el["eligible_count"]
+        planned = counts[scopes[f"export_{s}"]["positions"]]
+        bpr = bytes_per_row or C.feasibility_estimate(el, ws.ctx[s])["bytes_per_row_assumed"]
+        def block(c):
+            pairs = int(c.sum())
+            b = {"requests": int(len(c)), "eligible_pairs": pairs, "empty_pools": int((c == 0).sum()),
+                 "pools_below_shortlist_size": int((c < C.SHORTLIST_SIZE).sum()),
+                 "eligible_per_request_median": float(np.median(c)) if len(c) else 0.0,
+                 "full_scores_csv_bytes_estimate": int(pairs * bpr)}
+            if pairs_per_second:
+                b["scoring_hours_estimate"] = pairs / pairs_per_second / 3600
+            return b
+        out[s] = {"planned_export": block(planned), "all_requests": block(counts), "bytes_per_row": bpr,
+                  "export_scope": scopes[f"export_{s}"]["info"]["limit"]}
+    sel = C.catalogue_eligibility(ws.ctx["validation"], ws.art)["eligible_count"][
+        scopes["selection_validation"]["positions"]]
+    out["selection_per_evaluation_pairs"] = int(sel.sum())
+    out["training_requests"] = int(scopes["training"]["info"]["requests"])
+    out["planned_export_pairs_total"] = int(sum(out[s]["planned_export"]["eligible_pairs"] for s in D.SPLITS))
+    out["all_requests_pairs_total"] = int(sum(out[s]["all_requests"]["eligible_pairs"] for s in D.SPLITS))
+    out["max_export_pairs"] = cfg["max_export_pairs"]
+    out["pool"] = ws.reports["pool_fingerprint"]["policy"]
+    return out
+
+
+def check_export_budget(budget: dict) -> None:
+    """Stop an infeasible export before it starts (never shrink the pool instead)."""
+    if budget["planned_export_pairs_total"] > budget["max_export_pairs"]:
+        raise RuntimeError(f"planned export is {budget['planned_export_pairs_total']:,} pairs > max_export_pairs="
+                           f"{budget['max_export_pairs']:,}. Inspect the budget; use a sampled export scope or raise "
+                           "max_export_pairs deliberately after checking runtime/storage.")
+
+
+def full_score_gate(budget: dict, cfg: dict, out_roots: list) -> dict:
+    """Per split: may the full score CSV for the planned export requests be written?
 
     Never silently changes the pool: a split that fails the gate still gets
-    complete top-100 shortlists, and the manifest records why scores are absent."""
+    complete top-100 shortlists for every planned request (re-validated against
+    recomputed full scores), and the manifest records why scores are absent."""
     frees = [disk_free_bytes(r) for r in out_roots]
     free = min(f for f in frees if f is not None) if any(f is not None for f in frees) else 0
     decisions, remaining = {}, free
-    bpr = (throughput or {}).get("csv_bytes_per_row")
     for s in D.SPLITS:
-        est = preflight_report["eligibility"][s]["feasibility"]
-        need = est["eligible_pairs"] * (bpr or est["bytes_per_row_assumed"])
-        wanted = s in cfg["full_score_splits"] and s in cfg["shortlist_splits"]
+        need = budget[s]["planned_export"]["full_scores_csv_bytes_estimate"]
+        wanted = s in cfg["full_score_splits"]
         ok = wanted and need * cfg["full_score_storage_margin"] <= remaining
         decisions[s] = {"requested": wanted, "write": bool(ok), "estimated_bytes": int(need),
                         "free_bytes_at_decision": int(remaining),
@@ -527,17 +631,22 @@ def reload_check(persist_dir: Path, ws: Workspace, cfg: dict, device, n_requests
     with torch.no_grad():
         new = model(v.tensors, art.tensors, len(art.ids), r, a).float().cpu().numpy()
     out["recorded_max_abs_logit_diff"] = float(np.abs(new - saved.score.to_numpy()[take]).max())
-    # (2) catalogue: re-score first requests of the persisted dev-sample validation export
-    dev = Path(persist_dir) / "dev_sample"
-    blocks_path = dev / "diagnostics" / "catalogue" / "validation_score_blocks.csv"
-    if blocks_path.is_file():
+    # (2) catalogue: re-score the first exported validation requests from the persistent copy
+    root = Path(persist_dir)
+    blocks_path = root / "diagnostics" / "catalogue" / "validation_score_blocks.csv"
+    scores_path = root / "predictions" / "validation" / "submission_click_probabilities.csv"
+    scopes_path = root / "selection" / "request_scopes.json"
+    if scopes_path.is_file():
+        saved_pool = read_json(scopes_path).get("pool_fingerprint", {}).get("ids_and_published_sha256")
+        out["pool_fingerprint_matches"] = saved_pool == ws.reports["pool_fingerprint"]["ids_and_published_sha256"]
+    if blocks_path.is_file() and scores_path.is_file() and scopes_path.is_file():
         from .validate import read_block
         blocks = pd.read_csv(blocks_path)
         first = blocks.iloc[0]
-        frame = read_block(dev / "predictions" / "validation" / "submission_click_probabilities.csv",
-                           int(first.byte_start), int(first.byte_end))
-        positions = np.asarray(read_json(dev / "dev_sample_requests.json")["validation"])[
-            int(first.first_request_index):int(first.last_request_index) + 1][:n_requests]
+        frame = read_block(scores_path, int(first.byte_start), int(first.byte_end))
+        ids = read_json(scopes_path)["export_validation"]["behaviour_ids"]
+        all_pos = pd.Index(ws.ctx["validation"].requests.behaviour_id).get_indexer(ids)
+        positions = all_pos[int(first.first_request_index):int(first.last_request_index) + 1][:n_requests]
         scorer = C.CatalogueScorer(model, v, art, device, cfg["pair_chunk"], False)
         logits = scorer.logits(positions)
         elig = scorer.eligible_mask(positions)
@@ -552,7 +661,7 @@ def reload_check(persist_dir: Path, ws: Workspace, cfg: dict, device, n_requests
     out["passed"] = bool(out["article_ids_match"] and out["preprocessing_matches_workspace"]
                          and out["recorded_max_abs_logit_diff"] <= tolerance
                          and (out.get("catalogue_max_abs_logit_diff") is None or out["catalogue_max_abs_logit_diff"] <= tolerance)
-                         and out.get("catalogue_ids_match", True))
+                         and out.get("catalogue_ids_match", True) and out.get("pool_fingerprint_matches", True))
     return out
 
 
@@ -563,5 +672,6 @@ def requirements_text() -> str:
 
 
 __all__ = ["make_config", "prepare_inputs", "preflight", "train_model", "export_recorded", "export_catalogue",
-           "full_score_gate", "persist_run", "mark_run_complete", "run_is_complete", "reload_check", "requirements_text",
+           "full_score_gate", "export_budget", "check_export_budget", "resolve_request_scopes", "scope_ids",
+           "persist_run", "mark_run_complete", "run_is_complete", "reload_check", "requirements_text",
            "METRIC_DEFINITIONS", "parameter_counts", "git_info", "environment_info", "evaluate_recorded"]

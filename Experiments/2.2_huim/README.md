@@ -17,8 +17,8 @@ It implements Stage 1 only:
 | Operation | Pool | Labels |
 | --- | --- | --- |
 | Training | Shared recorded pairs (`feature_engineering/{split}_features.parquet` keys + `clicked`) | clicked = 1, shown-unclicked = 0; no re-explosion, no catalogue negatives |
-| Catalogue validation (selection) | A fixed sample of validation requests, each scored against its **full** eligible catalogue | **known-click Recall@100 (primary)**, observed-click nDCG@100 (secondary); unshown outcomes unknown |
-| Catalogue prediction | Every article of the split's declared catalogue with `published_time <= impression_time` | Recall@100 / nDCG@100 for labelled splits; coverage only for test |
+| Catalogue validation (selection) | The fixed `selection_validation` requests, each scored against its **full** eligible union pool | **known-click Recall@100 (primary)**, observed-click nDCG@100 (secondary); unshown outcomes unknown |
+| Catalogue prediction (export) | The `export` requests of each split × every article of the shared union with a known `published_time <= impression_time` | `exported_validation` Recall@100 / nDCG@100; coverage only for test |
 | Recorded-slate diagnostic | Every recorded candidate, grouped by `(user_id, impression_id)` | mean impression AUC, **diagnostic only** |
 
 ## Metric contract and model selection (Experiments/README.md, commit 2869a48)
@@ -32,13 +32,13 @@ It implements Stage 1 only:
   * the ideal DCG places **all** original known clicks first, capped at 100, so missed and ineligible clicks count against it.
 * **Diagnostic.** Recorded-slate AUC. nDCG@5 belongs to Stage 2's final list.
 * **Selection.**
-  * Every `selection_interval_steps` (300; smoke: 3) and at each epoch end, a fixed validation sample is scored against its full catalogue. The sample is 2,000 requests (smoke: 64) with seed `20261103`, and is saved to `selection/selection_requests.json`.
+  * Every `selection_interval_steps` (development 20, smoke 4, full 300) and at each epoch end, the fixed `selection_validation` requests are scored against their full union pools. There are 100 such requests (smoke: 25): the shared BLAKE2b prefix with seed 42, or 3.1's saved IDs. They are saved in `selection/request_scopes.json` and `selection/selection_requests.json`.
   * No score CSVs are written during selection.
   * The best checkpoint is chosen by Recall@100, then nDCG@100, then the earlier checkpoint.
   * Early stopping counts selection evaluations without improvement (patience 3, `min_improvement` 0). `ReduceLROnPlateau` follows Recall@100.
-  * The selected checkpoint is restored and re-evaluated. The notebook asserts that it reproduces its recorded metrics.
+  * The selected checkpoint is restored and re-evaluated. A mismatch with its recorded metrics is logged and stored in `selection`.
   * Controls and Optuna trials use the same sample and rule. Optuna prunes on intermediate Recall@100 and keeps pruned and failed trials.
-* **Provenance.** Recovery checkpoints carry the selection protocol (sample hash, interval, pool). A checkpoint from another protocol, such as the earlier AUC-selected version of this experiment, is refused. A loaded legacy bundle is labelled diagnostic and is not described as Recall-selected.
+* **Provenance.** Recovery checkpoints carry the selection protocol: `catalogue_recall@100_v2_union_pool_hash_requests`, with the sample hash, interval and pool fingerprint. A checkpoint from another protocol, such as the earlier AUC-selected version of this experiment, is refused. A loaded legacy bundle is labelled diagnostic and is not described as Recall-selected.
 * **Partitions.** Validation is development data. No reserved labelled final partition is declared by the shared protocol. Test is never evaluated or used for any choice.
 
 Files:
@@ -50,7 +50,9 @@ Files:
   * `model`, `train`, `metrics`.
   * `catalogue`: eligibility, scoring and streamed v3 exports.
   * `validate`, `persist`.
-  * `pipeline`: orchestration.
+  * `sampling`: shared request sampling (3.1 rule), saved-ID reuse, pool policy and fingerprint.
+  * `selection`: catalogue Recall@100 checkpoint selection.
+  * `pipeline`: orchestration, request scopes and budgets.
   * `tune`: optional Optuna search.
 * `tests/test_static.py`: synthetic checks (no shared data, no optimiser steps).
 
@@ -138,30 +140,52 @@ fixed-size list), it falls back to DuckDB and then Polars, when installed.
 * The reader used, its raw return type, the source type and earlier errors are recorded. A file that no reader can decode raises; it is never treated as missing vectors or replaced by zeros.
 * Notebook §3 checks all four original files (`vector_file_check.json`) before building inputs.
 * Regression tests cover real DuckDB 1.5.2, a forced reader-type stub, Polars, and the all-readers-fail case.
+  * The on-disk fixture uses portable nullable **variable-length** lists, because PyArrow 24 refuses to write nullable fixed-size lists ("Lists with non-zero length null components are not supported").
+  * Fixed-size-list coercion is tested in memory, including through a `RecordBatchReader`.
+  * Expected values, dimensions and the per-row null mask come from the source values, not from any reader.
+  * Set `HUIM_DATA_ROOT` to run the original-artifact check.
+* **Precedence (published_at_or_before_request_v1).** Sources are combined train_val then test, and the first source *record* per article ID wins, even when its vector is legitimately missing. A later snapshot never backfills it.
+  * The report counts overridden rows, non-backfilled later vectors and overlap differences.
+  * Flag/vector disagreements, wrong dimensions, non-finite values and duplicate IDs stop the run; they are not missingness.
 
 The original full-data image files were not checked here: at 70 MB and 18.6 MB, they exceed the Drive connector's
 download limit. The Colab preflight cell is the first check on them.
 
-## Eligibility policy and catalogue versions (declared)
+## Pool policy and request scopes (aligned with 3.1)
 
-The policy is the same for every split:
+**Pool: `published_at_or_before_request_v1`, the same for train, validation and test requests.**
 
-* The article belongs to the split's declared catalogue snapshot:
-  * `train` / `validation` → `train_val/articles.parquet`;
-  * `test` → `test/articles.parquet` (overlapping IDs keep the train_val row, as in Step 3).
-* `published_time` is present. Missing publication times are excluded and counted.
-* `published_time <= impression_time`.
+* Build one ordered union: `train_val/articles.parquet`, then `test/articles.parquet`. The first record per article ID is kept, including its missing fields; a later snapshot does not backfill a missing `published_time`.
+* An article is eligible iff its `published_time` is known and `published_time <= impression_time`.
+* There is no age or access cutoff and no embedding-coverage filter.
+* Every selected inference request is scored against **all** its eligible articles, in batches. There are no sampled article negatives. The top `min(100, pool)` articles are kept, and an empty pool gives `[]`.
+* Known clicks on ineligible articles stay in the Recall and ideal-DCG denominators.
+* The pool fingerprint is a SHA-256 over the policy, sorted IDs and publication times. It is recorded in `request_scopes.json`, the selection protocol, `export_manifest.json` and `run_config.json`, and is re-checked by the reload check.
+* Article-lookup coverage (history and recorded IDs outside the union) is reported per split.
 
-There is no recency window and no access/premium rule. The pool is not restricted to articles with vectors.
-`run_config.json` records file SHA-256 hashes.
+**Request sampling (shared 3.1 rule).**
 
-**Group decision needed:** the two snapshots differ greatly in size (20,738 vs 125,541 articles on Drive). Test
-pools are therefore roughly six times larger and much older than train/validation pools. This is a distribution
-shift for any model. Harmonising the catalogues, for example by using the 125,541-article snapshot for every split,
-is a shared-policy change, not something this experiment should decide alone. `catalogue_policy` is configurable.
+* `behaviour_id = f"{user_id}:{impression_id}"`; priority is `blake2b(f"42:{split}:{behaviour_id}", digest_size=8)`.
+* The smallest N requests by (priority, `behaviour_id`) are selected and then processed by (`impression_time`, `user_id`, `impression_id`).
+* Three separate limits apply: training, selection-validation and export per split. A smaller N is a prefix of the same order, so the 25 exported validation requests are a subset of the 100 selection requests.
+* Requests come from the complete population of each split. A training request keeps its complete recorded slate, and fixed histories are not augmented.
+* With `REFERENCE_31_RUN` set, 3.1's saved IDs are reused (`input_audit.json` `selection_requests`, `eligibility/{split}_requests.csv`). Our own hash selection is always recorded with `matches_own_hash_selection`.
+* A synthetic test and a check on the real mini feature tables both show identical IDs **and** processing order to 3.1's indexer, imported read-only.
 
-Requests are all behaviour rows, `(user_id, impression_id)`, including small recorded slates and the test
-beyond-accuracy impressions. An empty pool produces `[]`.
+**Metric scopes stay separate.** `metrics.json` has `selection_validation` (the selection requests, re-scored for
+the selected checkpoint) and `exported_validation` (the exported validation requests, computed from the validated
+shortlist files), as 3.1 names them. Each scope records:
+
+* purpose, split, request count and limit;
+* the IDs' SHA-256, plus the IDs file;
+* the pool fingerprint;
+* the selected model.
+
+Compare models only on identical request IDs and pools.
+
+**New protocol.** These pool and sample changes define selection protocol v2. Earlier v1 recovery checkpoints are
+refused. A loaded v1 bundle is evaluated on the current union pool, but keeps its original selection provenance and
+is labelled diagnostic.
 
 ## Export contract (v3) and validation
 
@@ -183,36 +207,44 @@ The validators check the following:
 * `click_probability = sigmoid(score)`;
 * recorded-slate scores equal catalogue scores for eligible recorded candidates.
 
-## Full-catalogue feasibility (measured in the notebook, not assumed)
+## Union-pool budgets (measured in the notebook, not assumed)
 
-The preflight computes exact eligible-pair counts, and the dev export measures throughput and bytes per row. What I
-could establish here comes from Drive metadata and the two small behaviour files I could download:
+The preflight computes **exact** eligible-pair counts for the planned scopes and for every agreed request. The
+bounded throughput benchmark then refines bytes per row and scoring time.
 
-| Split | Requests | Catalogue | Upper bound on pairs (requests × catalogue) |
+The union's exact size depends on the train_val/test overlap: it is at most 125,541 + 20,738 = 146,279 articles,
+and is likely about 125,541 if the train_val snapshot is a subset. I could not read the full catalogues here. The
+upper bounds are therefore requests × 146,279:
+
+| Scope | Requests | Upper bound on pairs | CSV at ~57 B/row |
 | --- | ---: | ---: | ---: |
-| validation | 29,110 | 20,738 | ≤ 603.7 M |
-| test | 29,085 (incl. 436 beyond-accuracy) | 125,541 | ≤ 3.65 B |
-| train | not downloadable via the connector (10.3 MB file) | 20,738 | — |
+| smoke selection, per evaluation | 25 | ≤ 3.7 M | — (no CSV) |
+| smoke export (5 per split) | 15 | ≤ 2.2 M | ≤ 0.13 GB |
+| development selection, per evaluation | 100 | ≤ 14.6 M | — (no CSV) |
+| development export (25 per split) | 75 | ≤ 11.0 M | ≤ 0.63 GB |
+| all validation requests | 29,110 | ≤ 4.26 B | ≤ 243 GB |
+| all test requests | 29,085 | ≤ 4.25 B | ≤ 242 GB |
+| all train requests | ≈233 k (exact count printed by preflight) | ≤ 34 B | ≤ 1.9 TB |
 
-The user's reference total is about 8.52 B pairs across all three splits. At about 57 bytes per CSV row, that is
-roughly **450–490 GB** of full-score CSV.
+Under the separate-catalogue policy, the reference was about 8.5 B pairs. The shared union raises the full-scope
+total to about **40 B pairs** (≈2–2.4 TB of CSV), mostly because train and validation requests now also score
+test-snapshot articles published before them.
 
-**Compute.** The factorised model needs about 0.2 M multiply-adds per pair, so all splits come to roughly
-3×10¹⁵ FLOP. That is minutes to a few hours on a T4, depending on memory-bound gathers. Compute is not the blocker.
+Compute is about 0.2 M multiply-adds per pair. Storage and I/O are the blocker.
 
-**Storage and I/O are the blocker.** Standard Colab local disk and typical Drive quotas cannot hold these files.
+Guards:
 
-The notebook therefore uses three modes:
+* `max_export_pairs` (default 20 M) stops an export before it starts; it never shrinks the pool.
+* `max_selection_pairs_per_evaluation` (50 M) bounds selection.
+* The storage gate (free space ≥ 1.25 × estimate on the local and persistent roots) decides whether full score CSVs are written. A split that fails keeps complete top-100 files, which are re-validated against recomputed full scores, and the manifest records why scores are absent.
 
-* **smoke:** a small training subset and 1 epoch, with tiny request samples. It is labelled smoke.
-* **development:** full training. It writes full scores and top 100 for a whole-request sample (≈1.3 GB) under `dev_sample/` (not a submission). It also writes top 100 for **every validation request**, so Recall@100 covers all validation requests, without the full validation score CSV.
-* **full:** top 100 for every request of every split. Full score CSVs are written only for splits that pass a storage gate: free space ≥ 1.25 × measured estimate, checked on both the local and persistent roots. A split that fails keeps complete shortlists, and the manifest records that its scores are absent and why. The pool never changes.
+Full scope therefore needs an explicit `max_export_pairs` override, plus storage, or one of the group proposals:
 
-Proposals for the group, if full score files remain infeasible. None is implemented here.
+1. Partitioned Parquet scores.
+2. An agreed, named alternative pool policy, compared separately.
+3. A shortlist-plus-manifest handoff amendment.
 
-1. Accept the README's "compression or partitioned storage" route as the archival form of full scores. That would be partitioned Parquet with `article_id` int32 and `score` float32, at about 8 bytes per row and about 70 GB in total, with the documented loader. Keep CSV for validation only.
-2. Agree a data-justified shared availability rule. An example is a maximum article age chosen from train click-age distributions, applied identically to all models. This changes the pool for everyone and needs agreement first.
-3. Treat the top-100 files plus per-request manifests as the Stage 2 handoff. Keep full scores only for validation and request samples. This is an explicit contract amendment.
+Exported results on a request sample are sampled development results, not full-split results or a submission.
 
 ## Colab execution
 
@@ -222,7 +254,17 @@ Proposals for the group, if full score files remain infeasible. None is implemen
    * `DATA_ROOT`: the shared folder or its shortcut. It is read-only and is never written.
    * `OUTPUT_ROOT`: writable persistent storage. The default is `MyDrive/BT4222 Experiment Runs/2.2_huim`. Use `BT4222 Shared Final Folder/Experiments/2.2_huim` only if you can write there; the write probe checks this.
    * `REPO_BRANCH`: currently `claude/focused-shannon-s4lmma`.
-4. Run with `RUN_MODE = "smoke"` end to end. Then use `"development"`. Use `"full"` only after reading the preflight and refined estimates.
+4. Run with `RUN_MODE = "smoke"` end to end. Then use `"development"`. Use `"full"` only after reading the preflight and refined budgets; it also needs `CONFIG_OVERRIDES = {"max_export_pairs": ...}`.
+
+   | Setting | smoke (labelled) | development (aligned with 3.1) | full |
+   | --- | --- | --- | --- |
+   | training requests | 1,000 | 5,000 | all (`None`) |
+   | selection-validation requests | 25 | 100 | 100 |
+   | export requests per split | 5 | 25 | all (`None`) |
+   | epochs / batch / selection interval | 1 / 1,024 / 4 steps | 6 / 1,024 / 20 steps | 4 / 4,096 / 300 steps |
+   | request sampling seed | 42 | 42 | 42 |
+
+   Optionally set `REFERENCE_31_RUN` to Max's run folder, to reuse its saved selection and export IDs.
 5. **Resume.** Rerun with the same `RUN_ID`.
    * Training resumes from `PERSIST_DIR/recovery/last.pt`. It holds the model, optimiser, scheduler, GradScaler, progress and RNG states; the CPU RNG state is restored as a CPU tensor.
    * Export resume uses the progress file in the local run folder. Each resume is tied to a weights digest and a catalogue hash. A file shorter than its recorded progress raises an error and is never padded. To survive a lost runtime, set `LOCAL_ROOT` to a Drive folder for long full exports.
@@ -249,6 +291,6 @@ Return the executed `experiment.ipynb` and `review_bundle_<run_id>.zip`. The not
 * `training_history.json`, `reload_check.json`, `interruption_check.json` (if run) and `requirements.txt`;
 * `logs/run.log` and `logs/errors.log`;
 * `controls/controls.csv` and `tuning/trials.csv` / `summary.json` (if run);
-* the attention diagnostics, learning curves, `selection/selection_requests.json`, `vector_file_check.json`, the dev-sample request lists and manifests, the export progress files, and the ineligible-recorded-candidate lists.
+* the attention diagnostics, learning curves, `selection/request_scopes.json` (all scope IDs + pool fingerprint), `selection/selection_requests.json`, `vector_file_check.json`, the per-request catalogue manifests, the export progress files, and the ineligible-recorded-candidate lists.
 
 Full data, score CSVs and model binaries are not needed for review.
