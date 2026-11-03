@@ -1143,8 +1143,10 @@ def build_catalogue_index(split: str, snapshot: str, snapshot_ids: np.ndarray,
 
 
 def eligibility_summary(arrays: SplitArrays, index: CatalogueIndex,
-                        max_age_hours=None, bytes_per_score_row: float | None = None) -> dict:
-    lo, hi = index.bounds(arrays.imp_time_s, max_age_hours)
+                        max_age_hours=None, bytes_per_score_row: float | None = None,
+                        requests=None) -> dict:
+    times = arrays.imp_time_s if requests is None else arrays.imp_time_s[np.asarray(requests)]
+    lo, hi = index.bounds(times, max_age_hours)
     count = hi - lo
     pairs = int(count.sum())
     text_pairs = int((index.cum_text[hi] - index.cum_text[lo]).sum())
@@ -1155,7 +1157,8 @@ def eligibility_summary(arrays: SplitArrays, index: CatalogueIndex,
         "snapshot_excluded_missing_published_time": index.excluded_missing_published,
         "snapshot_with_text_vector": int(index.cum_text[-1]),
         "snapshot_with_image_vector": int(index.cum_image[-1]),
-        "requests": int(arrays.n_impressions), "eligible_pairs": pairs,
+        "requests": int(len(times)), "eligible_pairs": pairs,
+        "requests_in_split": int(arrays.n_impressions),
         "empty_pools": int((count == 0).sum()),
         "pool_size_min_median_max": ([int(count.min()), float(np.median(count)),
                                       int(count.max())] if len(count) else None),
@@ -1209,43 +1212,86 @@ def clicks_by_request(clicks: dict) -> dict:
             for i, g in frame.groupby("imp", sort=False)}
 
 
-def click_hits(click_lookup: dict, i: int, shortlist: np.ndarray, ks=(100, 5)):
-    """Per-request hit counts for known clicks; None if the request has none."""
+def _ideal_dcg(n_relevant: int, k: int) -> float:
+    return float(sum(1.0 / math.log2(r + 1) for r in range(1, min(n_relevant, k) + 1)))
+
+
+def click_hits(click_lookup: dict, i: int, shortlist: np.ndarray, ks=(100,)):
+    """Per-request observed-click retrieval bookkeeping; None without known clicks.
+
+    ``shortlist`` must be in the exported order (descending score, ties by
+    ascending article ID). For each K: hits@K (clicked IDs in the top K),
+    DCG@K with gain 1 for an original known click and 0 observed gain otherwise,
+    and the ideal DCG over **all** original known clicks (including clicks
+    excluded by eligibility or missed by the shortlist), capped at K.
+    """
     entry = click_lookup.get(int(i))
     if entry is None:
         return None
     aids, eligible = entry
-    return {"n": int(len(aids)), "eligible": int(eligible.sum()),
-            **{k: int(np.isin(aids, shortlist[:k]).sum()) for k in ks}}
+    shortlist = np.asarray(shortlist, dtype=np.int64)
+    gains = np.isin(shortlist, aids).astype(float)
+    discounts = 1.0 / np.log2(np.arange(2, len(shortlist) + 2))
+    out = {"n": int(len(aids)), "eligible": int(eligible.sum())}
+    for k in ks:
+        out[f"hits@{k}"] = int(np.isin(aids, shortlist[:k]).sum())
+        out[f"dcg@{k}"] = float((gains[:k] * discounts[:k]).sum())
+        out[f"idcg@{k}"] = _ideal_dcg(len(aids), k)
+    return out
 
 
-def recall_from_hits(hits: dict, clicks: dict, ks=(100, 5)) -> dict:
-    """Known-click Recall@K: clicks rejected by eligibility stay in the
-    denominator; eligible-only recall is reported separately."""
+def recall_from_hits(hits: dict, clicks: dict, ks=(100,), requests_scored: int | None = None) -> dict:
+    """Macro-averaged catalogue metrics over scored requests with known clicks.
+
+    * known_click_recall@K: hits@K / all original known clicks (clicks rejected
+      by eligibility stay in the denominator; an empty pool scores 0).
+    * observed_click_ndcg@K: DCG@K / ideal DCG over all original known clicks.
+    * eligible_only_recall@K: hits@K / eligible clicks, over requests with >= 1.
+    Unshown articles have unknown outcomes; zero observed gain is bookkeeping,
+    not a negative label.
+    """
     if not clicks.get("labelled"):
         return {"labelled": False}
     frame = pd.DataFrame.from_dict(hits, orient="index")
-    result = {"impressions_with_known_clicks": int(len(np.unique(clicks["impression"]))),
-              "impressions_with_known_clicks_scored": int(len(frame)), **clicks["summary"]}
+    result = {"requests_with_known_clicks_evaluated": int(len(frame)),
+              "requests_without_known_clicks_scored": (int(requests_scored - len(frame))
+                                                       if requests_scored is not None else None),
+              "known_clicks_evaluated": int(frame["n"].sum()) if len(frame) else 0,
+              "known_clicks_eligible": int(frame["eligible"].sum()) if len(frame) else 0,
+              "split_click_eligibility": clicks["summary"]}
     for k in ks:
         if frame.empty:
-            result[f"known_click_recall@{k}"] = None
-            result[f"eligible_only_recall@{k}"] = None
+            result.update({f"known_click_recall@{k}": None, f"observed_click_ndcg@{k}": None,
+                           f"eligible_only_recall@{k}": None})
             continue
-        result[f"known_click_recall@{k}"] = float((frame[k] / frame["n"]).mean())
+        result[f"known_click_recall@{k}"] = float((frame[f"hits@{k}"] / frame["n"]).mean())
+        result[f"observed_click_ndcg@{k}"] = float((frame[f"dcg@{k}"] / frame[f"idcg@{k}"]).mean())
         elig = frame[frame["eligible"] > 0]
-        result[f"eligible_only_recall@{k}"] = (float((elig[k] / elig["eligible"]).mean())
+        result[f"eligible_only_recall@{k}"] = (float((elig[f"hits@{k}"] / elig["eligible"]).mean())
                                                if len(elig) else None)
-        result[f"eligible_only_impressions@{k}"] = int(len(elig))
+        result[f"eligible_only_requests@{k}"] = int(len(elig))
     return result
 
 
-def known_click_recall(shortlists: dict, clicks: dict, ks=(100, 5)) -> dict:
+def per_request_metrics(hits: dict, requests, k: int = 100) -> dict:
+    """Recall@K and observed-click nDCG@K per request (NaN without known clicks),
+    aligned to ``requests`` for paired comparisons."""
+    recall = np.full(len(requests), np.nan)
+    ndcg = np.full(len(requests), np.nan)
+    for j, i in enumerate(requests):
+        h = hits.get(int(i))
+        if h is not None:
+            recall[j] = h[f"hits@{k}"] / h["n"]
+            ndcg[j] = h[f"dcg@{k}"] / h[f"idcg@{k}"]
+    return {"recall": recall, "ndcg": ndcg}
+
+
+def known_click_recall(shortlists: dict, clicks: dict, ks=(100,)) -> dict:
     """Convenience wrapper over stored shortlists (index -> ordered IDs)."""
     lookup = clicks_by_request(clicks)
     hits = {i: h for i, top in shortlists.items()
             if (h := click_hits(lookup, i, np.asarray(top), ks)) is not None}
-    return recall_from_hits(hits, clicks, ks)
+    return recall_from_hits(hits, clicks, ks, requests_scored=len(shortlists))
 
 
 def top_k_reference(scores: np.ndarray, article_ids: np.ndarray, k: int) -> np.ndarray:
@@ -1259,17 +1305,23 @@ class ShortlistWriter:
 
     * rankings/{split}/submission_top_100.csv - one row per request
     * predictions/{split}/eligibility_manifest.csv - pool size per request
-    * full catalogue scores (all requests, or a declared request sample)
+    * full catalogue scores (every scored request, or a declared score sample)
     """
 
     def __init__(self, run_dir: Path, split: str, shortlist_size: int,
-                 full_scores: bool, flush_every: int = 5000):
+                 full_scores: bool, flush_every: int = 5000, sampled_requests: bool = False):
+        """``sampled_requests``: only a declared subset of the split's requests is
+        scored (e.g. a smoke run); every file then lives under a
+        ``sampled_requests/`` folder so it can never pass as a complete export."""
         self.split, self.k = split, shortlist_size
-        self.rank_path = Path(run_dir) / "rankings" / split / f"submission_top_{shortlist_size}.csv"
-        self.manifest_path = Path(run_dir) / "predictions" / split / "eligibility_manifest.csv"
+        sub = "sampled_requests" if sampled_requests else ""
+        self.rank_path = (Path(run_dir) / "rankings" / split / sub /
+                          f"submission_top_{shortlist_size}.csv")
+        base = Path(run_dir) / "predictions" / split / sub
+        self.manifest_path = base / "eligibility_manifest.csv"
+        # Full scores for every scored request, or only for a declared score sample.
         name = "submission_click_probabilities.csv"
-        self.score_path = (Path(run_dir) / "predictions" / split / name if full_scores else
-                           Path(run_dir) / "predictions" / split / "sampled_requests" / name)
+        self.score_path = base / name if full_scores else base / "score_sample" / name
         for path in (self.rank_path, self.manifest_path, self.score_path):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.unlink(missing_ok=True)
@@ -1322,17 +1374,21 @@ class ShortlistWriter:
 
 def validate_catalogue_exports(split_arrays: SplitArrays, index: CatalogueIndex,
                                outputs: dict, shortlist_size: int,
-                               max_age_hours=None, max_score_requests: int = 200) -> dict:
+                               max_age_hours=None, max_score_requests: int = 200,
+                               requests=None) -> dict:
     """Re-read the written files and check them against the eligibility rule and,
-    for requests with exported scores, against the full score rows."""
+    for requests with exported scores, against the full score rows. ``requests``
+    restricts the expected behaviours to a declared request subset."""
     ranks = pd.read_csv(outputs["rankings"], dtype={"behaviour_id": str})
     manifest = pd.read_csv(outputs["manifest"], dtype={"behaviour_id": str})
-    expected = behaviour_ids(split_arrays.user_id, split_arrays.impression_id)
+    keep = (np.arange(split_arrays.n_impressions) if requests is None
+            else np.sort(np.asarray(requests, dtype=np.int64)))
+    expected = behaviour_ids(split_arrays.user_id[keep], split_arrays.impression_id[keep])
     if ranks["behaviour_id"].duplicated().any():
         raise AssertionError("duplicate behaviours in the shortlist file")
     if set(ranks["behaviour_id"]) != set(expected):
         raise AssertionError("shortlist behaviours differ from the split's requests")
-    lo, hi = index.bounds(split_arrays.imp_time_s, max_age_hours)
+    lo, hi = index.bounds(split_arrays.imp_time_s[keep], max_age_hours)
     expected_counts = pd.Series(hi - lo, index=expected)
     got_counts = manifest.set_index("behaviour_id")["eligible_count"]
     if not got_counts.reindex(expected).eq(expected_counts).all():
@@ -1346,7 +1402,7 @@ def validate_catalogue_exports(split_arrays: SplitArrays, index: CatalogueIndex,
     pub_by_id = dict(zip(index.article_ids.tolist(), index.published_s.tolist()))
     bad = 0
     for behaviour_id, ids in lists.items():
-        i = position[behaviour_id]
+        i = keep[position[behaviour_id]]
         t = split_arrays.imp_time_s[i]
         floor = -np.inf if max_age_hours is None else t - max_age_hours * 3600
         for a in ids:

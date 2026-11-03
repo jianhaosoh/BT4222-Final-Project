@@ -12,6 +12,15 @@ It adapts the course Week 8 recipe from rating regression to binary clicks, usin
 
 **Training and recorded-slate benchmark.** Training uses each request's recorded `article_ids_inview` slate: clicked = 1, shown but unclicked = 0. No catalogue negatives are created.
 
+**Selection.** Checkpoints are evaluated once per epoch, the declared interval. For a fixed, seeded sample of validation requests (`SELECTION_REQUESTS`, default 10,000), the model's top 100 is computed over each request's full eligible catalogue. The selected checkpoint has the highest macro known-click Recall@100. Ties are broken by observed-click nDCG@100, then by the earlier checkpoint or trial.
+
+- **Early stopping, the learning-rate schedule and Optuna** all use this same objective.
+- **Recorded-slate AUC** is a diagnostic only, and nDCG@5 is left to Stage 2.
+- **Checkpoints record the selection declaration**, and resuming a checkpoint selected under a different declaration is refused. That includes legacy AUC selection.
+- **The selected model is scored on the full validation catalogue** in Section 7.
+
+**Smoke run.** The first execution is bounded. It trains on 5% of users for one epoch, selects on 100 validation requests, and runs catalogue inference on 100 requests per split, each against its full pool. Those outputs are written under `sampled_requests/`. Full scoring requires `SMOKE_TEST = False` with `CATALOGUE_REQUEST_LIMIT = None`.
+
 **Catalogue prediction.** Prediction uses each split's article snapshot: `train_val` for train and validation, `test` for test. An article is eligible if it was published at or before the request, with no age limit unless the group declares one. Outcomes for unshown articles are unknown.
 
 The inputs a catalogue request cannot have were removed: recorded slate size and within-slate age rank. Article age is computed from the catalogue, and the notebook checks it against the shared `article_age_h`.
@@ -74,7 +83,8 @@ The run folder contains (export schema v3):
 
 - `rankings/{split}/submission_top_100.csv`: one row per request with its top `min(100, pool)` eligible article IDs as a JSON array. An empty pool is written as `[]`.
 - `predictions/{split}/eligibility_manifest.csv`: per-request pool size and shortlist length.
-- `predictions/{split}/submission_click_probabilities.csv`: full catalogue scores (`score` = logit, `click_probability` = uncalibrated sigmoid). This file is written only if the estimated size fits `FULL_SCORE_EXPORT_MAX_GB` and the free space. Otherwise the scores of a declared, seeded request sample go to `predictions/{split}/sampled_requests/`, and `export_manifest.json` records that the full export is incomplete.
+- `predictions/{split}/submission_click_probabilities.csv`: full catalogue scores (`score` = logit, `click_probability` = uncalibrated sigmoid). This file is written only if the estimated size fits `FULL_SCORE_EXPORT_MAX_GB` and the free space. Otherwise the scores of a declared, seeded request sample go to `predictions/{split}/score_sample/`, and `export_manifest.json` records that the full export is incomplete.
+- A request-limited run, such as the smoke run, writes all of the above under `rankings/{split}/sampled_requests/` and `predictions/{split}/sampled_requests/`.
 - `diagnostics/recorded_slates/{split}_scores.csv`: every recorded candidate, for the labelled AUC/nDCG benchmark.
 - `model/`:
   - `model_state.pt` (state_dict)
@@ -85,7 +95,8 @@ The run folder contains (export schema v3):
   - `code/` (bundled modules)
   - `recovery/last_checkpoint.pt`
 - `metrics.json`, `run_config.json`, `export_manifest.json`, `catalogue_feasibility.json`, `training_history.{json,csv}`, `requirements.txt`, `reload_check.json`, `resume_check.json`, `manifest.json`
-- `ablations/<variant>/`: `summary.json` and `validation_per_impression.npz`, plus a `COMPLETE.json` marker that is written last and holds both files' hashes.
+- `ablations/<variant>/`: `summary.json` and `validation_per_impression.npz` (per-request Recall@100 and nDCG@100 on the selection sample, and diagnostic per-impression AUC), plus a `COMPLETE.json` marker that is written last and holds both files' hashes.
+- `selection/validation_requests.csv`: the fixed selection request sample.
 - `logs/notebook_log.txt`
 - `review_<run_id>.zip`
 
