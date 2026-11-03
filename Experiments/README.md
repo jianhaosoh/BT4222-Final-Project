@@ -291,6 +291,64 @@ The baseline's metric implementation is a useful reference, but adapt grouping
 to the composite impression key. Previously saved baseline results use a separate
 sample/pipeline and are not directly comparable with new experiment results.
 
+### Required validation workflow inside each experiment
+
+Each experiment must implement its own validation evaluation now; do not wait
+for the later shared evaluation notebook. That shared stage consolidates model
+comparisons and final results, while experiment owners need validation feedback
+to develop their models.
+
+1. **Fix the development data and protocol first.** Use the agreed train and
+   validation partitions. Declare any reserved labelled final-evaluation partition
+   before tuning, and keep it untouched. If using a development sample, fix its
+   seed/request IDs, preserve complete recorded slates, and use the same sample
+   across trials. Fit learned preprocessing and calibration on train or its
+   permitted inner partition only.
+2. **Train on train; select using validation.** For iterative models, evaluate
+   recorded-slate validation AUC at a declared interval, save the best checkpoint,
+   and use validation AUC for early stopping with a recorded patience/minimum
+   improvement rule. For non-iterative models, compare completed fits on that
+   same validation objective. Log training loss and validation AUC/nDCG@5; training
+   metrics diagnose optimisation and overfitting, not generalisation.
+3. **Run a bounded, recorded search.** Try a small set of justified settings,
+   manually or with an optional tuner such as Optuna. Declare the parameters,
+   ranges, budget, seeds and selection rule before the search; retain all trial
+   outcomes, including failed/pruned trials. Maximise the agreed validation mean
+   impression AUC. Use a deterministic tie rule, such as keeping the earlier
+   trial/checkpoint. Do not select by training accuracy or silently switch to
+   whichever validation metric makes a trial look best.
+4. **Restore and evaluate the selected checkpoint.** Do not export the last epoch
+   merely because it ran last. Report validation AUC and nDCG@5 with the grouping,
+   tie rules, denominators and exclusions above. Plot training/validation progress
+   where applicable and include a focused error/subgroup check or ablation suited
+   to the experiment. Report comparisons on identical requests and inputs.
+5. **Check catalogue shortlisting for the selected model.** Compute validation
+   known-click Recall@100 and the coverage/resource diagnostics below using the
+   declared eligible pool. Exhaustive catalogue scoring need not run after every
+   epoch or trial. A fixed validation-request sample is acceptable for development
+   if explicitly labelled; each sampled request must still use its full eligible
+   pool. Report sample results as sampled, and record full validation results when
+   executed. Record any further selection based on recall as validation tuning.
+6. **Save evidence and hand off.** Save the trial table, selected configuration
+   and checkpoint, validation metrics/counts, learning curves, input/pool versions
+   and any sampling IDs in the run bundle. Label repeatedly used validation scores
+   as development results. Export the selected model's outputs for later shared
+   comparison; the shared evaluator should not need to retrain it.
+
+### Test is never a tuning signal
+
+**Do not tune or select models based on test-set evaluation.** Hyperparameters,
+features, checkpoints, eligibility rules, shortlist size, calibration, ensemble
+choices and Stage 2 reranking settings must be chosen using train/validation,
+then frozen before final evaluation. Do not use test metrics, leaderboard feedback
+or test business-metric comparisons to revise those choices.
+
+The supplied official test has no click labels: generate predictions and perform
+label-free schema, loading and export-integrity checks, but do not invent test
+AUC, nDCG or recall. If a genuine untouched labelled test/evaluation set is
+available later, evaluate the frozen pipeline for final reporting only. The
+existence of test predictions does not make that split a development set.
+
 ### Catalogue shortlisting and end-to-end checks
 
 For catalogue prediction, report **known-click Recall@100**: for each impression
