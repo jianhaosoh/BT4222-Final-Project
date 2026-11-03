@@ -9,12 +9,14 @@ catalogue eligible at the request timestamp and selects up to 100 articles.
 Stage 2 applies business priorities within that shortlist to produce the final
 top 5 recommendations.
 
-Recorded-slate validation measures labelled click ranking; catalogue shortlist
-validation measures recovery of known clicked articles. Unshown article outcomes
-are unknown, so these offline results do not establish catalogue-wide CTR,
-retention or profit. See the experiment guide for the separate evaluation pools
-and export contracts. Existing slate-only experiments still need a catalogue
-inference path before they implement this intended pipeline.
+Select Stage 1 models using catalogue validation known-click Recall@100, with
+observed-click nDCG@100 as secondary. Recorded-slate AUC is diagnostic; nDCG@5
+evaluates the final Stage 2 list. Unshown article outcomes are unknown, so these
+offline results do not establish catalogue-wide CTR, retention or profit. Never
+tune model or reranker choices using test-set evaluation. See the experiment
+guide for the separate evaluation pools and export contracts. Existing slate-only
+experiments still need a catalogue inference/validation path before they
+implement this intended pipeline.
 
 ## Dataset
 

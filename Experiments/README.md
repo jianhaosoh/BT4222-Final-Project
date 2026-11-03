@@ -16,7 +16,7 @@ when making recommendations:
 | Operation | Article pool | Labels and purpose |
 | --- | --- | --- |
 | Training | Each behaviour's recorded `article_ids_inview` slate | Clicked = 1; shown but unclicked = 0. The shared feature tables already contain these expanded pairs. Keep this training setup. |
-| Recorded-slate validation | The same recorded candidate rows in validation | Labelled relevance benchmark for tuning/checkpoint selection. |
+| Recorded-slate validation | The same recorded candidate rows in validation | Labelled click-ranking diagnostic; not the primary shortlist-selection objective. |
 | Catalogue prediction, for each split | Every article eligible at each behaviour's timestamp | Score behaviour × eligible article, then select the top 100. Articles outside the recorded slate have **unknown** outcomes, not negative labels. |
 | Stage 2 | Stage 1's catalogue-derived shortlist | Apply the agreed business priorities and produce the final top 5. |
 
@@ -107,7 +107,7 @@ model to address every objective:
 
 | Business link | Example explanation in a model notebook | Evidence brought together in shared evaluation |
 | --- | --- | --- |
-| Relevant recommendations | Does category/topic affinity, reading history or content similarity explain why an article scores highly? | Impression AUC and nDCG@K on the same candidate rows, alongside representative ranking examples. |
+| Relevant recommendations | Does category/topic affinity, reading history or content similarity explain why an article scores highly? | Stage 1 catalogue known-click Recall@100 and observed-click nDCG@100; Stage 2 final-list relevance, alongside representative examples. |
 | Continued reading | If using historical reading depth or sequence information, explain how it could represent a reader's interests over time. | Session-continuation performance where suitable outcome labels exist; distinguish this from click prediction. |
 | Fresh content | Does recency information help the model consider timely articles? Explain any relevance/freshness trade-off. | Article-age distribution of top-ranked items before and after reranking. |
 | Exploration and variety | Do the highest-scoring articles repeatedly concentrate on the same topics? Explain the model's behaviour and implications for reranking. | Topic/category diversity before and after reranking, alongside relevance metrics. |
@@ -268,24 +268,39 @@ separate from a file-loading failure.
 
 ## Validation and model-selection protocol
 
-Use **mean impression AUC as the primary metric**, maximised for hyperparameter
-selection, early stopping and checkpoint selection. Report **mean impression
-nDCG@5 as a secondary metric**. Record the selected epoch/run/trial, objective,
-direction and any deterministic selection tie-breaker. Use the same protocol
-across experiments; do not silently select different models using different metrics.
+Stage 1 selects a catalogue-derived shortlist for Stage 2, so its model-selection
+metric must measure that task:
 
-Evaluate each complete slate, grouped by `(user_id, impression_id)`, then take an
-equal-weight mean over eligible impressions:
+| Role | Metric and evaluation pool |
+| --- | --- |
+| **Stage 1 primary** | **Mean known-click Recall@100** over validation requests, using the full time-eligible catalogue for each request. Maximise this for hyperparameter, checkpoint and early-stopping decisions. |
+| **Stage 1 secondary** | **Mean observed-click nDCG@100** on the same catalogue predictions, measuring the order within the shortlist. |
+| Recorded-slate diagnostic | Mean impression AUC on the original shown candidates; useful for debugging click ranking, not the final Stage 1 selection objective. |
+| Stage 2 final-list evaluation | nDCG@5 for the final five recommendations, alongside the agreed business metrics and explicit observed-outcome limitations. |
 
-- **AUC:** compare clicked and unclicked candidates within each impression. Give
-  equal scores half credit and exclude impressions without both label classes.
-  Pooled candidate-level ROC-AUC is not a substitute for this metric.
-- **nDCG@5:** use binary click labels and a cutoff of `min(5, slate_size)`. Give
-  tied scores expected ranking credit, including ties across the cutoff. Exclude
-  impressions without a positive label.
-- Report total candidate rows and impressions, eligible impressions for each
-  metric, and all exclusion counts. Deterministic article-ID tie-breaking in
-  exported lists must not determine metric credit.
+Stage 2 can reorder a retained clicked article but cannot recover one discarded
+by Stage 1. That is why shortlist membership (Recall@100) is primary and its
+initial ordering (nDCG@100) is secondary. nDCG@5 is not the Stage 1 objective.
+Keep the training loss separate: a click-prediction loss may still train on the
+recorded positive/negative pairs while catalogue Recall@100 selects the model.
+
+Group requests by `(user_id, impression_id)` and macro-average over requests
+with at least one known clicked article. Include empty eligible pools as zero
+recall/nDCG when clicks are known; report requests without known clicks separately.
+Record the selected epoch/run/trial, objective, direction, sampling and pool
+policy. For equal Recall@100, prefer higher observed-click nDCG@100, then the
+earlier trial/checkpoint. Use the same rule across experiments.
+
+Earlier AUC-selected or recorded-slate-only runs remain diagnostic results.
+Update their catalogue validation and selection logic before describing them as
+models selected for top-100 shortlisting; renaming metrics or exports is not a
+migration. Keep the original selection provenance for any existing run.
+
+For recorded-slate AUC, compare clicked and unclicked candidates within each
+complete impression, give equal scores half credit, exclude impressions without
+both classes, and macro-average the remaining impressions. Report all counts and
+exclusions. Pooled candidate-level ROC-AUC is not a substitute. Any additional
+recorded-slate ranking metrics must be labelled diagnostics, not catalogue results.
 
 The baseline's metric implementation is a useful reference, but adapt grouping
 to the composite impression key. Previously saved baseline results use a separate
@@ -301,34 +316,38 @@ to develop their models.
 1. **Fix the development data and protocol first.** Use the agreed train and
    validation partitions. Declare any reserved labelled final-evaluation partition
    before tuning, and keep it untouched. If using a development sample, fix its
-   seed/request IDs, preserve complete recorded slates, and use the same sample
-   across trials. Fit learned preprocessing and calibration on train or its
-   permitted inner partition only.
+   seed/request IDs, preserve their complete recorded slates for diagnostics and
+   their full eligible catalogues for selection, and use the same sample across
+   trials. Never replace the catalogue with sampled article negatives for the
+   headline retrieval metric. Fit learned preprocessing and calibration on train
+   or its permitted inner partition only.
 2. **Train on train; select using validation.** For iterative models, evaluate
-   recorded-slate validation AUC at a declared interval, save the best checkpoint,
-   and use validation AUC for early stopping with a recorded patience/minimum
-   improvement rule. For non-iterative models, compare completed fits on that
-   same validation objective. Log training loss and validation AUC/nDCG@5; training
-   metrics diagnose optimisation and overfitting, not generalisation.
+   catalogue validation Recall@100 at a declared checkpoint interval, save the
+   best checkpoint, and use that objective for early stopping with a recorded
+   patience/minimum-improvement rule. Patience counts selection evaluations, not
+   necessarily epochs. For non-iterative models, compare completed fits on that
+   same objective. Log training loss, Recall@100, observed-click nDCG@100 and
+   diagnostic recorded-slate AUC. Training metrics diagnose optimisation and
+   overfitting, not generalisation.
 3. **Run a bounded, recorded search.** Try a small set of justified settings,
    manually or with an optional tuner such as Optuna. Declare the parameters,
    ranges, budget, seeds and selection rule before the search; retain all trial
    outcomes, including failed/pruned trials. Maximise the agreed validation mean
-   impression AUC. Use a deterministic tie rule, such as keeping the earlier
-   trial/checkpoint. Do not select by training accuracy or silently switch to
-   whichever validation metric makes a trial look best.
+   known-click Recall@100, with the tie rule above. Do not select by training
+   accuracy or silently switch to whichever metric makes a trial look best.
 4. **Restore and evaluate the selected checkpoint.** Do not export the last epoch
-   merely because it ran last. Report validation AUC and nDCG@5 with the grouping,
-   tie rules, denominators and exclusions above. Plot training/validation progress
-   where applicable and include a focused error/subgroup check or ablation suited
-   to the experiment. Report comparisons on identical requests and inputs.
-5. **Check catalogue shortlisting for the selected model.** Compute validation
-   known-click Recall@100 and the coverage/resource diagnostics below using the
-   declared eligible pool. Exhaustive catalogue scoring need not run after every
-   epoch or trial. A fixed validation-request sample is acceptable for development
-   if explicitly labelled; each sampled request must still use its full eligible
-   pool. Report sample results as sampled, and record full validation results when
-   executed. Record any further selection based on recall as validation tuning.
+   merely because it ran last. Report catalogue Recall@100 and observed-click
+   nDCG@100, plus diagnostic recorded-slate AUC, with the agreed grouping, ties,
+   denominators and exclusions. Plot progress where applicable and include a
+   focused error/subgroup check or ablation. Compare identical requests and pools.
+5. **Budget catalogue validation explicitly.** A fixed validation-request sample
+   is acceptable for checkpoint/trial selection if full validation is too costly;
+   every sampled request still uses its full eligible catalogue. Declare the
+   sample and evaluation interval before searching. Compute top-100 metrics in
+   batches without writing exhaustive score CSVs at every checkpoint. Report
+   sample results as sampled, then evaluate the selected model on full validation
+   when feasible and record what actually ran. Do not silently substitute AUC
+   when catalogue validation is missing; mark shortlist selection as incomplete.
 6. **Save evidence and hand off.** Save the trial table, selected configuration
    and checkpoint, validation metrics/counts, learning curves, input/pool versions
    and any sampling IDs in the run bundle. Label repeatedly used validation scores
@@ -357,11 +376,24 @@ shortlist by its original number of clicked article IDs, then average equally
 over those impressions. Keep clicked articles rejected by eligibility in that
 denominator; report their count and exclusion reasons, plus eligible-only recall
 and eligibility coverage separately. Also report shortlist lengths, empty pools,
-scored pair counts and runtime. Use validation to investigate shortlist coverage
-and any proposed size changes; do not silently replace the agreed AUC checkpoint
-selection objective. Save the eligibility policy and shortlist size with results.
+scored pair counts and runtime. Use this validation recall as the primary
+checkpoint/trial-selection objective and to investigate any proposed size changes.
+Save the eligibility policy and shortlist size with results. Evaluate the actual
+top-100 membership after the export's deterministic score/article-ID tie rule;
+report ties crossing the cutoff.
 
-This is recovery of **observed** clicks, not an unbiased estimate of catalogue
+For **observed-click nDCG@100**, give an article gain of 1 when it belongs to the
+request's original known-click set, and 0 observed gain otherwise. Compute
+`DCG@100 = sum(gain_at_rank / log2(rank + 1))` over the exported shortlist, and
+divide by the ideal DCG obtained by placing all original known clicks first,
+capped at 100. Include missed/excluded clicks in that ideal; do not recompute it
+using only positives surviving in the shortlist. Use the same deterministic order
+as the export, record the tie policy, and macro-average the same requests as
+Recall@100. Zero observed gain for an unshown article is a retrieval bookkeeping
+convention, **not an observed non-click label**. Name this metric explicitly as
+observed-click nDCG; it is not fully observed catalogue relevance.
+
+These are recovery/ranking measures of **observed** clicks, not unbiased estimates of catalogue
 relevance, CTR, retention or profit. Unshown articles may be relevant: never label
 them zero for catalogue-wide classification AUC/BCE. Record exposure bias and
 catalogue coverage limitations. Observed-click retrieval metrics alone do not
@@ -372,10 +404,11 @@ business measures it targets. For the labelled recorded-slate experiment, apply
 the same shortlist/reranking procedure to the recorded pool and calculate final
 nDCG@5 against the **original full recorded slate's** labels/ideal ranking;
 discarded positives must count against the pipeline. Catalogue recommendations
-can report known-click recovery at 5 and business measures, with the unobserved
-outcome limitation above. Do not present a metric that silently treats every
-unshown catalogue article as an observed negative. Keep the two evaluation pools
-explicit in filenames, metadata and report tables.
+can report observed-click nDCG@5, known-click recovery at 5 and business measures,
+with the same unobserved-outcome qualification used for Stage 1. Do not present a
+metric that silently treats every unshown catalogue article as an observed
+negative. Keep the two evaluation pools explicit in filenames, metadata and
+report tables.
 
 State the partition used for tuning and early stopping. If validation is used
 repeatedly for selection, report its scores as **development/validation results**,
@@ -563,8 +596,9 @@ export an incomplete live database while assuming it is resumable.
 
 Save `metrics.json` with **validation development metrics**, metric definitions,
 evaluated row/impression counts and exclusions. Follow the validation protocol
-above: primary recorded-slate mean impression AUC, secondary recorded-slate
-nDCG@5, plus catalogue known-click Recall@100 and coverage diagnostics. Final cross-model tables,
+above: primary catalogue known-click Recall@100, secondary observed-click
+nDCG@100, diagnostic recorded-slate mean impression AUC and catalogue coverage.
+Record the selection request sample/interval if used. Final cross-model tables,
 train/validation comparisons and reranking results belong in the shared evaluation
 stage, using the same split and candidate rows for every model. The existing saved
 baseline benchmark used its own sample and is not directly comparable by default.
