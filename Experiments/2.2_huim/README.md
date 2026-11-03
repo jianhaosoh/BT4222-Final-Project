@@ -1,6 +1,10 @@
 # 2.2_huim — HUIM-inspired Stage 1 relevance model and catalogue shortlist
 
-**Status:** the implementation is prepared and has passed static and synthetic checks (30 tests, no optimiser steps). It has **not** been
+> **Branch status vs the draft on main.** The draft merged to main (AUC selection, PyArrow-only vector reader) is
+> superseded on this branch: catalogue Recall@100 selection, the DuckDB/Polars reader-to-Table fix and the shared
+> `published_at_or_before_request_v1` union pool are implemented here, pending execution in Colab.
+
+**Status:** the implementation is prepared and has passed static and synthetic checks (no optimiser steps). It has **not** been
 executed on the shared data. No training, metric, export, persistence or reload result exists yet. The
 executed Colab notebook and its review bundle will be the first evidence.
 

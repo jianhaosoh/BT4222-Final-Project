@@ -81,3 +81,25 @@ top-K boundaries. Unknown publication ages are not classified as older than
 Click probabilities describe the supplied logged slates. If impressions are
 click-filtered, these are conditional probabilities, not platform-wide CTR.
 Offline ranking metrics do not establish retention or causal engagement gains.
+
+## Logistic regression coefficients
+
+`results/logistic_regression_coefficients.csv` lists each processed feature and
+its fitted coefficient, using the same `feature,coefficient` format as the
+Pretrained Models experiment. It has been exported from the existing saved
+model; future training runs write it automatically.
+
+Numeric coefficients apply after standardisation. Categorical coefficients
+apply to the one-hot encoded columns. Positive coefficients increase the
+click log-odds, holding the other features fixed; they are not probability
+changes or causal effects. The model intercept remains in `model.joblib`.
+
+To regenerate the coefficient file from the saved model without retraining:
+
+```bash
+python3 "Baseline Testing/export_coefficients.py"
+```
+
+Optional `--model` and `--output` arguments select a different saved model
+and CSV destination. Defaults resolve relative to the script, so it also
+works when launched from inside `Baseline Testing/`.
