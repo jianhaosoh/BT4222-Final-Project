@@ -1199,34 +1199,53 @@ def clicked_eligibility(arrays: SplitArrays, index: CatalogueIndex,
                         **{r: int((reason == r).sum()) for r in CLICK_EXCLUSION_REASONS}}}
 
 
-def known_click_recall(shortlists: dict, clicks: dict, ks=(100, 5)) -> dict:
-    """Known-click Recall@K over impressions with recorded clicks.
-
-    ``shortlists``: impression index -> ordered article IDs. ``clicks`` is the
-    output of ``clicked_eligibility``. The main recall keeps clicks rejected by
-    eligibility in the denominator; eligible-only recall is reported separately.
-    """
+def clicks_by_request(clicks: dict) -> dict:
+    """impression index -> (clicked article IDs, eligible flags)."""
     if not clicks.get("labelled"):
-        return {"labelled": False}
+        return {}
     frame = pd.DataFrame({"imp": clicks["impression"], "aid": clicks["article_id"],
                           "eligible": clicks["eligible"]})
-    scored = frame["imp"].isin(list(shortlists))
-    result = {"impressions_with_known_clicks": int(frame["imp"].nunique()),
-              "impressions_with_known_clicks_scored": int(frame.loc[scored, "imp"].nunique()),
-              **clicks["summary"]}
-    frame = frame[scored].copy()
+    return {int(i): (g["aid"].to_numpy(), g["eligible"].to_numpy())
+            for i, g in frame.groupby("imp", sort=False)}
+
+
+def click_hits(click_lookup: dict, i: int, shortlist: np.ndarray, ks=(100, 5)):
+    """Per-request hit counts for known clicks; None if the request has none."""
+    entry = click_lookup.get(int(i))
+    if entry is None:
+        return None
+    aids, eligible = entry
+    return {"n": int(len(aids)), "eligible": int(eligible.sum()),
+            **{k: int(np.isin(aids, shortlist[:k]).sum()) for k in ks}}
+
+
+def recall_from_hits(hits: dict, clicks: dict, ks=(100, 5)) -> dict:
+    """Known-click Recall@K: clicks rejected by eligibility stay in the
+    denominator; eligible-only recall is reported separately."""
+    if not clicks.get("labelled"):
+        return {"labelled": False}
+    frame = pd.DataFrame.from_dict(hits, orient="index")
+    result = {"impressions_with_known_clicks": int(len(np.unique(clicks["impression"]))),
+              "impressions_with_known_clicks_scored": int(len(frame)), **clicks["summary"]}
     for k in ks:
-        top = {i: set(shortlists[i][:k]) for i in frame["imp"].unique().tolist()}
-        hit = np.fromiter((aid in top[i] for i, aid in zip(frame["imp"], frame["aid"])),
-                          dtype=bool, count=len(frame))
-        frame[f"hit@{k}"] = hit
-        per = frame.groupby("imp").agg(h=(f"hit@{k}", "sum"), n=("aid", "size"),
-                                       e=("eligible", "sum"))
-        result[f"known_click_recall@{k}"] = float((per["h"] / per["n"]).mean()) if len(per) else None
-        elig = per[per["e"] > 0]
-        result[f"eligible_only_recall@{k}"] = float((elig["h"] / elig["e"]).mean()) if len(elig) else None
+        if frame.empty:
+            result[f"known_click_recall@{k}"] = None
+            result[f"eligible_only_recall@{k}"] = None
+            continue
+        result[f"known_click_recall@{k}"] = float((frame[k] / frame["n"]).mean())
+        elig = frame[frame["eligible"] > 0]
+        result[f"eligible_only_recall@{k}"] = (float((elig[k] / elig["eligible"]).mean())
+                                               if len(elig) else None)
         result[f"eligible_only_impressions@{k}"] = int(len(elig))
     return result
+
+
+def known_click_recall(shortlists: dict, clicks: dict, ks=(100, 5)) -> dict:
+    """Convenience wrapper over stored shortlists (index -> ordered IDs)."""
+    lookup = clicks_by_request(clicks)
+    hits = {i: h for i, top in shortlists.items()
+            if (h := click_hits(lookup, i, np.asarray(top), ks)) is not None}
+    return recall_from_hits(hits, clicks, ks)
 
 
 def top_k_reference(scores: np.ndarray, article_ids: np.ndarray, k: int) -> np.ndarray:
@@ -1594,15 +1613,36 @@ def file_manifest(root: Path, hash_files: bool = True) -> dict:
     return entries
 
 
+def _copy_atomic(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".partial")
+    shutil.copy2(source, temporary)
+    os.replace(temporary, target)
+
+
 def persist_directory(source: Path, destination: Path) -> dict:
-    """Copy a run folder to persistent storage and verify sizes and hashes."""
+    """Copy a run folder to persistent storage without ever overwriting a good
+    file in place: each changed file goes to a temporary name and is renamed;
+    files whose size and hash already match are skipped; manifest.json last.
+    Then every file is verified against the local hashes."""
     source, destination = Path(source), Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, dirs_exist_ok=True)
     local = file_manifest(source)
-    remote = file_manifest(destination)
+    copied = skipped = 0
+    for relative, entry in local.items():
+        target = destination / relative
+        if (target.is_file() and target.stat().st_size == entry["bytes"]
+                and sha256_file(target) == entry["sha256"]):
+            skipped += 1
+            continue
+        _copy_atomic(source / relative, target)
+        copied += 1
+    if (source / "manifest.json").is_file():
+        _copy_atomic(source / "manifest.json", destination / "manifest.json")
+    remote = {k: {"bytes": (destination / k).stat().st_size,
+                  "sha256": sha256_file(destination / k)}
+              for k in local if (destination / k).is_file()}
     missing = sorted(set(local) - set(remote))
     different = sorted(k for k in local if k in remote and local[k] != remote[k])
-    return {"destination": str(destination), "files": len(local),
-            "missing": missing, "different": different,
+    return {"destination": str(destination), "files": len(local), "copied": copied,
+            "already_identical": skipped, "missing": missing, "different": different,
             "verified": not missing and not different, "manifest": local}

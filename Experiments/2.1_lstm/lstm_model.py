@@ -395,7 +395,7 @@ def predict_logits(model, data: SplitTensors, batch_size: int = 256,
                    impression_subset: np.ndarray | None = None) -> np.ndarray:
     """fp32 inference in the split's canonical candidate order."""
     model.eval()
-    out = torch.empty(data.n_candidates, dtype=torch.float32, device=data.device)
+    out = torch.full((data.n_candidates,), float("nan"), dtype=torch.float32, device=data.device)
     filled = torch.zeros(data.n_candidates, dtype=torch.bool, device=data.device)
     indices = (torch.arange(data.n_impressions) if impression_subset is None
                else torch.as_tensor(impression_subset, dtype=torch.long))
@@ -510,6 +510,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
     loss_fn = nn.BCEWithLogitsLoss()
     history, best = [], {"epoch": None, "auc": -math.inf, "metrics": None}
     start_epoch, stale = 1, 0
+    best_state = None
     recovery = out_dir / "recovery" / "last_checkpoint.pt"
     best_path = out_dir / "best_model_state.pt"
     generator = torch.Generator().manual_seed(cfg.seed)
@@ -522,9 +523,14 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
+        if state.get("best_model") is not None:
+            # The checkpoint carries the selected weights, so best_model_state.pt
+            # is rewritten from it: an interrupted copy cannot pair mismatched files.
+            atomic_torch_save(state["best_model"], best_path)
         if state["scaler"]:   # empty when saved from a CPU / non-AMP run
             scaler.load_state_dict(state["scaler"])
         history, best, stale = state["history"], state["best"], state["stale"]
+        best_state = state.get("best_model")
         start_epoch = state["epoch"] + 1
         restore_rng_state(state["rng"])
         generator.set_state(_cpu_byte_tensor(state["generator"]))
@@ -585,7 +591,8 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
         improved = auc > best["auc"]
         if improved:
             best = {"epoch": epoch, "auc": auc, "metrics": metrics}
-            atomic_torch_save(model.state_dict(), best_path)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            atomic_torch_save(best_state, best_path)
             stale = 0
         else:
             stale += 1
@@ -602,6 +609,7 @@ def train_model(model, train: SplitTensors, validation: SplitTensors, evaluate,
             "generator": generator.get_state(), "device_generator": device_gen.get_state(),
             "device_generator_type": device.type,
             "finished": finished, "early_stopped": early_stopped,
+            "best_model": best_state,
             "train_config": asdict(cfg),
         }, recovery)
         (out_dir / "training_history.json").write_text(json.dumps(history, indent=2))

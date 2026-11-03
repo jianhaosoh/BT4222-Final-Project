@@ -56,7 +56,7 @@ The shared folder is owned by another account. Add a Drive shortcut so it appear
    - set `TRAIN_MODEL = False`, `LOAD_RUN_ID = "<main run>"` and `RUN_ABLATIONS = True`;
    - the controls reuse the saved hyperparameters;
    - the run ID ends in `_load_controls`.
-7. Resume after a disconnect: set `RESUME_RUN_ID = "<run id>"`. It resumes from the Drive recovery checkpoint and is not guaranteed to be bitwise exact.
+7. Resume after a disconnect: set `RESUME_RUN_ID = "<run id>"`. This continues a training run from the Drive recovery checkpoint (not guaranteed to be bitwise exact). With `TRAIN_MODEL = False` and `LOAD_RUN_ID`, it continues a load or controls run, reusing finished controls and catalogue splits.
 
 ## Vector files
 
@@ -94,11 +94,11 @@ The run folder contains (export schema v3):
 With publication-time eligibility only, the shared artifacts give about 8.5 billion request × article pairs. That is roughly 4.3 billion for train, 0.57 billion for validation and 3.6 billion for test.
 
 - **Scoring all of them is feasible on a GPU.** Each request's eligible articles form one contiguous slice of the snapshot sorted by publication time. Article encodings and user LSTM states are computed once, and pairs are scored in chunks.
-- **Storing every score as CSV is not feasible** at about 40 bytes per row, hundreds of GB. Section 7 therefore:
+- **Storing every score as CSV is not feasible** at about 64 bytes per row, hundreds of GB. Section 7 therefore:
   1. counts the pairs exactly;
   2. measures the CSV row size and the scoring speed;
   3. checks free disk space;
-  4. stops before scoring if the estimated time exceeds `MAX_CATALOGUE_HOURS`.
+  4. skips scoring in that session if the estimated time exceeds `MAX_CATALOGUE_HOURS`. The run is still recorded, and the remaining splits can be scored later with `RESUME_RUN_ID` and a smaller `CATALOGUE_SPLITS`. Each finished split writes `catalogue/{split}.json` last, so a resumed run reuses finished splits.
 - **Text-vector coverage is low for test.** The test catalogue has 125,541 articles, but only about 21,000 have text vectors. These articles are kept, with missingness flags, and training hides 20% of candidate text vectors so the model learns to score without them. Section 4 reports pair-weighted coverage, and Section 7 reports the text-vector share inside the shortlists.
 - **An age limit would shrink the pool,** but it changes the task. Section 4 tabulates pairs and known-click eligibility for a few limits as evidence for the group's decision. It is not applied by default.
 
