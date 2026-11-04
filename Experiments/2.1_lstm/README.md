@@ -1,14 +1,26 @@
 # 2.1 LSTM with target-aware attention
 
-**Owner:** Winston Ho Rui Wei. A previous L4 smoke run completed successfully.
-The final tuned, all-request schema-v4 workflow below has **not yet been run**.
-The updated code passed syntax checks and tiny synthetic input-preparation,
-scoring, export, metric and saved-copy reload checks without training or Optuna.
-Those checks establish code behaviour on the fixture, not full-data results.
+**Owner:** Winston Ho Rui Wei. The initial tuned run
+`20261104_014914_seed42` completed training, all-request exports and the persistent
+reload check. Its full-validation known-click Recall@100 was **72.73%** across
+29,110 requests. These are development results, not final holdout performance.
 
 The model learns personal click relevance from recorded slates, then scores every
-eligible article and retains the genuine top 200 for Stage 2 business reranking
-to five recommendations. Unshown article outcomes remain unknown.
+eligible article. The working shortlist is the first 100 ranked articles; the
+next 100 are retained as a buffer. The separate business reranker produces the
+final five recommendations. Unshown article outcomes remain unknown.
+
+## Notebook sequence
+
+The numbering identifies stages within the `2.1_lstm` experiment family. Run IDs,
+helper-module names and persistent artifact locations remain unchanged.
+
+| Notebook | Purpose and status |
+| --- | --- |
+| [2.1.1 Initial LSTM run](2.1.1_initial_run.ipynb) | Completed tuned experiment, all-request prediction exports and reload evidence. |
+| [2.1.2 LSTM ablation study](2.1.2_ablation_study.ipynb) | Completed component comparisons, baselines and freshness blending, with saved outputs. |
+| 2.1.3 Improved LSTM run | Planned: larger checkpoint-selection sample, inference improvements and A100 evaluation. No notebook is included yet. |
+| 2.1.4 Model explainability | Planned: interpretation of the selected saved model and named inputs. No LIME/SHAP notebook is included yet. |
 
 ## Model and course connection
 
@@ -27,9 +39,9 @@ training-only candidate text dropout teaches this fallback. Missing vectors neve
 exclude an otherwise eligible article. Fitted transformations use training
 requests/history only and are reused unchanged at inference.
 
-## Run the notebook
+## Reproduce the initial run
 
-1. Open `experiment.ipynb` in a Colab L4 GPU runtime.
+1. Open `2.1.1_initial_run.ipynb` in a Colab L4 GPU runtime.
 2. Upload `lstm_data.py` and `lstm_model.py` to `/content`, beside the notebook.
    Locally, keep both helpers beside the notebook and use that working directory.
 3. Add the shared Drive folder shortcut at
@@ -56,7 +68,28 @@ article size `{64,128}`, dropout `0.1–0.4`, learning rate `3e-4–3e-3` (log),
 decay `1e-6–1e-3` (log), and history dropout `0–0.3`. All seven winning settings
 are applied before final fitting. Exact eligible-pair counts, retained-output
 size estimates and available space are printed before training; export progress
-reports elapsed time and an ETA. Full-run runtime remains unmeasured.
+reports elapsed time and an ETA. In the completed L4 run, final training took
+about three minutes and catalogue scoring/export took about 67 minutes.
+
+## Ablation study
+
+`2.1.2_ablation_study.ipynb` retains the completed comparisons and their saved
+outputs. It covers recency baselines, history encoding, attention, article
+representations, seed variation and freshness blending. To reproduce comparisons, upload
+`ablation_variants.py` alongside the two main helpers and run setup before the
+experiment sections. The initial model's hyperparameters and preprocessing are
+reused; trained controls receive a common four-epoch budget.
+
+The reporting sample contains 5,000 validation requests and excludes the 2,000
+reserved selection requests. The freshness weight is selected on the latter
+sample. The project holdout remains unused. This sample supports within-study
+comparisons; it does not replace the all-request handoff below.
+
+In a fresh CPU runtime, Section 13 reloads all saved metrics, including blend
+results, without helpers or model execution. Sections 14 and 15 then reload the
+saved segment and coverage reports. These tables average available seeds and
+identify them explicitly. The original paired comparison outputs remain in the
+notebook; the compact summary does not recompute confidence intervals.
 
 ## Inputs, catalogue and selection
 
@@ -120,8 +153,10 @@ Schema v4 exports the following compressed Parquets for **every request**:
 Rank by descending score, then ascending original article ID. Return
 `min(200, eligible_count)` unique IDs without padding or inserting clicked/slate
 articles. Pair scores contain **only the top 200**, not all eligible articles.
-No exhaustive score matrix is exported. `selection_k=100`, `export_k=200`,
-`shortlist_size=200`, and `final_display_size=5` are saved explicitly.
+No exhaustive score matrix is exported. The initial run records
+`selection_k=100`, `export_k=200`, `shortlist_size=200`, and
+`final_display_size=5`. Those historical configuration values are preserved;
+the working cutoff is now the first 100, with the remaining 100 kept in reserve.
 Training predictions are in-sample diagnostics, not out-of-fold stacking inputs.
 Scores are uncalibrated logits; no calibrated probabilities are claimed.
 
@@ -153,15 +188,30 @@ documented pre-request context and fixed-history inputs.
 
 ## Handoff and later evaluation
 
-The reranking owner receives all splits' genuine top-200 scores/rankings,
-complete recorded-slate diagnostics and the model/run bundle. Join labels by
-original IDs; preserve Stage 1 ranks/scores during business reranking to five.
+The initial run provides the cross-model evaluator with the following files
+under `DATA_ROOT/Experiments/2.1_lstm/20261104_014914_seed42/`:
+
+| File | Validation coverage |
+| --- | --- |
+| `rankings/validation/submission_top_200.parquet` | All 29,110 requests, with string `behaviour_id` and an ordered native int64 list of 200 article IDs. Use the first 100 for the working shortlist. |
+| `run_config.json` | Split declaration, catalogue policy, input sources, seed, score meaning and run configuration. |
+| `diagnostics/recorded_slates/validation_scores.parquet` | All 344,666 original candidate rows across the 29,110 requests: `behaviour_id`, `article_id`, `score`. |
+| `predictions/validation/submission_article_scores.parquet` | Scores and ranks for the retained 200 articles per request. |
+
+The saved export manifest records complete validation request coverage. The
+evaluator should align models by the exact composite behaviour IDs, the same
+catalogue and publication-time eligibility policy. A smaller common sample, if
+used by the team, must be declared once and shared across models. The ablation
+sample must not be substituted silently for these full-validation exports.
+
+Join labels to recorded-slate scores by original IDs for AUC; unshown catalogue
+articles are not labelled non-clicks. Preserve Stage 1 ranks and scores during
+business reranking. Training predictions are in-sample and must not be described
+as out-of-fold inputs for a learned reranker.
 Observed-click recovery is affected by exposure bias and catalogue coverage and
 does not establish unseen-article CTR, retention or profit.
 
-The planned later evaluation notebook described in [the shared experiment
-README](../README.md) will load saved artifacts without retraining and compare
-models on identical validation requests/pools. Learning curves, Optuna plots,
-ablations, history/coverage subgroups, meaningful feature/history explanations and
-Stage 2 trade-offs belong there. Attention weights alone are not causal
-explanations.
+The planned improved run and later explainability work remain separate from
+this completed study. Cross-model and Stage 2 evaluation should use the shared
+protocol in [the experiment README](../README.md). Attention weights alone are
+not causal explanations.
