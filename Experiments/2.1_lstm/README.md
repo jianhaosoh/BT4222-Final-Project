@@ -194,11 +194,29 @@ features, vocabularies, article mappings and frozen inputs are retained as befor
 The completed notebooks and their outputs are unchanged by this implementation.
 No ensemble or explainability notebook is added.
 
+## Saved run locations
+
+The completed initial run and ablation study keep their original locations.
+Notebook numbering does not relocate their artifacts or require rerunning them.
+Only the new improved run writes into its numbered stage folder:
+
+```text
+Experiments/2.1_lstm/
+  20261104_014914_seed42/           # completed initial run
+  ablation/ablation_v1/            # completed ablation study
+  2.1.3_improved_run/<run_id>/      # new improved run
+```
+
+The improved notebook reads the initial model from the existing path. Its setup
+creates its own output folder and does not reorganise historical files.
+
 ## Outputs and persistent model bundle
 
 Local Colab outputs are `/content/lstm_outputs/<run_id>/` (locally,
 `outputs/<run_id>/` beside the helpers). The persistent destination is
-`DATA_ROOT/Experiments/2.1_lstm/<run_id>/`. Completed study snapshots and epoch
+`DATA_ROOT/Experiments/2.1_lstm/<run_id>/` for the initial run and
+`DATA_ROOT/Experiments/2.1_lstm/2.1.3_improved_run/<run_id>/` for the improved run.
+Completed study snapshots and epoch
 checkpoints are copied during the run; the selected inference bundle is persisted
 before the long catalogue export. Exact interruption resumption is not claimed.
 
