@@ -196,9 +196,10 @@ No ensemble or explainability notebook is added.
 
 ## Saved run locations
 
-The completed initial run and ablation study keep their original locations.
-Notebook numbering does not relocate their artifacts or require rerunning them.
-Only the new improved run writes into its numbered stage folder:
+The completed initial run and ablation study remain at their original locations
+unless the separate organiser is explicitly run. Notebook numbering does not
+relocate artifacts or require rerunning experiments. New improved outputs use
+their numbered stage folder:
 
 ```text
 Experiments/2.1_lstm/
@@ -207,8 +208,26 @@ Experiments/2.1_lstm/
   2.1.3_improved_run/<run_id>/      # new improved run
 ```
 
-The improved notebook reads the initial model from the existing path. Its setup
-creates its own output folder and does not reorganise historical files.
+The improved notebook reads the initial model from either its existing path or
+`2.1.1_initial_run/<run_id>/`. Its setup creates its own output folder and does
+not reorganise historical files.
+
+### One-time organisation of existing folders
+
+Run [`organise_lstm_outputs.py`](organise_lstm_outputs.py) where Drive is mounted,
+before starting an experiment. The default is a preview:
+
+```bash
+python organise_lstm_outputs.py "/content/drive/MyDrive/Colab Notebooks/BT4222 Shared Final Folder"
+```
+
+Add `--apply` to perform the listed directory renames. The resulting locations
+are `2.1.1_initial_run/<run_id>/`, `2.1.2_ablation_study/ablation_v1/` and
+`2.1.3_improved_run/<run_id>/`. The script does not train models, copy large
+artifacts, rewrite metadata or change notebook files and their embedded outputs.
+Completed notebooks retain their historical paths; a later refresh of their
+load-only cells must point to the moved folder. The improved notebook supports
+both initial-model locations already.
 
 ## Outputs and persistent model bundle
 
