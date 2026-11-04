@@ -19,7 +19,7 @@ helper-module names and persistent artifact locations remain unchanged.
 | --- | --- |
 | [2.1.1 Initial LSTM run](2.1.1_initial_run.ipynb) | Completed tuned experiment, all-request prediction exports and reload evidence. |
 | [2.1.2 LSTM ablation study](2.1.2_ablation_study.ipynb) | Completed component comparisons, baselines and freshness blending, with saved outputs. |
-| 2.1.3 Improved LSTM run | Planned: larger checkpoint-selection sample, inference improvements and A100 evaluation. No notebook is included yet. |
+| [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Prepared, not yet executed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, and batched catalogue inference. |
 | 2.1.4 Model explainability | Planned: interpretation of the selected saved model and named inputs. No LIME/SHAP notebook is included yet. |
 
 ## Model and course connection
@@ -93,6 +93,10 @@ notebook; the compact summary does not recompute confidence intervals.
 
 ## Inputs, catalogue and selection
 
+The following input and catalogue conventions are shared by the initial and
+improved runs. The 100-request selection description refers to the completed
+initial run; the improved run uses 2,000 requests as described below.
+
 Inputs live under `DATA_ROOT`:
 
 - `feature_engineering/{split}_features.parquet`: existing recorded candidate
@@ -133,6 +137,63 @@ including missed/ineligible clicks. Unshown articles' zero observed gain is
 retrieval bookkeeping, not a non-click label. Validation is repeatedly used
 **development** data. Project test labels are kept on disk for final evaluation and masked during development.
 
+## Improved run: single LSTM with tuned freshness
+
+`2.1.3_improved_run.ipynb` is prepared for an **A100 GPU with High RAM**. Upload
+[`lstm_helpers.zip`](lstm_helpers.zip) to the Colab runtime, open the notebook and
+run the cells in order. The notebook extracts `lstm_data.py`, `lstm_model.py` and
+`lstm_inference.py`. The same shared Drive shortcut and completed initial run
+`20261104_014914_seed42` must be accessible. No GitHub authentication is needed.
+
+The model reuses the neural hyperparameters selected by the initial Optuna study
+and fits a fresh seed-42 network on all training requests. At each epoch, the
+same fixed 2,000 validation requests select a freshness weight from
+`{0, 0.25, 0.5, 1, 2, 4, 8, 16, 64}`. All weights share one catalogue-scoring
+pass for that checkpoint. Optuna records the grid evaluations, their epochs and
+their retrieval metrics; a weight trial does not train another neural model.
+
+The final score is `neural_logit - weight * log1p(age_hours)`. Selection maximises
+known-click Recall@100, then nDCG@100; smaller weights break within-epoch ties
+and earlier epochs win equal checkpoint metrics. The learning-rate scheduler
+and early stopping use the best blended selection score. The initial neural
+tuning summary, all new trial history and per-epoch freshness curves are saved.
+The completed ablation's 5,000 reporting requests exclude these 2,000 requests.
+Full validation remains development evaluation; project-test outcomes stay masked.
+
+`lstm_inference.py` changes inference and serialisation, not the architecture:
+
+- Cache article encodings and user histories, then batch 16 requests against
+  candidate tiles totalling at most 131,072 pairs by default.
+- Keep attention and the prediction head in float32. Encode float32 score order
+  and original article-ID rank into exact integer top-k keys, without epsilon
+  adjustments or per-chunk CPU selection.
+- Transfer retained scores/IDs to CPU once per request block. Write column arrays
+  in Parquet groups of up to 1,024 requests instead of creating a Python dictionary
+  for every retained article. Copy completed files from local storage to Drive
+  once; final metadata saving does not copy the large exports a second time.
+
+Before training, the notebook compares the original and batched scorers on 32
+declared requests using the initial saved weights. It checks numerical agreement,
+top-100/200 membership and ordering, and records timings excluding cache creation.
+The real GPU benchmark has not been run during preparation; no speedup is claimed.
+
+Export every split's genuine top 200 with the same schema and eligibility policy.
+Use the first 100 as the working shortlist. Full validation reports the blended
+model, its unblended neural scores and newest-first on all 29,110 requests; the
+raw-neural comparison reuses the same scoring pass. These comparisons do not
+select the freshness weight. Recorded-slate exports contain the final blended
+scores for optional AUC evaluation; raw neural AUC is also reported separately.
+
+The inference bundle additionally contains `model/score_recipe.json` and the new
+helper source. The recipe preserves the selected freshness weight, score meaning
+and age convention; it must be loaded with the model. Scores are uncalibrated
+ranking values, not probabilities. Reload checks cover neural logits, blended
+slate scores and persisted catalogue rankings/scores, with no refitting. Named
+features, vocabularies, article mappings and frozen inputs are retained as before.
+
+The completed notebooks and their outputs are unchanged by this implementation.
+No ensemble or explainability notebook is added.
+
 ## Outputs and persistent model bundle
 
 Local Colab outputs are `/content/lstm_outputs/<run_id>/` (locally,
@@ -145,7 +206,7 @@ Schema v4 exports the following compressed Parquets for **every request**:
 
 | File | Contents |
 | --- | --- |
-| `predictions/{split}/submission_article_scores.parquet` | Genuine retained top-200 pairs: string `behaviour_id`, int64 `article_id`, 1-based integer `rank`, float32 `score` (click logit). |
+| `predictions/{split}/submission_article_scores.parquet` | Genuine retained top-200 pairs: string `behaviour_id`, int64 `article_id`, 1-based integer `rank`, float32 `score` (initial-run neural logit or improved-run blended score). |
 | `rankings/{split}/submission_top_200.parquet` | One row/request with string `behaviour_id` and native `list<int64>` `article_ids` in identical rank order; empty pools are `[]`. |
 | `predictions/{split}/eligibility_manifest.parquet` | Every request's ID, exact timestamp, eligible count and shortlist length. |
 | `diagnostics/recorded_slates/{split}_scores.parquet` | Every original recorded candidate, including non-clicks and ineligible candidates: `behaviour_id`, `article_id`, `score`. Original labels are joined separately. |
@@ -158,7 +219,9 @@ No exhaustive score matrix is exported. The initial run records
 `final_display_size=5`. Those historical configuration values are preserved;
 the working cutoff is now the first 100, with the remaining 100 kept in reserve.
 Training predictions are in-sample diagnostics, not out-of-fold stacking inputs.
-Scores are uncalibrated logits; no calibrated probabilities are claimed.
+Initial-run scores are uncalibrated neural logits. Improved-run scores include
+the saved freshness term and are uncalibrated ranking values. Neither is claimed
+to provide calibrated probabilities.
 
 The reloadable `model/` folder contains:
 
@@ -211,7 +274,7 @@ as out-of-fold inputs for a learned reranker.
 Observed-click recovery is affected by exposure bias and catalogue coverage and
 does not establish unseen-article CTR, retention or profit.
 
-The planned improved run and later explainability work remain separate from
-this completed study. Cross-model and Stage 2 evaluation should use the shared
+The prepared improved run and later explainability work remain separate from
+the completed ablation study. Cross-model and Stage 2 evaluation should use the shared
 protocol in [the experiment README](../README.md). Attention weights alone are
 not causal explanations.

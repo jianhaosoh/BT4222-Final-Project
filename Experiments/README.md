@@ -7,6 +7,7 @@ predictions and models without rerunning training notebooks.
 
 - [Initial LSTM run](2.1_lstm/2.1.1_initial_run.ipynb)
 - [LSTM ablation study](2.1_lstm/2.1.2_ablation_study.ipynb)
+- [Improved LSTM run](2.1_lstm/2.1.3_improved_run.ipynb)
 - [HUIM-inspired attention network](2.2_huim/experiment.ipynb)
 - [Pretrained similarity experiment](3.1_pretrained_similarity/experiment.ipynb)
 
