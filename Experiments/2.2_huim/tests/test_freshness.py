@@ -37,6 +37,31 @@ class TestFreshness(unittest.TestCase):
         expected = x - 2 * torch.log1p(age).float()
         torch.testing.assert_close(self.f.blend(x, age, 2.), expected, rtol=0, atol=0)
 
+    def test_notebook_logging_supports_messages_and_stage_context(self):
+        import ast
+        from huim.io_utils import RunLogger
+        notebook = Path(__file__).resolve().parents[1]/'2.2.2_freshness_run.ipynb'
+        setup = ast.parse(''.join(json.loads(notebook.read_text())['cells'][2]['source']))
+        nodes, started = [], False
+        for node in setup.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) \
+                    and isinstance(node.value.func, ast.Name) and node.value.func.id == 'RunLogger':
+                started = True
+            if started:
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) \
+                        and isinstance(node.value.func, ast.Name) and node.value.func.id == 'log':
+                    break
+                nodes.append(node)
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = {'RunLogger': RunLogger, 'RUN_DIR': Path(tmp)}
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), '<notebook logging>', 'exec'), scope)
+            scope['log']('Run:', 42, '| freshness:', 2)
+            with scope['log'].stage('check'):
+                scope['log']('one message')
+            content = (Path(tmp)/'logs'/'run.log').read_text()
+            self.assertIn('Run: 42 | freshness: 2', content)
+            self.assertIn('[done] check', content)
+
     def test_scorer_matches_original_neural_and_blended_reference(self):
         from test_static import synthetic_world, make_model
         from huim.catalogue import CatalogueScorer
