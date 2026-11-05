@@ -20,7 +20,7 @@ helper-module names and persistent artifact locations remain unchanged.
 | [2.1.1 Initial LSTM run](2.1.1_initial_run.ipynb) | Completed tuned experiment, all-request prediction exports and reload evidence. |
 | [2.1.2 LSTM ablation study](2.1.2_ablation_study.ipynb) | Completed component comparisons, baselines and freshness blending, with saved outputs. |
 | [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Completed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, all-request exports and saved-model reload; validation Recall@100 91.61%. |
-| [2.1.4 Model explainability](2.1.4_explainability.ipynb) | Prepared: course-aligned attention examples, exact freshness decomposition and supporting input sensitivity on 200 fixed validation requests; no retraining. |
+| [2.1.4 Model explainability](2.1.4_explainability.ipynb) | Completed: 200 fixed validation requests, 1,724 explanation pairs, attention and freshness examples, input sensitivity and persistent report reload; findings included. |
 
 For explainability, upload `lstm_explainability_helpers.zip` to a fresh Colab
 GPU / High RAM runtime and run `2.1.4_explainability.ipynb`. Original training
