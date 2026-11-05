@@ -22,10 +22,10 @@ helper-module names and persistent artifact locations remain unchanged.
 | [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Completed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, and batched catalogue inference. |
 | 2.1.4 Model explainability | Planned: interpretation of the selected saved model and named inputs. No LIME/SHAP notebook is included yet. |
 
-The completed test prediction refresh is included in Section 7 of the improved
-run notebook. It reuses the selected model and replaces test files in the same
-Drive run folder. Original validation exports and metrics still use the larger
-catalogue.
+The improved notebook follows one end-to-end path: load the shared SMALL
+catalogue, fit and select the model, export all splits, and reload the saved
+score. Train, validation and test use the same 20,738 article IDs with the
+shared publication-time eligibility rule.
 
 ## Model and course connection
 
