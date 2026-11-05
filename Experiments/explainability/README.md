@@ -6,11 +6,24 @@ tuning, reranking, or changing their evaluator exports:
 - [2.1.4 LSTM + freshness](../2.1_lstm/2.1.4_explainability.ipynb)
 - [2.2.3 HUIM + freshness](../2.2_huim/2.2.3_explainability.ipynb)
 
-Both are prepared for Colab; the actual findings must come from their executed
-outputs. Each uses the same 200 validation request IDs and explanation pairs.
+Both completed on an L4 GPU, with all cell outputs preserved and findings in
+Section 9. Each explains the same 200 validation requests (179 readers) and
+1,724 candidate pairs. Saved-score agreement and persistent report reload passed.
+The report runs are `20261105_171932_seed42` (LSTM) and
+`20261105_172058_seed42` (HUIM).
 The source runs are pinned in `explain_common.MODEL_RUNS` to the completed final
 LSTM and HUIM freshness bundles. Both source folders must be accessible through
 the live shortcut to `BT4222 Shared Final Folder`.
+
+In both models, metadata and the event-history pathway produced the largest
+changes under the declared input replacements. Attention varied with the
+candidate; deleting the highest-weight event changed scores more than deleting
+the lowest-weight event for six of seven distinct LSTM case candidates and all
+seven HUIM case candidates. These are local diagnostics, not causal effects or
+evidence that one model's attention is better. Both models also placed a clicked
+40-hour-old article outside the working top 100, illustrating the freshness
+trade-off. The notebook findings discuss these cases and availability coverage;
+the diagnostics do not change the evaluator's saved rankings.
 
 ## Course grounding
 
