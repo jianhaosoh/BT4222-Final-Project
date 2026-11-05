@@ -24,6 +24,14 @@ in the saved files for final evaluation, but development loaders return `y=None`
 for test. The preview notebook reports holdout schema and counts without targets.
 The split manifest records source data, sampling seeds and membership.
 
+Run [step1_val_test_split.ipynb](step1_val_test_split.ipynb) to prepare these folders
+from `BT4222 Shared/ebnerd_small/`. It also copies the original training files to
+`train_val/train/` and the same **20,738-article SMALL catalogue** to
+`train_val/articles.parquet` and `test/articles.parquet`. The official unlabelled
+testset and LARGE article catalogue are not project inputs. Step 3 reads these
+two SMALL copies; it does not fall back to another catalogue. Existing union
+caches are archived if Step 1 replaces a different catalogue.
+
 ## Four input cases
 
 Choose **one case** for a model experiment. In the table, `{split}` is `train`, `validation`, or `test`.
@@ -325,20 +333,24 @@ python "Preprocessing/embedding_pipeline.py" \
 
 For the full catalogue, omit `--limit 3` and the smoke-test `--output-dir`.
 
-The feature-engineering notebook combines the train/validation and official test
-article catalogues. To prepare vectors for both, pass them in the same order:
+Generate embeddings for the complete SMALL catalogue once, then publish the
+same article-ID-keyed files to both project folders. Already-generated complete
+SMALL embeddings can be published directly without API calls:
 
 ```sh
-python "Preprocessing/embedding_pipeline.py" \
-  --articles /path/to/train_val/articles.parquet /path/to/ebnerd_testset/articles.parquet \
-  --image-embeddings "$EMBEDDING_IMAGES" --output-dir data/embeddings/combined
+python "Preprocessing/publish_article_embeddings.py" \
+  --shared-root "/path/to/BT4222 Shared Final Folder" \
+  --embeddings-dir data/embeddings/ebnerd_small
 ```
 
-Overlapping article IDs keep the first catalogue's snapshot, matching Step 3.
-The current local embedding files cover the 20,738-article SMALL catalogue; extra
-articles from the official test catalogue need vectors generated from that file.
-Use a left join when adding vectors to candidates so missing vectors never remove
-candidate rows.
+Set `--shared-root` to the mounted shared folder in Colab, or its local copy.
+The publisher requires `metadata.json` and both complete embedding files; it
+checks article IDs before copying. It writes `article embeddings/` under both
+`train_val/` and `test/`, preserving encoder provenance and missing-vector rows.
+Test reuses the same vectors, rather than a subset covering only test requests.
+Use a left join when adding vectors to candidates so missing vectors never
+remove candidate rows. Existing experiment results retain their original
+catalogue provenance; changing the input files does not update their metrics or exports.
 
 The script uses the regular API, one document or long-document chunk per request. Successful text vectors
 are checkpointed every 100 rows and on interruption. A separate local
@@ -363,6 +375,7 @@ Default outputs are in `data/embeddings/ebnerd_small/`:
 | --- | --- |
 | `text_embeddings.parquet` | `article_id`, `text_embedding` (768 float32 values), `has_text_embedding`, `status`, `error_code`, `input_hash` |
 | `image_embeddings.parquet` | `article_id`, `image_embedding` (1,024 float32 values), `has_image_embedding`, `status`, `error_code` |
+| `metadata.json` | Source catalogue, encoder, dimensions, status counts and long-text pooling method |
 
 Missing inputs remain null; no article is dropped and no zero vector is invented.
 The inspected SMALL catalogue has 20,738 articles, 18 without usable text. The
