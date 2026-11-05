@@ -4,8 +4,14 @@
 | --- | --- |
 | [experiment.ipynb](experiment.ipynb) | Completed initial HUIM fit, recovered exports and saved-model reload; original outputs preserved |
 | [2.2.2_freshness_run.ipynb](2.2.2_freshness_run.ipynb) | Reload the frozen HUIM fit, tune freshness and export a new ranking recipe without retraining |
+| [2.2.3_explainability.ipynb](2.2.3_explainability.ipynb) | Prepared: actual attention, score decomposition and supporting sensitivity checks on the final saved pipeline |
 
 The initial all-request run `20261104_014752_seed42` and freshness continuation `20261104_234712_freshness_seed42` both completed all exports and passed persistent reload. Their executed outputs and findings are preserved in the respective notebooks.
+
+For explainability, upload `huim_explainability_helpers.zip` to a fresh Colab
+GPU / High RAM runtime and run `2.2.3_explainability.ipynb`. It uses 200 shared
+validation requests and does not retrain or modify handoff files. Reports go to
+`2.2.3_explainability/<run_id>/`; see the [shared protocol](../explainability/README.md).
 
 ## Run the freshness continuation in Colab
 
