@@ -19,8 +19,14 @@ helper-module names and persistent artifact locations remain unchanged.
 | --- | --- |
 | [2.1.1 Initial LSTM run](2.1.1_initial_run.ipynb) | Completed tuned experiment, all-request prediction exports and reload evidence. |
 | [2.1.2 LSTM ablation study](2.1.2_ablation_study.ipynb) | Completed component comparisons, baselines and freshness blending, with saved outputs. |
-| [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Completed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, and batched catalogue inference. |
-| 2.1.4 Model explainability | Planned: interpretation of the selected saved model and named inputs. No LIME/SHAP notebook is included yet. |
+| [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Completed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, all-request exports and saved-model reload; validation Recall@100 91.61%. |
+| [2.1.4 Model explainability](2.1.4_explainability.ipynb) | Completed: 200 fixed validation requests, 1,724 explanation pairs, attention and freshness examples, input sensitivity and persistent report reload; findings included. |
+
+For explainability, upload `lstm_explainability_helpers.zip` to a fresh Colab
+GPU / High RAM runtime and run `2.1.4_explainability.ipynb`. Original training
+helpers are loaded from the saved final bundle. Reports are written to the
+separate `2.1.4_explainability/<run_id>/` shared folder; evaluator exports remain
+unchanged. See the [shared explanation protocol](../explainability/README.md).
 
 The improved notebook follows one end-to-end path: load the shared SMALL
 catalogue, fit and select the model, export all splits, and reload the saved
@@ -145,7 +151,7 @@ retrieval bookkeeping, not a non-click label. Validation is repeatedly used
 
 ## Improved run: single LSTM with tuned freshness
 
-`2.1.3_improved_run.ipynb` is prepared for an **A100 GPU with High RAM**. Upload
+`2.1.3_improved_run.ipynb` runs on an **A100 GPU with High RAM**. Upload
 [`lstm_helpers.zip`](lstm_helpers.zip) to the Colab runtime, open the notebook and
 run the cells in order. The notebook extracts `lstm_data.py`, `lstm_model.py` and
 `lstm_inference.py`. The same shared Drive shortcut and completed initial run
@@ -181,7 +187,8 @@ Full validation remains development evaluation; project-test outcomes stay maske
 Before training, the notebook compares the original and batched scorers on 32
 declared requests using the initial saved weights. It checks numerical agreement,
 top-100/200 membership and ordering, and records timings excluding cache creation.
-The real GPU benchmark has not been run during preparation; no speedup is claimed.
+The completed same-GPU benchmark measured 1.60× faster scoring and 1.88× faster
+top-200 inference, with matching logits and rankings on those 32 requests.
 
 Export every split's genuine top 200 with the same schema and eligibility policy.
 Use the first 100 as the working shortlist. Full validation reports the blended
@@ -198,8 +205,8 @@ scores from the persisted weights and fitted inputs with saved predictions,
 without refitting. Named
 features, vocabularies, article mappings and frozen inputs are retained as before.
 
-The completed notebooks and their outputs are unchanged by this implementation.
-No ensemble or explainability notebook is added.
+The completed notebooks and their outputs remain preserved. No ensemble is used;
+the separate `2.1.4_explainability.ipynb` interprets the final saved pipeline.
 
 ## Saved run locations
 
@@ -318,7 +325,7 @@ as out-of-fold inputs for a learned reranker.
 Observed-click recovery is affected by exposure bias and catalogue coverage and
 does not establish unseen-article CTR, retention or profit.
 
-The prepared improved run and later explainability work remain separate from
+The completed improved run and separate explainability notebook remain separate from
 the completed ablation study. Cross-model and Stage 2 evaluation should use the shared
 protocol in [the experiment README](../README.md). Attention weights alone are
 not causal explanations.

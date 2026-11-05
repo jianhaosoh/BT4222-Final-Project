@@ -10,6 +10,8 @@ predictions and models without rerunning training notebooks.
 - [Improved LSTM run](2.1_lstm/2.1.3_improved_run.ipynb)
 - [HUIM-inspired attention network](2.2_huim/experiment.ipynb)
 - [HUIM with tuned freshness](2.2_huim/2.2.2_freshness_run.ipynb)
+- [LSTM explainability](2.1_lstm/2.1.4_explainability.ipynb)
+- [HUIM explainability](2.2_huim/2.2.3_explainability.ipynb)
 - [Pretrained similarity experiment](3.1_pretrained_similarity/experiment.ipynb)
 
 **Current handoff decision: genuine catalogue top 200 plus separate recorded-slate
