@@ -1,4 +1,6 @@
 xgboost
+lightgbm
+scikit-learn
 numpy
 pandas
 pyarrow
