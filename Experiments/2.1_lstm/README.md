@@ -22,11 +22,10 @@ helper-module names and persistent artifact locations remain unchanged.
 | [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Completed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, and batched catalogue inference. |
 | 2.1.4 Model explainability | Planned: interpretation of the selected saved model and named inputs. No LIME/SHAP notebook is included yet. |
 
-[2.1.3 Test prediction refresh](2.1.3_test_prediction_small.ipynb) records the
-completed SMALL-catalogue test export using the same selected model. Run only
-its three `TEST-ONLY STEP` cells to repeat that export; helper code is loaded
-from the saved Drive bundle. It replaces test files in the existing run folder.
-The original validation exports and metrics still use the larger catalogue.
+The completed test prediction refresh is included in Section 7 of the improved
+run notebook. It reuses the selected model and replaces test files in the same
+Drive run folder. Original validation exports and metrics still use the larger
+catalogue.
 
 ## Model and course connection
 
