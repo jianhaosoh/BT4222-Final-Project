@@ -5,7 +5,7 @@
 | [experiment.ipynb](experiment.ipynb) | Completed initial HUIM fit, recovered exports and saved-model reload; original outputs preserved |
 | [2.2.2_freshness_run.ipynb](2.2.2_freshness_run.ipynb) | Reload the frozen HUIM fit, tune freshness and export a new ranking recipe without retraining |
 
-The initial all-request run `20261104_014752_seed42` completed and passed persistent reload. The freshness continuation is prepared for execution; its results must come from its executed outputs.
+The initial all-request run `20261104_014752_seed42` and freshness continuation `20261104_234712_freshness_seed42` both completed all exports and passed persistent reload. Their executed outputs and findings are preserved in the respective notebooks.
 
 ## Run the freshness continuation in Colab
 
