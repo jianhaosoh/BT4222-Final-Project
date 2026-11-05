@@ -124,7 +124,7 @@ def generate_embeddings(articles_path: Path | list[Path], image_path: Path, outp
         if frame["article_id"].isna().any() or frame["article_id"].duplicated().any():
             raise ValueError("Each catalogue must have non-null, unique article IDs")
         frames.append(frame)
-    # Match step3_feature_engineering: train/validation catalogue first, then test.
+    # Overlapping IDs keep the first supplied catalogue snapshot.
     articles = pd.concat(frames, ignore_index=True).drop_duplicates("article_id", keep="first").sort_values("article_id")
     if limit is not None:
         articles = articles.head(limit)
@@ -185,6 +185,24 @@ def generate_embeddings(articles_path: Path | list[Path], image_path: Path, outp
             save_text(rows, text_path)
         if owned_client:
             client.close()
+    metadata = {
+        "source_catalogues": [str(path) for path in paths],
+        "articles": len(articles),
+        "text_model": model, "text_dimension": dimension,
+        "image_source": "ebnerd_supplied", "image_dimension": 1024,
+        "counts": {
+            "text": pd.Series([row["status"] for row in rows]).value_counts().to_dict(),
+            "image": images["status"].value_counts().to_dict(),
+        },
+        "long_text_processing": {
+            "max_chunk_tokens": MAX_TEXT_TOKENS,
+            "pooling": "token-count-weighted mean followed by L2 normalisation",
+        },
+    }
+    if len(paths) == 1:
+        with paths[0].open("rb") as source:
+            metadata["catalogue_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Saved separate text and image vectors in {output_dir}")
 
 

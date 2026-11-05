@@ -84,8 +84,12 @@ Use the 3.1 policy **`published_at_or_before_request_v1`** for shared comparison
 
 1. Construct one ordered union from `train_val/articles.parquet`, then
    `test/articles.parquet`, for **every** split. Keep the first source record for
-   each article ID, including its missing fields. Do not use separate smaller
-   train/validation and larger test pools for a like-for-like comparison.
+   each article ID, including its missing fields. Both files must contain the same
+   **20,738-article EB-NeRD SMALL catalogue**, prepared by Step 1. The official
+   testset and LARGE catalogues are not inputs to the labelled project splits.
+   Use the complete SMALL embeddings in both folders, retaining missing-vector
+   candidates. Older runs using a larger union keep their original provenance;
+   their exports and metrics must be regenerated before a SMALL-only comparison.
 2. An article is eligible only when its publication timestamp is known and
    `published_time <= impression_time`. Unknown dates and future publications are
    excluded; original known clicks on those articles still count in metric ideals.

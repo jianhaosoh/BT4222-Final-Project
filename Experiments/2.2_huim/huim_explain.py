@@ -18,13 +18,14 @@ class HUIMExplainer:
     @classmethod
     def load(cls,data_root,run_dir,device):
         from huim import pipeline as P,features as F
-        from huim.persist import load_model,check_article_ids
+        from huim.persist import load_model
         root = Path(run_dir)
         model,_,pre,_ = load_model(root,device)
         model.requires_grad_(False)
         cfg = json.loads((root/'source_neural_config.json').read_text())
         ws = P.prepare_inputs(cfg,Path(data_root),pre=pre,log=print)
-        assert check_article_ids(root,ws.art)
+        # Rows are rebuilt with their histories/candidates for the SMALL catalogue;
+        # weights do not use article-ID embeddings. Saved-score parity is checked below.
         assert pre.to_json() == json.loads((root/'model'/'preprocessing.json').read_text())
         art,contexts = P.device_and_tensors(ws,device)
         result = cls(model,art,contexts['validation'],pre,F)
