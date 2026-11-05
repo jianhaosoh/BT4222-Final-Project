@@ -1,7 +1,7 @@
 """Ablation switches, comparators and evaluation helpers for 2.1_lstm.
 
-Used by ``ablation.ipynb``. This module only *adds* behaviour around the main
-experiment code: ``lstm_model.py`` and ``lstm_data.py`` are imported, never
+Used by ``2.1.2_ablation_study.ipynb``. This module only *adds* behaviour around
+the main experiment code: ``lstm_model.py`` and ``lstm_data.py`` are imported, never
 edited. Every ablation keeps the tuned main-run settings and changes one thing.
 
 Model-side switches (``AblationConfig``), applied by subclassing:

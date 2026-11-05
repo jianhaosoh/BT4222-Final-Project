@@ -1,8 +1,23 @@
 # 2.2_huim — Candidate-aware attention for relevance shortlisting
 
-The final notebook runs one path: **12 Optuna trials → apply the winning settings → fit all recorded training requests → restore the selected checkpoint → export every request → save and reload from shared Drive**.
+| Notebook | Purpose |
+| --- | --- |
+| [experiment.ipynb](experiment.ipynb) | Completed initial HUIM fit, recovered exports and saved-model reload; original outputs preserved |
+| [2.2.2_freshness_run.ipynb](2.2.2_freshness_run.ipynb) | Reload the frozen HUIM fit, tune freshness and export a new ranking recipe without retraining |
 
-Earlier bounded Colab checks completed training and saved-model reload; the plotting-directory error discovered there was fixed. Those checks do not establish the results or coverage of this updated final workflow. The final tuned all-request run has not been executed. Notebook outputs are cleared for that execution.
+The initial all-request run `20261104_014752_seed42` and freshness continuation `20261104_234712_freshness_seed42` both completed all exports and passed persistent reload. Their executed outputs and findings are preserved in the respective notebooks.
+
+## Run the freshness continuation in Colab
+
+1. Open `2.2.2_freshness_run.ipynb` in a fresh **A100 GPU / High RAM** runtime.
+2. Upload **`huim_freshness_helpers.zip`** to `/content`, leaving it zipped. This ZIP contains the new `huim_freshness.py` extension. The original `huim_helpers.zip` is not needed for this continuation.
+3. Keep the live Drive shortcut to `BT4222 Shared Final Folder` under `MyDrive/Colab Notebooks` (or directly under `MyDrive`). Run all and authorise Drive. No settings changes are needed for the existing completed source run.
+4. The notebook loads the initial run's own saved code, weights and preprocessing. It selects freshness on the shared 2,000-request validation sample, reports on the separate 5,000 requests and exports every request in validation, holdout and train, in that order.
+5. Wait for **`Persistent numerical reload passed: True`**, then download the executed notebook. The full run stays in `Experiments/2.2_huim/2.2.2_freshness_run/<run_id>/` on shared Drive.
+
+The new bundle preserves the original model and adds `model/score_recipe.json`, the freshness selection/trial history and all handoff artifacts. The working cutoff is 100; top 200 is the export buffer. Schema v5 exports a generic blended `score` without `click_probability`; recorded-slate diagnostics contain every original pair separately. The remaining sections document the initial fit and its original v4 exports.
+
+The initial notebook runs one path: **12 Optuna trials → apply the winning settings → fit all recorded training requests → restore the selected checkpoint → export every request → save and reload from shared Drive**.
 
 Course connection: the implementation combines categorical embeddings, attention, feature interactions, dense networks and dropout/weight-decay regularisation. The complete HUIM-inspired architecture is an adaptation rather than a model taught as a whole in class.
 
