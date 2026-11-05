@@ -2,7 +2,7 @@
 
 **Owner:** Winston Ho Rui Wei. The initial tuned run
 `20261104_014914_seed42` completed training, all-request exports and the persistent
-reload check. Its full-validation known-click Recall@100 was **72.73%** across
+reload check. Its full-validation known-click Recall@100 was **76.50%** across
 29,110 requests. These are development results, not final holdout performance.
 
 The model learns personal click relevance from recorded slates, then scores every
@@ -47,8 +47,9 @@ requests/history only and are reused unchanged at inference.
 ## Reproduce the initial run
 
 1. Open `2.1.1_initial_run.ipynb` in a Colab L4 GPU runtime.
-2. Upload `lstm_data.py` and `lstm_model.py` to `/content`, beside the notebook.
-   Locally, keep both helpers beside the notebook and use that working directory.
+2. Upload `lstm_helpers.zip` to `/content`. It contains `lstm_data.py`,
+   `lstm_model.py` and `lstm_inference.py`. Locally, keep the three helpers beside
+   the notebook and use that working directory.
 3. Add the shared Drive folder shortcut at
    `/content/drive/MyDrive/Colab Notebooks/BT4222 Shared Final Folder`.
    This is `DATA_ROOT`; local execution can set it to the local shared-data copy.
@@ -192,8 +193,9 @@ scores for optional AUC evaluation; raw neural AUC is also reported separately.
 The inference bundle additionally contains `model/score_recipe.json` and the new
 helper source. The recipe preserves the selected freshness weight, score meaning
 and age convention; it must be loaded with the model. Scores are uncalibrated
-ranking values, not probabilities. Reload checks cover neural logits, blended
-slate scores and persisted catalogue rankings/scores, with no refitting. Named
+ranking values, not probabilities. Reload checks compare 128 recorded-candidate
+scores from the persisted weights and fitted inputs with saved predictions,
+without refitting. Named
 features, vocabularies, article mappings and frozen inputs are retained as before.
 
 The completed notebooks and their outputs are unchanged by this implementation.
