@@ -1,0 +1,7 @@
+numpy>=1.26
+pandas>=2.2
+pyarrow>=15
+scikit-learn>=1.4
+torch>=2.3
+sentence-transformers>=3
+huggingface-hub>=0.23

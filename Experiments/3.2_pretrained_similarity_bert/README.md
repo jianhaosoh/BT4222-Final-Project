@@ -10,8 +10,8 @@ This experiment uses a sentence-embedding model, not plain BERT hidden states.
 
 Defaults: title/subtitle/full body, latest 10 past clicks, seed 42,
 1,000 validation requests, 1,000 validation exports, 25 train/test exports.
-Output: `rankings/<split>/submission_top_200.csv` with request IDs, article-ID
-lists and aligned cosine-similarity lists. No classifier fitting or fine-tuning.
+Output: `rankings/<split>/submission_top_200.parquet` with request IDs and ordered
+article-ID lists. Aligned scores are stored in `submission_top_200_scores.parquet`. No classifier fitting or fine-tuning.
 
 Long articles are split into nonoverlapping model-token windows. Each window's
 vector is normalized, then pooled by content-token count and normalized again.
@@ -30,6 +30,44 @@ The actual shared Drive embedding generation must be run in Colab. Local checks
 use synthetic fixtures and do not establish recommendation quality or runtime.
 
 Model documentation: https://huggingface.co/sentence-transformers/distiluse-base-multilingual-cased-v2
+
+## Separate text-variant notebooks
+
+| Notebook | `TEXT_VARIANT` | Article text | Default experiment/cache ID |
+| --- | --- | --- | --- |
+| `bert_title_subtitle.ipynb` | `title_subtitle` | Title + subtitle | `3.2_pretrained_similarity_bert_title_subtitle` |
+| `bert_title_subtitle_intro.ipynb` | `title_subtitle_intro` | Title + subtitle + first 1,000 stripped body characters | `3.2_pretrained_similarity_bert_title_subtitle_intro` |
+| `bert_full.ipynb` | `title_subtitle_body` | Title + subtitle + full body | `3.2_pretrained_similarity_bert_full` |
+
+All three share `catalogue_pipeline.py`, use latest-10 mean-profile cosine by
+default, and retain 1,000 fixed validation requests/seed 42 for controlled text
+comparison. `history_aggregation` can be changed explicitly for a separate
+history experiment. Their outputs are separated by EXPERIMENT_ID and run ID.
+Optional genuine held-out test evaluation is disabled until EVALUATE_TEST=True.
+
+Matching embeddings already in each experiment's cache are reused. To reuse a
+matching cache under a legacy folder name, change EMBEDDING_EXPERIMENT_ID to the
+old ID without changing the output EXPERIMENT_ID. Inputs, encoder revision and
+text variant still must match. A source-fingerprint change requires a fresh
+cache or an explicit audited reuse of existing ID-matched vectors; do not silently
+mix vectors generated from different article content.
+
+## Native-list Parquet shortlist
+
+The canonical output is `rankings/<split>/submission_top_200.parquet`, containing
+exactly `behaviour_id` (string) and `article_ids` (native list<int64>). One row is
+one request. The highest-ranked article is first; tie handling is descending
+similarity, then ascending original article ID. Preserve empty lists for empty
+eligible pools. The separate score Parquet retains aligned similarity scores.
+
+All BERT notebooks now include a conversion-only cell for existing completed
+CSV exports: `cp.export_parquet_submissions(WORK, persistent_location)`. Reload
+the updated helper, keep WORK/RUN_ID pointing to the existing completed run, and
+convert without embedding generation or catalogue scoring. The helper updates
+the manifest and copies new files into the existing persistent bundle when its
+path is supplied. For new runs, Parquet export is direct and verified against
+independently recomputed full-catalogue rankings. The canonical Parquet has no score column;
+the manifest identifies the separate score Parquet as the companion source for similarities.
 
 ## Reported validation results
 
@@ -115,3 +153,41 @@ policy. Test AUC/recall/nDCG are not computed by this inference pipeline. Valida
 remains the basis for configuration selection. Re-upload the updated helper and
 use a new run ID after an input release or loader-version change; saved article
 embeddings remain reusable when their article sources and encoder are unchanged.
+
+## Individual-history similarity experiment
+
+`experiment_individual_history.ipynb` compares these retrieval rules with the same
+latest-10 history and request sample:
+
+| `history_aggregation` | Score |
+| --- | --- |
+| `mean_profile` | Original cosine to the normalized average history vector |
+| `max_history` | Maximum candidate-to-history-article cosine |
+| `topk_history` | Mean of the largest 3 candidate-to-history cosines |
+
+Set `history_top_k=3` for the last method; fewer available events use their actual
+count. Select the latest events before dropping missing vectors. Repeated clicks
+retain repeated weight/events. Missing candidates or histories get zero. Individual
+methods require a positive bounded `history_limit` (default 10). Metadata, labels
+and availability flags do not affect ranking. GPU and CPU paths use the same rule.
+
+Start on the same 1,000 validation request IDs. Use a fresh run ID for each method,
+then compare Recall@200 and nDCG@200 with the matching mean-profile baseline. Saved
+article embeddings remain reusable. Source/versioned history caches, score exports,
+recorded-slate diagnostics and reload probes all use the declared aggregation.
+More cosine comparisons are required, so benchmark before full validation. The
+pair budget counts candidate pairs, not the expanded number of history dot products.
+No recommendation quality improvement is claimed before running these experiments.
+
+### Direct Parquet export
+
+New runs create no `submission_top_200.csv`. The two ranking files are:
+
+- `submission_top_200.parquet`: `behaviour_id`, ordered native `article_ids`.
+- `submission_top_200_scores.parquet`: the same request/ID lists plus aligned
+  native `similarity_scores`.
+
+The highest-ranked article remains first. Request eligibility audits may still
+use CSV, but recommendation submissions and score companions are Parquet. Existing
+legacy CSVs can be converted without rescoring; their source files are preserved.
+Saved validation and optional test evaluation now read the Parquet recommendations.

@@ -104,7 +104,8 @@ outcome metrics. Observed clicks do not establish retention gains.
 
 Each run writes:
 
-- `rankings/{split}/submission_top_200.csv`: ordered top-200 IDs and aligned cosine similarity scores per request.
+- `rankings/{split}/submission_top_200.parquet`: one row per `behaviour_id`, with a native ordered `article_ids` integer list.
+- `rankings/{split}/submission_top_200_scores.parquet`: companion file with ordered IDs and aligned similarity scores.
 - `eligibility/{split}_requests.csv`: per-request eligibility and coverage audit.
 - Model JSON, metrics, source/configuration manifests and reload checks.
 
@@ -141,8 +142,8 @@ Earlier hybrid source is archived locally at `Pretrained Models/hybrid_reference
 which is ignored by Git. It is separate from the active similarity-only experiment;
 its checkpoints and probability outputs are not used here.
 
-The shortlist CSV has `behaviour_id,article_ids,similarity_scores`. Both lists
-are JSON arrays of equal length; each score belongs to the ID at the same position.
+The score Parquet has `behaviour_id,article_ids,similarity_scores`. Both lists
+are native arrays of equal length; each score belongs to the ID at the same position.
 Scores are in [-1, 1], with zero as the existing missing-vector/profile fallback.
 Use a new run ID and re-upload the helper after this schema update.
 
@@ -153,3 +154,57 @@ policy. Test AUC/recall/nDCG are not computed by this inference pipeline. Valida
 remains the basis for configuration selection. Re-upload the updated helper and
 use a new run ID after an input release or loader-version change; saved article
 embeddings remain reusable when their article sources and encoder are unchanged.
+
+## Individual-history similarity experiment
+
+`experiment_individual_history.ipynb` compares these retrieval rules with the same
+latest-10 history and request sample:
+
+| `history_aggregation` | Score |
+| --- | --- |
+| `mean_profile` | Original cosine to the normalized average history vector |
+| `max_history` | Maximum candidate-to-history-article cosine |
+| `topk_history` | Mean of the largest 3 candidate-to-history cosines |
+
+Set `history_top_k=3` for the last method; fewer available events use their actual
+count. Select the latest events before dropping missing vectors. Repeated clicks
+retain repeated weight/events. Missing candidates or histories get zero. Individual
+methods require a positive bounded `history_limit` (default 10). Metadata, labels
+and availability flags do not affect ranking. GPU and CPU paths use the same rule.
+
+Start on the same 1,000 validation request IDs. Use a fresh run ID for each method,
+then compare Recall@200 and nDCG@200 with the matching mean-profile baseline. Saved
+article embeddings remain reusable. Source/versioned history caches, score exports,
+recorded-slate diagnostics and reload probes all use the declared aggregation.
+More cosine comparisons are required, so benchmark before full validation. The
+pair budget counts candidate pairs, not the expanded number of history dot products.
+No recommendation quality improvement is claimed before running these experiments.
+
+## Individual-history Parquet handoff
+
+The canonical shortlist is now `rankings/<split>/submission_top_200.parquet` with
+exactly two columns: `behaviour_id` (string) and `article_ids` (native list<int64>).
+Each request has one row. List order is recommendation order, not article-ID
+order, and is preserved exactly from scoring. Lists contain up to 200 unique IDs;
+empty eligible pools retain an empty list. This applies to all three history
+aggregation choices; it does not change ranking or metrics.
+
+New runs write both the Parquet handoff and a separate score-bearing Parquet companion.
+Existing completed runs can call `cp.export_parquet_submissions(WORK, persistent)`
+to convert saved CSVs and copy the new files/manifest to the existing persistent
+run folder. This requires no new embeddings or catalogue scoring. The notebook
+includes the conversion-only cell. Keep WORK pointing to the existing run for
+this format-only conversion; do not accidentally generate a new RUN_ID first.
+
+### Direct Parquet export
+
+New runs create no `submission_top_200.csv`. The two ranking files are:
+
+- `submission_top_200.parquet`: `behaviour_id`, ordered native `article_ids`.
+- `submission_top_200_scores.parquet`: the same request/ID lists plus aligned
+  native `similarity_scores`.
+
+The highest-ranked article remains first. Request eligibility audits may still
+use CSV, but recommendation submissions and score companions are Parquet. Existing
+legacy CSVs can be converted without rescoring; their source files are preserved.
+Saved validation and optional test evaluation now read the Parquet recommendations.

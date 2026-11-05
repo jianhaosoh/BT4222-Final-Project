@@ -129,9 +129,11 @@ class RetrievalChecks(unittest.TestCase):
             connection.close()
             req=('7:10',7,10,'1990-01-01','[]')
             cp.export_split({},[req],db,'validation',root,cat,{}, {},2)
-            frame=pd.read_csv(root/'rankings/validation/submission_top_200.csv')
-            self.assertEqual(frame.article_ids.tolist(),['[]'])
-            self.assertEqual(frame.similarity_scores.tolist(),['[]'])
+            frame=pd.read_parquet(root/'rankings/validation/submission_top_200.parquet')
+            self.assertEqual(frame.article_ids.iloc[0].tolist(),[])
+            scores=pd.read_parquet(root/'rankings/validation/submission_top_200_scores.parquet')
+            self.assertEqual(scores.similarity_scores.iloc[0].tolist(),[])
+            self.assertFalse((root/'rankings/validation/submission_top_200.csv').exists())
             self.assertFalse((root/'predictions').exists())
             cp.validate_export(root,'validation',lambda:iter([req]),cat,db,0,model={},profiles={},vectors={})
 
@@ -153,14 +155,14 @@ class RetrievalChecks(unittest.TestCase):
             manifest=json.loads((root/'work/run_config.json').read_text())
             self.assertEqual(manifest['export_profile'],'top200_only')
             self.assertFalse(manifest['shared_full_score_contract_complete'])
-            frame=pd.read_csv(root/'work/rankings/validation/submission_top_200.csv')
+            frame=pd.read_parquet(root/'work/rankings/validation/submission_top_200_scores.parquet')
             for row in frame.itertuples():
-                ids=json.loads(row.article_ids);scores=json.loads(row.similarity_scores)
+                ids=row.article_ids.tolist();scores=row.similarity_scores.tolist()
                 self.assertEqual(len(ids),len(scores))
                 self.assertTrue(all(-1<=v<=1 for v in scores))
                 self.assertEqual(scores,sorted(scores,reverse=True))
             row=frame.iloc[0]
-            score_map=dict(zip(json.loads(row.article_ids),json.loads(row.similarity_scores)))
+            score_map=dict(zip(row.article_ids.tolist(),row.similarity_scores.tolist()))
             self.assertAlmostEqual(score_map[1],2/np.sqrt(5),places=6)
             self.assertAlmostEqual(score_map[3],1/np.sqrt(5),places=6)
             self.assertFalse(list((root/'work').rglob('*.joblib')))
@@ -170,8 +172,11 @@ class RetrievalChecks(unittest.TestCase):
             model=cp.load_run(second,source)
             replay=cp.execute(second,model)
             self.assertEqual(replay['metrics'],result['metrics'])
-            path=root/'work/rankings/test/submission_top_200.csv'
-            frame=pd.read_csv(path);frame.loc[0,'article_ids']='[4]';frame.to_csv(path,index=False)
+            path=root/'work/rankings/test/submission_top_200.parquet'
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            native=pq.read_table(path).to_pylist();native[0]['article_ids']=[4]
+            pq.write_table(pa.Table.from_pylist(native,schema=cp.shortlist_schemas()[0]),path)
             with self.assertRaisesRegex(ValueError,'Top-200'):
                 cp.validate_export(root/'work','test',lambda:cp.request_iter(prepared['dbs']['test']),prepared['catalogue'],prepared['dbs']['test'],8,
                     model=cp.model_spec(settings),profiles={},vectors=prepared['vectors'])

@@ -21,16 +21,18 @@ from importlib.metadata import version
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from sklearn.metrics import roc_auc_score
 
 SPLITS=('train','validation','test')
 KEYS=['user_id','impression_id','candidate_article_id','impression_time']
-PIPELINE_VERSION='similarity_top200_scores_v5'
+PIPELINE_VERSION='similarity_individual_history_v6'
 POLICY={'name':'published_at_or_before_request_v1',
         'publication_field':'published_time','missing_publication':'exclude',
         'age_limit_hours':None,'access_filter':None,
         'snapshot':'ordered union of declared catalogues; first snapshot wins'}
+TEXT_VARIANT = 'title_subtitle_intro'
 
 def save_json(path, value):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,23 +119,32 @@ def requests(db_path, limit):
     if limit is None: raise ValueError('Use request_iter for full splits')
     return list(request_iter(db_path,limit))
 
+class HistoryProfiles(dict):
+    """History vectors and their aggregation rule, shared by CPU and GPU inference."""
+    def __init__(self,*args,aggregation='mean_profile',top_k=3,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.aggregation=aggregation;self.top_k=top_k
+
 class ProfileLookup:
     """Bounded memory lookup for persistent, fixed history profiles."""
-    def __init__(self,path,dimension):
+    def __init__(self,path,dimension,aggregation='mean_profile',top_k=3):
         self.path=str(path);self.dimension=dimension
+        self.aggregation=aggregation;self.top_k=top_k
         self.connection=sqlite3.connect(self.path)
         self.get=lru_cache(maxsize=1024)(self._get)
     def _get(self,user,default=(None,0.0)):
         row=self.connection.execute('SELECT vector,coverage FROM profiles WHERE user_id=?',(int(user),)).fetchone()
         if row is None:return default
-        return (np.frombuffer(row[0],dtype='float32') if row[0] is not None else None,float(row[1]))
+        profile=np.frombuffer(row[0],dtype='float32') if row[0] is not None else None
+        if profile is not None and self.aggregation!='mean_profile':profile=profile.reshape(-1,self.dimension)
+        return profile,float(row[1])
     def close(self):self.get.cache_clear();self.connection.close()
 
 class SimilarityVectors(dict):
     """CPU-compatible lookups with one optional shared CUDA article table.
 
     No CUDA tensors enter the saved inference specification. CPU replay remains valid.
-    Only one last-used user profile is cached on the GPU, not every user's history.
+    Only one last-used user profile/history matrix is cached on the GPU.
     """
     def __init__(self, vectors, device='auto', min_gpu_batch=256):
         super().__init__(vectors)
@@ -182,7 +193,7 @@ class SimilarityVectors(dict):
                          torch_version=torch.__version__,cuda_version=torch.version.cuda,
                          gpu_name=torch.cuda.get_device_name(0))
 
-    def similarities(self, ids, profile):
+    def similarities(self, ids, profile, aggregation='mean_profile', top_k=3):
         if self._matrix is None or len(ids)<self.min_gpu_batch:
             return None
         torch=self._torch
@@ -195,7 +206,12 @@ class SimilarityVectors(dict):
                 self._last_profile_source=profile
             positions=torch.as_tensor(indices,dtype=torch.long,device=self._matrix.device)
             candidates=self._matrix.index_select(0,positions)
-            result=candidates @ self._last_profile_tensor
+            if aggregation=='mean_profile':
+                result=candidates @ self._last_profile_tensor
+            else:
+                pairwise=candidates @ self._last_profile_tensor.T
+                result=(pairwise.max(dim=1).values if aggregation=='max_history' else
+                        pairwise.topk(min(top_k,profile.shape[0]),dim=1).values.mean(dim=1))
             return result.clamp(-1,1).cpu().numpy()
 
 def semantic_values(ids, user, profiles, vectors):
@@ -204,13 +220,21 @@ def semantic_values(ids, user, profiles, vectors):
     missing=np.fromiter((int(a) not in vectors for a in ids),dtype=bool,count=len(ids))
     result[:,1]=missing;result[:,2]=profile is None;result[:,3]=coverage
     if profile is None or not len(ids):return result
-    accelerated=vectors.similarities(ids,profile) if isinstance(vectors,SimilarityVectors) else None
+    aggregation=getattr(profiles,'aggregation','mean_profile');top_k=getattr(profiles,'top_k',3)
+    accelerated=vectors.similarities(ids,profile,aggregation,top_k) if isinstance(vectors,SimilarityVectors) else None
     if accelerated is not None:
         result[:,0]=accelerated
     else:
-        for i,aid in enumerate(ids):
-            vector=vectors.get(int(aid))
-            if vector is not None:result[i,0]=float(vector@profile)
+        positions=[i for i,a in enumerate(ids) if int(a) in vectors]
+        if positions:
+            candidates=np.stack([vectors[int(ids[i])] for i in positions])
+            if aggregation=='mean_profile':scores=candidates @ profile
+            else:
+                pairwise=candidates @ profile.T
+                k=min(top_k,profile.shape[0])
+                scores=(pairwise.max(axis=1) if aggregation=='max_history' else
+                        np.partition(pairwise,pairwise.shape[1]-k,axis=1)[:,-k:].mean(axis=1))
+            result[positions,0]=scores
         result[:,0]=np.clip(result[:,0],-1,1)
     return result
 
@@ -269,13 +293,13 @@ def evaluate_exported_validation(out, reqs, db_path, catalogue):
     values=[];eligible_values=[];without=empty=excluded=total_known=ties=0
     reasons={'missing_article':0,'missing_publication':0,'future_publication':0}
     with closing(sqlite3.connect(db_path)) as db, \
-         (out/'rankings/validation/submission_top_200.csv').open(newline='') as f, \
+         closing(shortlist_parquet_rows(out/'rankings/validation/submission_top_200.parquet')) as rankings, \
          (out/'eligibility/validation_requests.csv').open(newline='') as ef:
-        rankings=iter(csv.DictReader(f));eligibility=iter(csv.DictReader(ef))
+        eligibility=iter(csv.DictReader(ef))
         for req in reqs:
             row=next(rankings);detail=next(eligibility)
             if row['behaviour_id']!=req[0] or detail['behaviour_id']!=req[0]:raise ValueError('Export metric request alignment failure')
-            ranking=json.loads(row['article_ids']);empty+=int(detail['eligible_article_count'])==0
+            ranking=row['article_ids'];empty+=int(detail['eligible_article_count'])==0
             ties+=detail['ties_crossing_200']=='True'
             known={r[0] for r in db.execute('SELECT article_id FROM candidates WHERE behaviour_id=? AND clicked=1',(req[0],))}
             if not known:without+=1;continue
@@ -323,8 +347,9 @@ def resolve_inputs(config):
     inputs={}
     for part in ['train_val','test']:
         inputs[f'catalogue_{part}']=resolve(f'catalogue_{part}',[f'{part}/articles.parquet'])
-        inputs[f'embeddings_{part}']=resolve(f'embeddings_{part}',[
-            f'{part}/article embeddings/text_embeddings.parquet',f'embeddings/{part}/text_embeddings.parquet'])
+        # inputs[f'embeddings_{part}']=resolve(f'embeddings_{part}',[
+        #     f'{part}/article embeddings/text_embeddings.parquet',f'embeddings/{part}/text_embeddings.parquet'])
+        inputs[f'embeddings_{part}'] = resolve(f'embeddings_{part}',[f'feature_engineering/text_embedding_variants/{TEXT_VARIANT}/{part}/article embeddings/text_embeddings.parquet'])
     for split in SPLITS:
         inputs[f'features_{split}']=resolve(f'features_{split}',[f'feature_engineering/{split}_features.parquet'])
         prefix=f'train_val/{split}' if split!='test' else 'test'
@@ -400,7 +425,8 @@ def index_shared(path,split,db_path,seed):
             'sampling_rule':'Smallest BLAKE2b-64(seed:split:behaviour_id); complete recorded slates'}
 
 
-def history_profiles(path,needed_users,cutoff,vectors,output_db=None,history_limit=None):
+def history_profiles(path,needed_users,cutoff,vectors,output_db=None,history_limit=None,aggregation='mean_profile',top_k=3):
+    validate_aggregation(aggregation,top_k,history_limit)
     if history_limit is not None and (not isinstance(history_limit,int) or history_limit<1):
         raise ValueError('history_limit must be a positive integer or None')
     with ExitStack() as stack:
@@ -408,7 +434,7 @@ def history_profiles(path,needed_users,cutoff,vectors,output_db=None,history_lim
         if store is not None:
             store.execute('CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY,vector BLOB,coverage REAL)')
             if store.execute('SELECT count(*) FROM profiles').fetchone()[0]:raise FileExistsError('History lookup already exists')
-        profiles={};seen=set();missing_time=selected_events=available_events=0
+        profiles=HistoryProfiles(aggregation=aggregation,top_k=top_k);seen=set();missing_time=selected_events=available_events=0
         dim=len(next(iter(vectors.values())))
         for batch in pq.ParquetFile(path).iter_batches(columns=['user_id','article_id_fixed','impression_time_fixed'],batch_size=64):
             for row in batch.to_pylist():
@@ -424,22 +450,24 @@ def history_profiles(path,needed_users,cutoff,vectors,output_db=None,history_lim
                     if aid is None:raise ValueError('Missing historical article ID')
                     valid.append((pd.Timestamp(when),position,int(aid)))
                 if history_limit is not None:valid=heapq.nlargest(history_limit,valid)
-                summed=np.zeros(dim,dtype='float64');available=0
-                for _,_,aid in valid:
-                    vector=vectors.get(aid)
-                    if vector is not None:summed+=vector;available+=1
-                norm=np.linalg.norm(summed)
-                profile=(summed/norm).astype('float32') if norm>1e-8 else None
+                history=[vectors[aid] for _,_,aid in valid if aid in vectors]
+                available=len(history)
+                if aggregation=='mean_profile':
+                    summed=np.asarray(history,dtype='float64').sum(axis=0) if history else np.zeros(dim)
+                    norm=np.linalg.norm(summed)
+                    profile=(summed/norm).astype('float32') if norm>1e-8 else None
+                else:
+                    profile=np.stack(history).astype('float32') if history else None
                 coverage=available/max(len(valid),1)
                 selected_events+=len(valid);available_events+=available
                 if store is None:profiles[uid]=(profile,coverage)
                 else:store.execute('INSERT INTO profiles VALUES (?,?,?)',(uid,profile.tobytes() if profile is not None else None,coverage))
             if store is not None:store.commit()
-    if output_db is not None:profiles=ProfileLookup(output_db,dim)
+    if output_db is not None:profiles=ProfileLookup(output_db,dim,aggregation,top_k)
     return profiles,{'users_requested':len(needed_users),'users_found':len(seen),
         'missing_history_users':len(needed_users-seen),'events_missing_time_excluded':missing_time,
         'selected_history_events':selected_events,'selected_events_with_vectors':available_events,
-        'history_limit':history_limit}
+        'history_limit':history_limit,'history_aggregation':aggregation,'history_top_k':top_k if aggregation=='topk_history' else None}
 
 
 def cosine_scores(ids,user,profiles,vectors):
@@ -463,15 +491,30 @@ def score_request(model,request,catalogue,profiles,vectors,batch_size,write=None
     return [a for _,a in top[:200]],len(ids)
 
 
+def validate_aggregation(aggregation,top_k,history_limit):
+    if aggregation not in ('mean_profile','max_history','topk_history'):
+        raise ValueError('history_aggregation must be mean_profile, max_history, or topk_history')
+    if not isinstance(top_k,int) or isinstance(top_k,bool) or top_k<1:
+        raise ValueError('history_top_k must be a positive integer')
+    if aggregation!='mean_profile' and (not isinstance(history_limit,int) or isinstance(history_limit,bool) or history_limit<1):
+        raise ValueError('Individual-history methods require a positive bounded history_limit, e.g. 10')
+
+
 def model_spec(config):
-    return {'pipeline_version':PIPELINE_VERSION,'method':'mean_history_cosine',
+    aggregation=config.get('history_aggregation','mean_profile');top_k=config.get('history_top_k',3)
+    validate_aggregation(aggregation,top_k,config.get('history_limit'))
+    descriptions={'mean_profile':'L2-normalized mean of selected past-click article vectors',
+                  'max_history':'maximum cosine over available selected past-click article vectors',
+                  'topk_history':'mean of largest min(history_top_k, available history events) candidate-to-history cosines'}
+    return {'pipeline_version':PIPELINE_VERSION,'method':aggregation+'_cosine',
+            'history_aggregation':aggregation,'history_top_k':top_k if aggregation=='topk_history' else None,
             'history_limit':config.get('history_limit'),
             'article_normalization':'L2 per nonmissing article vector',
-            'user_profile':'L2-normalized mean of selected past-click article vectors',
+            'user_profile':descriptions[aggregation],
             'history_snapshot':'strictly before first request of each split; no behavior-log updates',
-            'repeated_clicks':'retain repeated weight',
+            'repeated_clicks':'retain repeated weight/events, including in top-k aggregation',
             'missing_vectors_or_history':'score 0; retain eligible articles; report flags and ties',
-            'score_semantics':'cosine similarity in [-1,1], not a probability',
+            'score_semantics':'aggregated cosine similarity in [-1,1], not a probability',
             'learned_parameters':False,'fine_tuned_encoder':False,
             'shortlist_size':200,'tie_policy':'descending cosine, ascending original article ID'}
 
@@ -480,6 +523,7 @@ def prepare(config,work):
     if config.get('scope','development') not in ('development','final'):raise ValueError('Scope must be development or final')
     if config.get('history_limit') is not None and (not isinstance(config['history_limit'],int) or config['history_limit']<1):
         raise ValueError('history_limit must be a positive integer or None')
+    model_spec(config)  # Validate aggregation before creating caches.
     work=Path(work);(work/'indexes').mkdir(parents=True,exist_ok=True)
     prior_path=work/'input_audit.json'
     if prior_path.exists() and json.loads(prior_path.read_text()).get('pipeline_version')!=PIPELINE_VERSION:
@@ -551,9 +595,11 @@ def profiles_for(prepared,split):
     if state.exists():
         old=json.loads(state.read_text())
         if old['key']!=key:raise ValueError('History lookup configuration changed; use a new run')
-        return ProfileLookup(path,prepared['audit']['embedding_info']['dimension']),old['counts']
+        return ProfileLookup(path,prepared['audit']['embedding_info']['dimension'],
+            config.get('history_aggregation','mean_profile'),config.get('history_top_k',3)),old['counts']
     if path.exists():path.unlink()
-    profiles,counts=history_profiles(prepared['inputs'][f'history_{split}'],users,key['cutoff'],prepared['vectors'],path,config.get('history_limit'))
+    profiles,counts=history_profiles(prepared['inputs'][f'history_{split}'],users,key['cutoff'],prepared['vectors'],path,config.get('history_limit'),
+        config.get('history_aggregation','mean_profile'),config.get('history_top_k',3))
     save_json(state,{'key':key,'counts':counts})
     return profiles,counts
 
@@ -590,35 +636,38 @@ def evaluate(prepared,model=None):
 
 
 def export_split(model,reqs,db_path,split,out,catalogue,profiles,vectors,batch_size):
-    ranking_dir=out/f'rankings/{split}'
-    eligibility=out/'eligibility'
+    ranking_dir=out/f'rankings/{split}';eligibility=out/'eligibility'
     for path in [ranking_dir,eligibility]:path.mkdir(parents=True,exist_ok=True)
     request_count=recorded_count=outside=empty=missing_users=missing_vectors=0
-    auc_sum=auc_count=0
+    auc_sum=auc_count=0;pending=[]
+    native_schema,score_schema=shortlist_schemas()
     with closing(sqlite3.connect(db_path)) as db, \
-         (ranking_dir/'submission_top_200.csv').open('w',newline='') as rf, \
+         pq.ParquetWriter(ranking_dir/'submission_top_200.parquet',native_schema,compression='zstd') as writer, \
+         pq.ParquetWriter(ranking_dir/'submission_top_200_scores.parquet',score_schema,compression='zstd') as score_writer, \
          (eligibility/f'{split}_requests.csv').open('w',newline='') as ef:
-        rw,ew=map(csv.writer,[rf,ef])
-        rw.writerow(['behaviour_id','article_ids','similarity_scores'])
+        ew=csv.writer(ef)
         ew.writerow(['behaviour_id','impression_time','eligible_article_count',
             'recorded_candidates_outside_pool','ties_crossing_200','user_profile_missing','eligible_articles_missing_vector'])
         for req in reqs:
             request_count+=1;stats={}
             ranking,count=score_request(model,req,catalogue,profiles,vectors,batch_size,stats=stats)
-            rw.writerow([req[0],json.dumps(ranking),json.dumps(stats['similarity_scores'])])
+            pending.append({'behaviour_id':req[0],'article_ids':ranking,'similarity_scores':stats['similarity_scores']})
+            if len(pending)>=512:
+                write_shortlist_batch(pending,writer,score_writer);pending.clear()
             rows=db.execute('SELECT article_id,clicked FROM candidates WHERE behaviour_id=? ORDER BY article_id',(req[0],)).fetchall()
             ids=np.asarray([r[0] for r in rows],dtype='int64')
             scores=cosine_scores(ids,int(req[1]),profiles,vectors)
             known_eligible=eligible_ids(catalogue,req[3]);pool=set(known_eligible)
-            excluded=sum(a not in pool for a in ids)
-            missing=sum(int(a) not in vectors for a in known_eligible)
+            excluded=sum(a not in pool for a in ids);missing=sum(int(a) not in vectors for a in known_eligible)
             no_profile=profiles.get(int(req[1]),(None,0.0))[0] is None
             outside+=excluded;empty+=count==0;missing_users+=no_profile;missing_vectors+=missing;recorded_count+=len(rows)
             ew.writerow([req[0],req[3],count,excluded,stats['ties_crossing_200'],no_profile,missing])
             if split!='test':
                 y=np.asarray([r[1] for r in rows],dtype='int8')
                 if len(np.unique(y))==2:auc_sum+=float(roc_auc_score(y,scores));auc_count+=1
-    return {'recorded_slate_mean_impression_auc':auc_sum/auc_count if auc_count else None,
+        if pending:write_shortlist_batch(pending,writer,score_writer)
+    return {'parquet_rows_exported':request_count,
+            'recorded_slate_mean_impression_auc':auc_sum/auc_count if auc_count else None,
             'auc_evaluable_requests':auc_count,'requests_exported':request_count,'recorded_rows':recorded_count,
             'recorded_candidates_outside_pool':outside,'empty_pools':empty,
             'requests_without_usable_user_profile':missing_users,
@@ -627,26 +676,25 @@ def export_split(model,reqs,db_path,split,out,catalogue,profiles,vectors,batch_s
 
 
 def validate_export(out,split,reqs,catalogue,db_path,expected_pairs,*,model,profiles,vectors,batch_size=4096):
-    """Check persisted shortlists against independently recomputed catalogue rankings."""
-    ranking_path=out/f'rankings/{split}/submission_top_200.csv'
+    """Check native Parquet IDs and scores against independently recomputed rankings."""
+    ranking_path=out/f'rankings/{split}/submission_top_200.parquet'
+    scores_path=out/f'rankings/{split}/submission_top_200_scores.parquet'
     pairs=request_count=shortlisted=0
-    with ranking_path.open(newline='') as rf:
-        reader=csv.DictReader(rf)
-        if reader.fieldnames!=['behaviour_id','article_ids','similarity_scores']:raise ValueError('Incorrect shortlist schema')
+    with closing(shortlist_parquet_rows(ranking_path)) as reader, closing(shortlist_score_rows(scores_path)) as score_reader:
         for req in reqs():
-            row=next(reader,None)
+            row=next(reader,None);score_row=next(score_reader,None)
             if row is None or row['behaviour_id']!=req[0]:raise ValueError('Ranking request coverage mismatch')
-            ranking=json.loads(row['article_ids'])
-            stats={}
+            ranking=row['article_ids'];stats={}
             expected,count=score_request(model,req,catalogue,profiles,vectors,batch_size,stats=stats)
             if ranking!=expected:raise ValueError('Top-200 ordering or membership mismatch')
-            scores=np.asarray(json.loads(row['similarity_scores']),dtype='float64')
+            if score_row is None or score_row['behaviour_id']!=req[0] or score_row['article_ids']!=ranking:
+                raise ValueError('Parquet score request/order mismatch')
+            scores=np.asarray(score_row['similarity_scores'],dtype='float64')
             if scores.ndim!=1 or len(scores)!=len(ranking) or not np.isfinite(scores).all():
                 raise ValueError('Invalid shortlist similarity scores')
-            if not np.allclose(scores,stats['similarity_scores'],rtol=0,atol=2e-6):
-                raise ValueError('Shortlist similarity scores mismatch')
+            if not np.allclose(scores,stats['similarity_scores'],rtol=0,atol=2e-6):raise ValueError('Shortlist similarity scores mismatch')
             request_count+=1;pairs+=count;shortlisted+=len(ranking)
-        if next(reader,None) is not None:raise ValueError('Unexpected extra export requests')
+        if next(reader,None) is not None or next(score_reader,None) is not None:raise ValueError('Unexpected extra export requests')
     if pairs!=expected_pairs:raise ValueError('Full catalogue pair count differs from audit')
     return {'catalogue_pairs_rescored_for_verification':pairs,'requests_verified':request_count,
             'shortlisted_articles_verified':shortlisted,'full_score_rows_exported':0}
@@ -689,7 +737,8 @@ def persist_and_reload(prepared,probe):
     loaded=importlib.util.module_from_spec(spec);sys.modules[module_name]=loaded;spec.loader.exec_module(loaded)
     with np.load(target/'model/reload_probe.npz',allow_pickle=False) as data:
         profile=None if data['profile_missing'].item() else data['profile']
-        profiles={int(data['user_id']):(profile,float(data['coverage']))}
+        profiles=loaded.HistoryProfiles({int(data['user_id']):(profile,float(data['coverage']))},
+            aggregation=config.get('history_aggregation','mean_profile'),top_k=config.get('history_top_k',3))
         # Reopen versioned input files to verify preprocessing and lookup reconstruction,
         # rather than only reusing an in-memory vector dictionary.
         vectors,info=loaded.load_embeddings([prepared['inputs']['embeddings_train_val'],prepared['inputs']['embeddings_test']],
@@ -772,19 +821,20 @@ def execute(prepared,model=None):
         save_json(work/'metrics.json',{'validation':selected_metrics,'validation_sample':benchmark['metrics'],
             'exported_validation':exported_validation,'recorded_slate_diagnostics':diagnostics,'test_metrics':None,
             'scope':config.get('scope','development'),'model_selection':'No search performed; one predeclared fixed similarity configuration.'})
-        record={'pipeline_version':PIPELINE_VERSION,'config':config,'model':model,'export_schema_version':5,
-            'export_profile':'top200_only','shortlist_score_column':'similarity_scores','shared_full_score_contract_complete':False,
+        record={'pipeline_version':PIPELINE_VERSION,'config':config,'model':model,'export_schema_version':7,
+            'export_profile':'top200_only','shortlist_score_column':None,'score_companion_column':'similarity_scores','shared_full_score_contract_complete':False,
             'prediction_pool':'time_eligible_catalogue','score_semantics':'cosine similarity, not click probability',
             'probability_column':None,'shortlist_size':200,'final_display_size':5,
             'inputs':prepared['audit']['inputs'],'embedding_source':config.get('embedding_source'),
             'embedding_dimension':prepared['audit']['embedding_info']['dimension'],'compute':prepared['vectors'].info,
             'eligibility_policy':POLICY,'history_coverage':history_counts,'export_checks':checks,'export_cost':cost,
             'learned_parameters':False,'trained_components':[],'frozen_components':['shared text embeddings'],
-            'feature_usage':'Only candidate-to-user cosine ranks articles. Metadata, flags and labels are not score predictors.',
+            'feature_usage':'Only the declared candidate-to-history cosine aggregation ranks articles. Metadata, flags and labels are not score predictors.',
             'python':sys.version,'packages':versions,'code_provenance':config.get('code_provenance',{}),
             'scope':config.get('scope','development'),
             'all_agreed_requests_exported':all(config['export_requests'][s] is None for s in SPLITS),
-            'exports':{s:{'shortlist':f'rankings/{s}/submission_top_200.csv',
+            'exports':{s:{'shortlist':f'rankings/{s}/submission_top_200.parquet',
+                'shortlist_scores':f'rankings/{s}/submission_top_200_scores.parquet',
                 'eligibility':f'eligibility/{s}_requests.csv'} for s in SPLITS},
             'handoff_complete':False,'persistence':{'persistent_copy_complete':False,'reload_from_persistent_copy':False},
             'limitations':['Top-200-only handoff requested; exhaustive score files from the original shared contract are omitted.',
@@ -809,3 +859,116 @@ def execute(prepared,model=None):
             target=Path(persistence['persistent_location'])
             for name in ['run_config.json','reload_check.json','result.json']:shutil.copy2(work/name,target/name)
         return result
+
+
+def shortlist_schemas():
+    native=pa.schema([pa.field('behaviour_id',pa.string(),nullable=False),
+                      pa.field('article_ids',pa.list_(pa.int64()),nullable=False)])
+    scores=pa.schema(list(native)+[pa.field('similarity_scores',pa.list_(pa.float32()),nullable=False)])
+    return native,scores
+
+
+def write_shortlist_batch(rows,writer,score_writer=None):
+    native,score_schema=shortlist_schemas()
+    writer.write_table(pa.Table.from_pylist([
+        {'behaviour_id':row['behaviour_id'],'article_ids':row['article_ids']} for row in rows],schema=native))
+    if score_writer is not None:score_writer.write_table(pa.Table.from_pylist(rows,schema=score_schema))
+
+
+def write_shortlist_parquet(csv_path, output_path=None):
+    """Convert a legacy CSV without rescoring; new model exports do not create CSVs."""
+    csv_path=Path(csv_path)
+    target=Path(output_path) if output_path is not None else csv_path.with_suffix('.parquet')
+    if target.resolve()==csv_path.resolve():raise ValueError('Parquet output cannot overwrite the source CSV')
+    target.parent.mkdir(parents=True,exist_ok=True)
+    temporary=target.with_suffix('.tmp.parquet')
+    score_target=target.with_name(target.stem+'_scores.parquet')
+    score_temporary=score_target.with_suffix('.tmp.parquet')
+    native_schema,score_schema=shortlist_schemas()
+    seen=set();pending=[];rows=articles=0;has_scores=False
+    try:
+        with csv_path.open(newline='') as source,ExitStack() as resources:
+            reader=csv.DictReader(source)
+            if not {'behaviour_id','article_ids'}<=set(reader.fieldnames or []):raise ValueError('CSV must contain behaviour_id and article_ids')
+            has_scores='similarity_scores' in reader.fieldnames
+            writer=resources.enter_context(pq.ParquetWriter(temporary,native_schema,compression='zstd'))
+            score_writer=resources.enter_context(pq.ParquetWriter(score_temporary,score_schema,compression='zstd')) if has_scores else None
+            for row in reader:
+                key=row['behaviour_id'];ids=json.loads(row['article_ids'])
+                if not key or key in seen:raise ValueError('Missing or duplicate behaviour_id')
+                if not isinstance(ids,list) or len(ids)>200 or any(type(a) is not int for a in ids):
+                    raise ValueError('article_ids must be an ordered list of up to 200 original integer IDs')
+                if len(ids)!=len(set(ids)):raise ValueError('Duplicate article IDs in shortlist')
+                item={'behaviour_id':key,'article_ids':ids}
+                if has_scores:
+                    scores=json.loads(row['similarity_scores'])
+                    array=np.asarray(scores,dtype='float64')
+                    if array.ndim!=1 or len(array)!=len(ids) or not np.isfinite(array).all():raise ValueError('Invalid similarity scores')
+                    item['similarity_scores']=scores
+                seen.add(key);rows+=1;articles+=len(ids);pending.append(item)
+                if len(pending)>=512:
+                    write_shortlist_batch(pending,writer,score_writer);pending.clear()
+            if pending:write_shortlist_batch(pending,writer,score_writer)
+        temporary.replace(target)
+        if has_scores:score_temporary.replace(score_target)
+    except BaseException:
+        temporary.unlink(missing_ok=True);score_temporary.unlink(missing_ok=True);raise
+    return {'path':str(target),'scores_path':str(score_target) if has_scores else None,
+            'rows':rows,'article_ids':articles,'schema':'behaviour_id:string,article_ids:list<int64>',
+            'order':'same recommendation order as the source; no sorting/grouping applied'}
+
+
+def shortlist_parquet_rows(path):
+    with Path(path).open('rb') as source:
+        parquet=pq.ParquetFile(source);native,_=shortlist_schemas()
+        if not parquet.schema_arrow.equals(native,check_metadata=False):raise ValueError('Incorrect native Parquet shortlist schema')
+        for batch in parquet.iter_batches(batch_size=512):yield from batch.to_pylist()
+
+
+def shortlist_score_rows(path):
+    with Path(path).open('rb') as source:
+        parquet=pq.ParquetFile(source);_,expected=shortlist_schemas()
+        if not parquet.schema_arrow.equals(expected,check_metadata=False):raise ValueError('Incorrect Parquet score schema')
+        for batch in parquet.iter_batches(batch_size=512):yield from batch.to_pylist()
+
+
+def export_parquet_submissions(work,persistent_location=None):
+    """Convert legacy runs or report direct Parquet exports; never recompute scores."""
+    work=Path(work);converted={}
+    for split in SPLITS:
+        directory=work/f'rankings/{split}';csv_path=directory/'submission_top_200.csv'
+        target=directory/'submission_top_200.parquet';score_path=directory/'submission_top_200_scores.parquet'
+        if csv_path.is_file():converted[split]=write_shortlist_parquet(csv_path)
+        elif target.is_file():
+            rows=articles=0;seen=set()
+            for row in shortlist_parquet_rows(target):
+                if row['behaviour_id'] in seen:raise ValueError('Duplicate Parquet request')
+                seen.add(row['behaviour_id']);rows+=1;articles+=len(row['article_ids'])
+            converted[split]={'path':str(target),'scores_path':str(score_path) if score_path.is_file() else None,
+                              'rows':rows,'article_ids':articles,'schema':'behaviour_id:string,article_ids:list<int64>'}
+    if not converted:raise FileNotFoundError('No completed shortlist files under WORK/rankings')
+    record_path=work/'run_config.json'
+    if record_path.is_file():
+        record=json.loads(record_path.read_text());record['export_schema_version']=7
+        record['shortlist_score_column']=None;record['score_companion_column']='similarity_scores'
+        record.pop('csv_shortlist_score_column',None)
+        record['parquet_submission_schema']={'behaviour_id':'string','article_ids':'ordered list<int64>','rows':'one per request'}
+        for split,info in converted.items():
+            entry=record.setdefault('exports',{}).setdefault(split,{})
+            entry['shortlist']=f'rankings/{split}/submission_top_200.parquet'
+            if info['scores_path']:entry['shortlist_scores']=f'rankings/{split}/submission_top_200_scores.parquet'
+            # Preserve any legacy CSV reference when converting an older bundle.
+        save_json(record_path,record)
+    save_json(work/'parquet_submissions.json',converted)
+    if persistent_location:
+        destination=Path(persistent_location)
+        if not destination.is_dir():raise FileNotFoundError('Persistent run folder does not exist')
+        if destination.resolve()!=work.resolve():
+            for info in converted.values():
+                for name in ['path','scores_path']:
+                    if not info.get(name):continue
+                    source=Path(info[name]);target=destination/source.relative_to(work)
+                    target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)
+            for name in ['run_config.json','parquet_submissions.json']:
+                if (work/name).is_file():shutil.copy2(work/name,destination/name)
+    return converted
