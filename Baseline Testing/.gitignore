@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-results/*.parquet
-results/*.joblib
-results_smoke/
