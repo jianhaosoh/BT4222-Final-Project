@@ -4,3 +4,4 @@ python-dotenv==1.2.4
 pyarrow==26.0.0
 pandas==2.3.3
 numpy>=1.26,<3
+duckdb>=1.4,<2
