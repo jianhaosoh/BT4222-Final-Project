@@ -292,10 +292,25 @@ The saved files retain both raw and log alternatives for traceability; the loade
 
 ## Article text and image embeddings
 
-[`embedding_pipeline.py`](embedding_pipeline.py) is a standalone regular-API example.
-It combines each article's Danish title, subtitle, and body into one text document,
-generates one Gemini Embedding 2 vector per article, and joins supplied image vectors by
-`article_id`. Text and image vectors are saved separately.
+[`embedding_pipeline.py`](embedding_pipeline.py) is the single generation and
+publication workflow for the complete **20,738-article SMALL catalogue**. Run it
+after Step 1 has put the same `articles.parquet` snapshot in `train_val/` and
+`test/`. It uses Gemini Embedding 2 at 768 dimensions for all three text variants
+and joins the supplied 1,024-dimensional EB-NeRD image vectors by `article_id`.
+Image embeddings are reused, not generated through Gemini.
+
+| Variant | Text sent to Gemini | Usable text in the current catalogue |
+| --- | --- | ---: |
+| `title_subtitle` | Title + subtitle | 20,719 |
+| `title_subtitle_intro` | Title + subtitle + intro | 20,720 |
+| `title_subtitle_body` | Title + subtitle + full body | 20,720 |
+
+The intro is the first body paragraph with at least 40 characters, skipping
+`SPLIT ELEMENT` markers; if no paragraph is long enough, use the first remaining
+paragraph. This preserves the rule used for the final Gemini variants on Drive.
+It differs from the BERT experiment's separately documented 1,000-character intro.
+Fields retain their Danish text and `title:`, `subtitle:`, `intro:` or `body:`
+labels. Full-body text is also the default text representation for the models.
 
 ### Setup and run
 
@@ -304,88 +319,107 @@ Use Python 3.11 or later. From the repository root:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r "Preprocessing/requirements-embeddings.txt"
-cp .env.example .env
+python -m pip install -r Preprocessing/requirements-embeddings.txt
 ```
 
-Add your `GEMINI_API_KEY` to `.env`. This file is ignored by Git. The script reads
-it from the repository root; existing environment variables take precedence.
-The defaults are `gemini-embedding-2` and 768 text dimensions.
-
-The current data remains in the sibling `Project` directory. Adjust these paths
-if your files are elsewhere:
+Set the shared folder and the supplied EB-NeRD image file. In Colab, mount Drive
+first and use its mounted shared-folder shortcut as `SHARED_ROOT`.
 
 ```sh
-EMBEDDING_DATA=../Project/data/ebnerd_small
-EMBEDDING_IMAGES=../Project/data/ebnerd_large/Ekstra_Bladet_image_embeddings/image_embeddings.parquet
+SHARED_ROOT="/path/to/BT4222 Shared Final Folder"
+IMAGE_VECTORS="/path/to/Ekstra_Bladet_image_embeddings/image_embeddings.parquet"
 
-# Local input check: no API calls and no output writes.
-python "Preprocessing/embedding_pipeline.py" \
-  --articles "$EMBEDDING_DATA/articles.parquet" \
-  --image-embeddings "$EMBEDDING_IMAGES" --dry-run
+# Read inputs and existing caches only: no API calls, key loading or output writes.
+python Preprocessing/embedding_pipeline.py \
+  --shared-root "$SHARED_ROOT" --image-embeddings "$IMAGE_VECTORS" --dry-run
 
-# Generate a small sample in its own directory.
-python "Preprocessing/embedding_pipeline.py" \
-  --articles "$EMBEDDING_DATA/articles.parquet" \
-  --image-embeddings "$EMBEDDING_IMAGES" --limit 3 \
-  --output-dir data/embeddings/ebnerd_small-smoke
+# Generate missing vectors and publish every article, including missing-input rows.
+python Preprocessing/embedding_pipeline.py \
+  --shared-root "$SHARED_ROOT" --image-embeddings "$IMAGE_VECTORS"
 ```
 
-For the full catalogue, omit `--limit 3` and the smoke-test `--output-dir`.
+Before actual generation, set `GEMINI_API_KEY` in the environment or repository
+`.env`. Environment values take precedence. No key or Google SDK import is
+needed for dry-run or a fully cached run. When image vectors already exist in
+`train_val/article embeddings/`, `--image-embeddings` can be omitted. An existing
+local vector file or cache can be added with repeatable `--cache-source PATH`.
+The default is ten workers; `--workers` adjusts concurrency.
 
-Generate embeddings for the complete SMALL catalogue once, then publish the
-same article-ID-keyed files to both project folders. Already-generated complete
-SMALL embeddings can be published directly without API calls:
+### Output layout
+
+The same complete catalogue is published to both split folders. Test does not
+regenerate or select a smaller subset of vectors.
+
+```text
+<shared root>/
+  train_val/article embeddings/
+    text_embeddings.parquet          # full-body variant
+    image_embeddings.parquet
+    metadata.json
+  test/article embeddings/           # same vectors and article IDs
+  feature_engineering/text_embedding_variants/
+    title_subtitle/{train_val,test}/article embeddings/
+      text_embeddings.parquet
+      metadata.json
+    title_subtitle_intro/{train_val,test}/article embeddings/
+      text_embeddings.parquet
+      metadata.json
+    title_subtitle_body/{train_val,test}/article embeddings/
+      text_embeddings.parquet
+      metadata.json
+    text_cache.parquet
+    manifest.json
+```
+
+Text files contain `article_id` (int32), `text_embedding` (768 float32 values or
+null), `has_text_embedding`, `status`, `error_code`, and `input_hash`. Image files
+contain the equivalent image fields without an input hash. Missing inputs keep
+null vectors and `status=missing_input`: no articles are dropped and no zero
+vectors are invented. The current catalogue has 16,995 supplied image vectors;
+3,743 articles lack one. Extra IDs in the supplied image file are excluded by the
+left join. Metadata records catalogue hashes, encoder, text recipe, dimensions,
+status counts and long-text pooling.
+Existing nullable fixed-size vector files are read through DuckDB if Arrow
+cannot decode their null rows; the output retains those missing vectors.
+
+### Reuse and long text
+
+The script reuses the existing default text file, all three existing variant
+files, and its persistent `text_cache.parquet`. Hashes use the same prepared
+text, model, dimension and `article-text-v1` recipe as the original generators.
+Identical texts across articles or variants share a vector. Successful vectors
+are checkpointed every 500 new documents and on interruption, so a rerun only
+requests uncached texts. Complete text and image outputs are published after
+all nonempty texts have vectors. An API failure leaves published files unchanged
+and retains completed work in the cache.
+
+Documents longer than 8,192 tokens are split at newline/space boundaries, falling
+back to character boundaries. Token counts are checked for each chunk, preserving
+all text without truncation or overlap. Chunk vectors are averaged with token-count
+weights and L2-normalised; short documents retain the API vector. The dry-run
+reports uncached documents, not an exact API request/token bill: long documents
+can require multiple calls. Temporary rate-limit/server failures are retried.
+Cached vectors are preserved; fresh API results need not be bit-identical across
+provider model updates.
+
+API reference: [Gemini Embedding 2](https://ai.google.dev/gemini-api/docs/models/gemini-embedding-2)
+and [the embedding API](https://ai.google.dev/gemini-api/docs/embeddings).
+
+This command replaces running the base generator and the separate Drive variant
+script in sequence; it also publishes the files without a separate publisher
+command. `publish_article_embeddings.py` remains an offline utility for copying
+already-generated base files.
+
+Use the same article-ID mapping for candidate and historical-click lookups. Keep
+vectors in lookup tables until batching rather than repeating them in every
+candidate row. Text and supplied image vectors occupy different model spaces;
+do not compute text-to-image cosine similarity between them. Fit downstream
+scaling, PCA and missing-value handling on training data only. Article text is
+a supplied catalogue snapshot, not a reconstruction at each impression time.
+Changing embeddings does not update existing model results or exports.
+
+Offline fixture checks, without credentials or network access:
 
 ```sh
-python "Preprocessing/publish_article_embeddings.py" \
-  --shared-root "/path/to/BT4222 Shared Final Folder" \
-  --embeddings-dir data/embeddings/ebnerd_small
+python -m unittest discover -s Preprocessing/tests -p test_embedding_pipeline.py -v
 ```
-
-Set `--shared-root` to the mounted shared folder in Colab, or its local copy.
-The publisher requires `metadata.json` and both complete embedding files; it
-checks article IDs before copying. It writes `article embeddings/` under both
-`train_val/` and `test/`, preserving encoder provenance and missing-vector rows.
-Test reuses the same vectors, rather than a subset covering only test requests.
-Use a left join when adding vectors to candidates so missing vectors never
-remove candidate rows. Existing experiment results retain their original
-catalogue provenance; changing the input files does not update their metrics or exports.
-
-The script uses the regular API, one document or long-document chunk per request. Successful text vectors
-are checkpointed every 100 rows and on interruption. A separate local
-`text_cache.parquet` keeps all successful vectors even after a limited or interrupted
-rerun. Repeating the command reuses
-vectors with the same prepared text, model and dimension, including identical text
-on different article IDs. Documents longer than 8,192 tokens are split near the
-middle at paragraph/newline boundaries, falling back to spaces or character
-boundaries. Every chunk is token-counted and split again if necessary, preserving
-all text without overlap or truncation. Chunk vectors are averaged with token-count
-weights, then L2-normalised to produce one vector of the configured dimension.
-Short documents use their API vector directly. Pooling is an approximation to
-whole-document embedding and does not change the downstream vector shape.
-Temporary rate-limit/server errors are retried. A rerun also processes previously
-oversized articles, since only successful vectors are cached.
-
-### Files and model inputs
-
-Default outputs are in `data/embeddings/ebnerd_small/`:
-
-| File | Main fields |
-| --- | --- |
-| `text_embeddings.parquet` | `article_id`, `text_embedding` (768 float32 values), `has_text_embedding`, `status`, `error_code`, `input_hash` |
-| `image_embeddings.parquet` | `article_id`, `image_embedding` (1,024 float32 values), `has_image_embedding`, `status`, `error_code` |
-| `metadata.json` | Source catalogue, encoder, dimensions, status counts and long-text pooling method |
-
-Missing inputs remain null; no article is dropped and no zero vector is invented.
-The inspected SMALL catalogue has 20,738 articles, 18 without usable text. The
-shared image artifact covers 16,995 articles (81.95%); 3,743 have no image vector.
-Extra IDs in the shared image artifact are excluded by the article-ID join.
-
-Use `candidate_article_id = article_id` for candidate feature lookups and the same
-article-ID mapping for historical clicks. Keep dense vectors in lookup tables
-until model batching rather than duplicating them across the full impression
-file. Text and image vectors come from different model spaces; do not compute
-text-to-image cosine similarity between them. Fit downstream scaling, PCA and
-missing-value handling on training data only. The text is a supplied catalogue
-snapshot, not a reconstruction of article text at each impression time.
