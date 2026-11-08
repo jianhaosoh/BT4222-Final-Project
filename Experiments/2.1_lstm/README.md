@@ -22,22 +22,6 @@ helper-module names and persistent artifact locations remain unchanged.
 | [2.1.3 Improved LSTM run](2.1.3_improved_run.ipynb) | Completed: one LSTM, joint checkpoint/freshness selection on 2,000 requests, all-request exports and saved-model reload; validation Recall@100 91.61%. |
 | [2.1.4 Model explainability](2.1.4_explainability.ipynb) | Completed: 200 fixed validation requests, 1,724 explanation pairs, attention and freshness examples, input sensitivity and persistent report reload; findings included. |
 
-### Training export from the saved improved model
-
-[2.1.3 Training export](2.1.3_training_export.ipynb) is a prepared companion
-notebook for regenerating all 232,887 training requests' top-200 recommendations
-over the shared 20,738-article SMALL pool. It reloads the selected improved model
-and fixed freshness coefficient without fitting or tuning. Its training metrics
-are in-sample diagnostics, not out-of-fold or holdout results.
-
-Open it in an A100 GPU / High RAM Colab runtime and Run all. No helper ZIP is
-needed: the saved model's own helpers are loaded from Drive. It stages and checks
-the training files locally, then writes them into the existing
-`2.1.3_improved_run/20261104_175920_improved_seed42/` folder. It updates the run's
-training-export declarations while preserving model files, validation/test
-exports and their metrics. Wait for **`Training export persisted and verified:
-True`** and download the executed notebook. No results are claimed until that run.
-
 For explainability, upload `lstm_explainability_helpers.zip` to a fresh Colab
 GPU / High RAM runtime and run `2.1.4_explainability.ipynb`. Original training
 helpers are loaded from the saved final bundle. Reports are written to the
