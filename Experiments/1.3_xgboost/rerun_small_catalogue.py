@@ -27,7 +27,7 @@ TRIALS = dict(lightgbm={"leaves31": 31, "leaves63": 63, "leaves127": 127}, xgboo
 
 def parse():
     p = argparse.ArgumentParser(); p.add_argument("--run-id", default="20261105_small_seed42"); p.add_argument("--workers", type=int, default=5); p.add_argument("--threads", type=int, default=3)
-    p.add_argument("--dev", action="store_true"); p.add_argument("--stage", default="all"); p.add_argument("--worker", type=int, default=-1); p.add_argument("--jobs", default="")
+    p.add_argument("--dev", action="store_true"); p.add_argument("--train-only", action="store_true"); p.add_argument("--stage", default="all"); p.add_argument("--worker", type=int, default=-1); p.add_argument("--jobs", default="")
     a = p.parse_args()
     if a.dev: a.run_id = "_dev_small"
     a.sel_n, a.max_req, a.frac = (6, 40, 0.03) if a.dev else (200, 0, 0.0)
@@ -194,7 +194,7 @@ def finish(a, model, splits):
     o = out_dir(model, a); feat = features_list(); sel = json.load(open(o / "model/selection.json", encoding="utf-8")); git = lambda *x: subprocess.run(["git", *x], capture_output=True, text=True, cwd=HERE).stdout.strip()
     import lightgbm, xgboost, sklearn
     cfg = dict(experiment_id=FOLDERS[model], run_id=a.run_id, owner="Nigel Yap", seed=42, request_sampling_seed=42, export_schema_version=4, prediction_pool="time_eligible_catalogue", selection_k=100, export_k=EXPORT_K, shortlist_size=EXPORT_K, final_display_size=5, model=model, selected=sel,
-        scope=dict(splits_exported=splits, all_requests_in_split=a.max_req == 0, sampled_run=bool(a.max_req), train_catalogue_export=False, training="all recorded train rows" if not a.frac else f"DEV {a.frac}"),
+        scope=dict(splits_exported=splits, in_sample_splits=[s for s in splits if s == "train"], all_requests_in_split=a.max_req == 0, sampled_run=bool(a.max_req), train_catalogue_export="train" in splits, training="all recorded train rows" if not a.frac else f"DEV {a.frac}"),
         eligibility=dict(policy=cv.POLICY, catalogue="EB-NeRD SMALL, shared rule from commit 57b3475", catalogue_articles=20738, catalogue_fingerprint=SMALL_FP, sources=["train_val/articles.parquet", "test/articles.parquet (SHA-256 b1cea52e..., identical file)"]),
         selection_rule=dict(primary="mean known-click Recall@100", secondary="mean observed-click nDCG@100", tie_rule="then earlier trial/checkpoint", partition="same 200 validation requests as earlier runs (development results)"), score_semantics=dict(score_type="logit", click_probability="sigmoid(score), uncalibrated"),
         features=feat, histories=dict(validation="small validation history", test="small validation history (project holdout)"), test_labels="not loaded", packages=dict(python=platform.python_version(), lightgbm=lightgbm.__version__, xgboost=xgboost.__version__, sklearn=sklearn.__version__, numpy=np.__version__, pandas=pd.__version__), code_commit=git("rev-parse", "HEAD"), uncommitted_changes=bool(git("status", "--porcelain")), persistent_artifact_location=str(persist_dir(model, a)))
@@ -218,6 +218,8 @@ def main():
     if os.name == "nt":
         import ctypes; ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
     env = {**os.environ, "OMP_NUM_THREADS": str(a.threads), "OPENBLAS_NUM_THREADS": str(a.threads), "MKL_NUM_THREADS": str(a.threads)}; t0 = time.time(); log(a, "start")
+    if a.train_only:     # load-only: score train requests with the saved final XGBoost model (in-sample)
+        run_workers(a, "xgboost:train", env); merge(a, "xgboost", "train"); finish(a, "xgboost", ["validation", "test", "train"]); log(a, f"train export finished minutes={(time.time() - t0) / 60:.1f}"); return
     if not all((out_dir(m, a) / "model" / "selection.json").exists() for m in FOLDERS): fit_stage(a)
     run_workers(a, ",".join(f"{m}:validation" for m in FOLDERS), env); res = {m: merge(a, m, "validation") for m in FOLDERS}
     best = max(res, key=lambda m: (res[m]["recall@100"], res[m]["ndcg@100"])); log(a, f"FINAL MODEL by full validation Recall@100: {best}")
