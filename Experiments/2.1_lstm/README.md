@@ -33,6 +33,12 @@ catalogue, fit and select the model, export all splits, and reload the saved
 score. Train, validation and test use the same 20,738 article IDs with the
 shared publication-time eligibility rule.
 
+The improved run's completed training export covers all 232,887 requests and
+46,577,400 retained score rows. Training Recall@100 is 94.67% and observed-click
+nDCG@100 is 0.3392; these are in-sample fit diagnostics. Rankings are saved under
+`rankings/train/submission_top_200.parquet`, with metrics in
+`evaluation/training_export.json` in the existing improved-run folder.
+
 ## Model and course connection
 
 The course Week 8 concepts are chronological LSTM history encoding, embeddings
