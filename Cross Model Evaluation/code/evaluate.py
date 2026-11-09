@@ -1093,7 +1093,7 @@ def main() -> None:
                         help="Columns from --segments to summarize, e.g. history_length_group device_type")
     parser.add_argument("--export-k", type=int, default=200)
     parser.add_argument("--ks", type=int, nargs="+", default=[100, 200])
-    parser.add_argument("--split", choices=("validation", "holdout", "test"), default="validation",
+    parser.add_argument("--split", choices=("train", "validation", "holdout", "test"), default="validation",
                         help="Name the supplied labelled partition; use holdout only after choices are frozen")
     parser.add_argument("--naive-timezone", default="UTC",
                         help="Timezone to assign to timezone-naive impression/article timestamps (default: UTC)")
@@ -1173,7 +1173,10 @@ def main() -> None:
     report = {
         "protocol": "schema_v4_catalogue_and_stage2_evaluation",
         "split": args.split,
-        "scope": "validation_development" if args.split == "validation" else "final_holdout_or_declared_test",
+        "scope": {
+            "train": "in_sample_training",
+            "validation": "validation_development",
+        }.get(args.split, "final_holdout_or_declared_test"),
         "export_k": args.export_k,
         "ks": sorted(set(args.ks)),
         "primary_metric": f"known_click_recall@{selection_cutoff}",
