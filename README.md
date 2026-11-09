@@ -22,7 +22,7 @@ The overall two-stage system architecture below illustrates the **final selected
 The final submission model integrates sequential neural modeling, gradient-boosted decision trees, and semantic diversity reranking:
 
 - **Stage 1 (Full-Catalogue Retrieval Ensemble):**
-  - **Full-Catalogue Scoring:** Every candidate article in the 20,738-article catalogue published prior to the request timestamp ($\text{published\_time} \le \text{impression\_time}$) is scored in parallel.
+  - **Full-Catalogue Scoring:** Every candidate article in the 20,738-article catalogue published prior to the request timestamp (`published_time <= impression_time`) is scored in parallel.
   - **Model Complementarity:** Retrieval combines the **Target-Aware LSTM** (capturing sequential reading dynamics and candidate-history attention) and the **XGBoost point-in-time ranker** (leveraging 202 engineered features including category affinities and dwell statistics). Both models apply logarithmic freshness regularization ($\lambda = 2.0$) to counteract historical popularity bias.
   - **Weighted Reciprocal Rank Fusion (RRF):** Individual model rankings are fused with 75% weight allocated to the Target-Aware LSTM and 25% weight to XGBoost:
     $$\text{RRF}(d) = 0.75 \cdot \frac{1}{60 + r_{\text{LSTM}}(d)} + 0.25 \cdot \frac{1}{60 + r_{\text{XGB}}(d)}$$
@@ -52,16 +52,16 @@ All candidate architectures explored during the project were systematically eval
 All models were evaluated under identical catalogue retrieval conditions: scoring all 20,738 eligible articles per impression request across both the Validation split (29,110 requests, 566 million pairs evaluated) and the Holdout Test split (29,142 requests).
 
 | Model / Stage | Architecture / Method | Val Recall@100 | Val Recall@200 | Val nDCG@100 | Val nDCG@200 | Test Recall@5 | Test nDCG@5 | Test Shared ILD@5 |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **1.1 LightGBM** | GBDT Ranker (31 leaves, 75 trees) | 0.828 | 0.907 | 0.217 | 0.228 | - | - | - |
-| **1.2 Logistic Regression** | Linear Baseline ($C=0.01$) | 0.769 | 0.915 | 0.175 | 0.196 | - | - | - |
+| **1.2 Logistic Regression** | Linear Baseline (C = 0.01) | 0.769 | 0.915 | 0.175 | 0.196 | - | - | - |
 | **1.3 XGBoost** | GBDT Ranker (31 leaves, 25 trees) | 0.858 | 0.923 | 0.221 | 0.230 | 0.138 | 0.088 | 0.626 |
-| **2.1 Target-Aware LSTM** | LSTM + Soft Freshness ($\lambda=2.0$) | 0.907 | 0.965 | 0.251 | 0.342 | 0.215 | 0.136 | 0.614 |
+| **2.1 Target-Aware LSTM** | LSTM + Soft Freshness (lambda = 2.0) | 0.907 | 0.965 | 0.251 | 0.342 | 0.215 | 0.136 | 0.614 |
 | **2.2 HUIM** | Parallel DIN Attention + Soft Freshness | 0.914 | 0.965 | 0.286 | 0.343 | - | - | - |
 | **3.1 Gemini Semantic** | Multilingual Embeddings (`max_history`) | 0.032 | 0.048 | 0.006 | 0.009 | 0.017 | 0.010 | 0.768 |
 | **3.2 DistilBERT** | Title+Subtitle+Intro Similarity | 0.015 | 0.025 | 0.003 | 0.004 | - | - | - |
 | **Stage 1 Ensemble** | **Weighted RRF (75% LSTM + 25% XGBoost)** | **0.914** | **0.948** | **0.308** | **0.313** | **0.226** | **0.143** | 0.629 |
-| **Stage 2 Reranker** | **MMR Diversity Rerank ($\lambda=0.9$)** | - | - | - | - | **0.225** | **0.143** | **0.707** (+12.4%) |
+| **Stage 2 Reranker** | **MMR Diversity Rerank (lambda = 0.9)** | - | - | - | - | **0.225** | **0.143** | **0.707** (+12.4%) |
 
 ### Key Benchmark Observations
 
@@ -100,7 +100,7 @@ All feature transformations, imputation statistics, and vocabulary mappings were
 ### Full-Catalogue Candidate Generation
 
 Unlike standard impression-slate evaluation, which ranks only recorded in-view articles (typically 5 to 30 items), this system performs full-catalogue retrieval:
-- **Eligibility Rule (`published_at_or_before_request_v1`):** Every article in the 20,738-article catalogue whose publication timestamp satisfies $\text{published\_time} \le \text{impression\_time}$ is scored.
+- **Eligibility Rule (`published_at_or_before_request_v1`):** Every article in the 20,738-article catalogue whose publication timestamp satisfies `published_time <= impression_time` is scored.
 - **Scale:** Validation scoring evaluates over 566 million request-candidate pairs. Unshown articles are treated as unobserved rather than negative candidates during inference.
 
 ### Evaluation Metrics
@@ -151,7 +151,5 @@ BT4222-Final-Project/
     ├── huim_architecture.png         # DIN / HUIM architecture schematic
     ├── neural_architecture_diagrams.html # Interactive high-DPI canvas viewer
     ├── lstm_gate_dynamics.png        # Unrolled LSTM gate correlation plots
-    ├── huim_gating_equivalents.png   # HUIM recency norms, DIN gates, and ReLU sparsity
-    ├── xgboost_shap_importance.png   # Tree SHAP feature attributions
-    └── lightgbm_gain_importance.png  # LightGBM split gain attributions
+    └── huim_gating_equivalents.png   # HUIM recency norms, DIN gates, and ReLU sparsity
 ```

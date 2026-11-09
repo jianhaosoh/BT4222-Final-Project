@@ -1,6 +1,6 @@
 # 2.1 LSTM with target-aware attention
 
-**Owner:** Winston Ho Rui Wei. The initial tuned run
+The initial tuned run
 `20261104_014914_seed42` completed training, all-request exports and the persistent
 reload check. Its full-validation known-click Recall@100 was **76.50%** across
 29,110 requests. These are development results, not final holdout performance.
