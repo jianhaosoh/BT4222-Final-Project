@@ -5,6 +5,7 @@ tuning, reranking, or changing their evaluator exports:
 
 - [2.1.4 LSTM + freshness](../2.1_lstm/2.1.4_explainability.ipynb)
 - [2.2.3 HUIM + freshness](../2.2_huim/2.2.3_explainability.ipynb)
+- [Gate explainability analysis](gate_explainability_analysis.ipynb)
 
 Both completed on an L4 GPU, with all cell outputs preserved and findings in
 Section 9. Each explains the same 200 validation requests (179 readers) and
@@ -24,6 +25,31 @@ evidence that one model's attention is better. Both models also placed a clicked
 40-hour-old article outside the working top 100, illustrating the freshness
 trade-off. The notebook findings discuss these cases and availability coverage;
 the diagnostics do not change the evaluator's saved rankings.
+
+## Empirical Gate Dynamics and Non-Recurrent Equivalents
+
+The standalone companion notebook [`gate_explainability_analysis.ipynb`](gate_explainability_analysis.ipynb) loads and audits internal gating mechanics across both neural architectures (`2.1_lstm` and `2.2_huim`) on the shared 200 validation requests (8,579 verified interaction clicks, 1,724 candidate pairs).
+
+### LSTM Recurrent Gate Dynamics
+
+In the sequential Target-Aware LSTM (`nn.LSTM(128, 128)`), three sigmoid gates regulate how each chronological interaction updates and exposes the reader's state vector:
+
+- **Forget Gate ($f_t$):** Controls the proportion of prior cell memory $c_{t-1}$ retained. Reading dwell time correlates negatively with forget gate activation ($r = -0.375$). When readers spend longer exploring an article, earlier context is discounted more heavily to assimilate new preferences. Conversely, longer inactive gaps between reading sessions correlate positively with forget activations ($r = +0.285$), preserving baseline interests across session breaks.
+- **Input Gate ($i_t$):** Governs how strongly the current candidate interaction updates running memory. Dwell duration correlates positively with the effective memory write magnitude $|i_t \odot g_t|$ ($r = +0.294$).
+- **Output Gate ($o_t$):** Regulates which cell memory dimensions are exposed in the hidden state $h_t$, dictating what information is visible to candidate-aware attention keys and the ranking head.
+- **Numerical Parity:** Unrolling the saved weight matrices (`weight_ih_l0`, `weight_hh_l0`, `bias_ih_l0`, `bias_hh_l0`) matches the output of `adapter.model.encode_history` with numerical error below $10^{-5}$.
+
+![LSTM Gate Dynamics](../../figures/lstm_gate_dynamics.png)
+
+### HUIM Non-Recurrent Gating Equivalents
+
+The feed-forward HUIM network operates without recurrence or sequential cell states ($c_t$). It replaces sequential LSTM gating with three explicit feed-forward mechanisms:
+
+- **Temporal Decay via Recency Bins:** Rather than relying on exponential decay across recurrent steps, each past interaction is assigned a 10-bin request-relative recency embedding ($rc_j$). Attention weights decay predictably as interaction age increases.
+- **Engagement Gating via DIN Multiplicative Attention:** Reading duration and scroll depth embeddings modulate each event representation $x_j$. The candidate-interaction projection $P(x_j \odot c)$ functions as a multiplicative gate, contributing 27.8% of the total pre-activation attention magnitude.
+- **Output Filtering via ReLU Sparsity:** Post-attention matching projections apply ReLU activation gating before concatenating with the dense feature branch. This produces 75.5% activation sparsity, filtering out inactive matching dimensions prior to final scoring.
+
+![HUIM Gating Equivalents](../../figures/huim_gating_equivalents.png)
 
 ## Course grounding
 

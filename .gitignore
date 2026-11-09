@@ -4,6 +4,15 @@ __pycache__/
 *.pyc
 data/
 .venv/
+.vscode/
+
+# R history files
+.Rhistory
+*.Rhistory
+
+# Scratch analysis notebooks
+gate_explainability_analysis.ipynb
+
 # Local planning notes and verification code are not part of the submission.
 /docs/
 /tests/

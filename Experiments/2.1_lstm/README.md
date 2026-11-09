@@ -40,6 +40,55 @@ nDCG@100 is 0.3392; these are in-sample fit diagnostics. Rankings are saved unde
 `rankings/train/submission_top_200.parquet`, with metrics in
 `evaluation/training_export.json` in the existing improved-run folder.
 
+## Neural Architecture and Formulation
+
+The neural sequential ranker (`TargetAwareLSTMRanker` in `lstm_model.py`) models chronological reader consumption patterns and predicts candidate relevance through candidate-queried attention over user history states.
+
+![Target-Aware LSTM Architecture](../../figures/lstm_architecture.png)
+
+### Multimodal Article Encoder (145-D to 128-D)
+The `ArticleEncoder` processes candidate articles and historical click items through parallel modality-specific projection layers:
+- Category embedding: 16-D learned representation over 26 categorical codes (`nn.Embedding(26, 16, padding_idx=0)`).
+- Article type embedding: 8-D learned representation over 15 structural type codes (`nn.Embedding(15, 8, padding_idx=0)`).
+- Topic bag representation: 16-D mean-pooled embedding bag over 80 topic codes (`nn.Embedding(80, 16, padding_idx=0)`).
+- Gemini text projection: 64-D linear projection (`nn.Linear(768, 64)`) applied to frozen 768-D `gemini-embedding-2` document vectors. A 20% training-only modality dropout regularizes the projection against missing text embeddings in the candidate catalogue.
+- EB-NeRD ResNet image projection: 32-D linear projection (`nn.Linear(1024, 32)`) applied to frozen 1024-D visual embeddings.
+- Dense numeric statistics: 9-D standardized features covering body word counts, title lengths, sentiment scores, premium status, and missingness availability flags.
+
+The concatenated 145-D multimodal representation (16 + 8 + 16 + 64 + 32 + 9 = 145) is projected through a dense layer with ReLU activation and Layer Normalization (`nn.Sequential(Linear(145, 128), ReLU(), LayerNorm(128))`) to yield a unified 128-D article embedding.
+
+### Sequential History Encoder
+The user interaction sequence retains up to 50 chronological reading events. Each historical click event concatenates the 128-D article embedding with 8-D event interaction features (dwell read time, scroll percentage, and time interval to request), forming a 136-D event representation projected to 128-D via an input linear transformation with ReLU and dropout (`nn.Sequential(Linear(136, 128), ReLU(), Dropout(0.2))`). A recurrent network (`nn.LSTM(128, 128, batch_first=True)`) processes the chronological sequence via packed sequences, generating output hidden states $H = [h_1, h_2, \dots, h_L] \in \mathbb{R}^{L \times 128}$.
+
+### Recency-Biased Query-Key Attention
+The candidate article embedding $c \in \mathbb{R}^{128}$ queries the sequence of historical hidden states. Learned projections map candidate vectors to a 64-D query space ($q = W_q c \in \mathbb{R}^{64}$) and hidden states to 64-D keys ($k_t = W_k h_t \in \mathbb{R}^{64}$). Scaled dot-product attention scores include an additive recency bias based on standardized log elapsed time $\Delta t_{\text{norm}}$ between each historical interaction and the request timestamp:
+
+$$\alpha_t = \text{softmax}\left(\frac{q^\top k_t}{\sqrt{64}} + w_{\text{rec}} \cdot \Delta t_{\text{norm}}\right)$$
+
+where $w_{\text{rec}}$ is a learnable scalar parameter initialized to -0.5, and $\Delta t_{\text{norm}} = (\ln(1 + \Delta t_{\text{hours}}) - \mu_{\Delta t}) / \sigma_{\Delta t}$ normalizes elapsed interaction hours. The candidate-specific history context vector is pooled as:
+
+$$c_{\text{hist}} = \sum_{t=1}^L \alpha_t h_t \in \mathbb{R}^{128}$$
+
+Users without prior history receive a learned default representation vector $h_0 \in \mathbb{R}^{128}$.
+
+### Interaction Prediction Head (344-D)
+To capture both bilinear matching and nonlinear interactions, candidate embedding $c$ and history context $c_{\text{hist}}$ are projected to a 64-D interaction space ($p_c = W_c c, p_h = W_h c_{\text{hist}}$). The model constructs a 344-D feature vector concatenating:
+- Candidate article representation: 128-D
+- Attended history context vector: 128-D
+- Element-wise interaction product ($p_c \odot p_h$): 64-D
+- Scaled bilinear dot product ($(p_c^\top p_h) / \sqrt{64}$): 1-D
+- Candidate tabular features: 2-D (publication age and freshness flags)
+- Request context features: 21-D (user device type, hour of day, day of week, session counters)
+
+Total vector width is 128 + 128 + 64 + 1 + 2 + 21 = 344-D. This concatenated vector passes through a multi-layer perceptron (`Linear(344, 256) -> ReLU() -> Dropout(0.2) -> Linear(256, 128) -> ReLU() -> Dropout(0.2) -> Linear(128, 1)`) to compute the relevance logit $\text{logit}(u, c)$.
+
+### Soft Freshness Decay
+To prevent historical popularity bias from promoting stale articles over breaking news, a logarithmic freshness penalty is applied during catalogue scoring:
+
+$$s(u, c) = \text{logit}(u, c) - \lambda \ln(1 + \Delta t_{\text{hours}}), \quad \lambda = 2.0$$
+
+where $\Delta t_{\text{hours}}$ denotes article age in hours from publication to request time. The decay weight $\lambda = 2.0$ was selected via grid search on 2,000 validation requests to maximize Recall@100 across the full 20,738 article candidate pool.
+
 ## Model and course connection
 
 The course Week 8 concepts are chronological LSTM history encoding, embeddings
@@ -70,8 +119,8 @@ requests/history only and are reused unchanged at inference.
    installs DuckDB/Optuna if missing. It uses the runtime's core scientific stack.
 
 The 26-cell notebook follows the nine shared experiment sections. Its single
-path is **Optuna → apply winning parameters → fit on all training requests →
-restore the selected checkpoint → export all three splits → reload from the
+path is **Optuna -> apply winning parameters -> fit on all training requests ->
+restore the selected checkpoint -> export all three splits -> reload from the
 persistent copy**. No Git checkout or credentials are required.
 
 | Stage | Declared budget and scope |
@@ -83,8 +132,8 @@ persistent copy**. No Git checkout or credentials are required.
 
 Optuna uses seeded TPE and a median pruner (three startup trials, one warmup step).
 Its search space is LSTM hidden size `{64,128,256}`, attention size `{32,64,128}`,
-article size `{64,128}`, dropout `0.1–0.4`, learning rate `3e-4–3e-3` (log), weight
-decay `1e-6–1e-3` (log), and history dropout `0–0.3`. All seven winning settings
+article size `{64,128}`, dropout `0.1-0.4`, learning rate `3e-4-3e-3` (log), weight
+decay `1e-6-1e-3` (log), and history dropout `0-0.3`. All seven winning settings
 are applied before final fitting. Exact eligible-pair counts, retained-output
 size estimates and available space are printed before training; export progress
 reports elapsed time and an ETA. In the completed L4 run, final training took
@@ -194,7 +243,7 @@ Full validation remains development evaluation; project-test outcomes stay maske
 Before training, the notebook compares the original and batched scorers on 32
 declared requests using the initial saved weights. It checks numerical agreement,
 top-100/200 membership and ordering, and records timings excluding cache creation.
-The completed same-GPU benchmark measured 1.60× faster scoring and 1.88× faster
+The completed same-GPU benchmark measured 1.60x faster scoring and 1.88x faster
 top-200 inference, with matching logits and rankings on those 32 requests.
 
 Export every split's genuine top 200 with the same schema and eligibility policy.

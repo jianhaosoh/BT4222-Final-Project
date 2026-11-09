@@ -1,4 +1,4 @@
-# 2.2_huim — Candidate-aware attention for relevance shortlisting
+# 2.2 HUIM: Candidate-aware attention for relevance shortlisting
 
 | Notebook | Purpose |
 | --- | --- |
@@ -13,6 +13,66 @@ GPU / High RAM runtime and run `2.2.3_explainability.ipynb`. It uses 200 shared
 validation requests and does not retrain or modify handoff files. Reports go to
 `2.2.3_explainability/<run_id>/`; see the [shared protocol](../explainability/README.md).
 
+## Neural Architecture and Formulation
+
+The `HUIMStage1` model (defined in `huim/model.py`) is a Deep Interest Network (DIN) inspired ranker engineered for high-throughput candidate scoring. Unlike recurrent architectures, it operates without recurrence or sequence-positional encodings: the interaction history is processed in parallel, conditioned dynamically on candidate article features via multiplicative target attention.
+
+![Deep Interest Network / HUIM Architecture](../../figures/huim_architecture.png)
+
+### Order-Invariant Parallel Event Encoder
+The shared article encoder maps metadata, category embeddings, subcategories, sentiment, and frozen text/image projections into a $d_{\text{model}} = 64$-dimensional article vector $e \in \mathbb{R}^{64}$. Each historical interaction event incorporates behavioral depth and temporal intervals:
+- Read time bin embedding: 8-D learned representation from discrete dwell duration buckets.
+- Scroll percentage bin embedding: 8-D learned representation from discrete scroll depth tiers.
+- Request-relative recency bin embedding: 8-D learned representation capturing the elapsed time between historical reading and request timestamp.
+
+The concatenated event vector of width 88-D (64 + 8 + 8 + 8 = 88) is projected through a dense linear transformation with Layer Normalization:
+
+$$x_j = \text{LayerNorm}(W_{\text{ev}} [e_j \,\|\, b_{\text{read}} \,\|\, b_{\text{scroll}} \,\|\, b_{\text{rec}}] + b_{\text{ev}}) \in \mathbb{R}^{64}$$
+
+Because temporal context is explicitly bound to each event vector, the sequence is permutation-invariant and scored in parallel across time steps.
+
+### 10 Request-Relative Recency Bins
+Temporal relevance is parameterized via 10 fixed logarithmic hour thresholds ($[1, 3, 6, 12, 24, 48, 96, 168, 336, 672]$ hours). Historical events are bucketed dynamically relative to each request timestamp $\Delta t = t_{\text{req}} - t_j$. This discretization enables parallel GPU execution across all historical items without sequential recurrent unrolling or causal masking overhead.
+
+### DIN Multiplicative Candidate Attention
+Given candidate article embedding $c \in \mathbb{R}^{64}$ and historical event representations $x_j \in \mathbb{R}^{64}$, the attention mechanism computes item-to-candidate alignment scores. The first interaction layer is formulated as:
+
+$$a_j = W_{\text{out}} \text{ReLU}\left(A x_j + B c + P(x_j \odot c)\right)$$
+
+where $A \in \mathbb{R}^{32 \times 64}$, $B \in \mathbb{R}^{32 \times 64}$, and $P \in \mathbb{R}^{32 \times 64}$. The product term $P(x_j \odot c)$ functions as a direct multiplicative interaction gate, allowing candidate attributes to activate or suppress specific reading history dimensions. Normalized attention weights are computed over valid history events:
+
+$$\alpha_j = \frac{\exp(a_j)}{\sum_{k \in \mathcal{H}} \exp(a_k)}$$
+
+The pooled user interest representation conditioned on candidate $c$ is:
+
+$$h = \sum_{j \in \mathcal{H}} \alpha_j x_j \in \mathbb{R}^{64}$$
+
+Users without prior interaction history receive a learned default parameter vector $h_{\emptyset} \in \mathbb{R}^{64}$.
+
+### Post-Attention Match Projection with ReLU Sparsity
+To capture both directional shift and affinity magnitude between candidate and user interest, the model constructs a 256-D matching vector concatenating four components:
+
+$$m = [h \,\|\, c \,\|\, h - c \,\|\, h \odot c] \in \mathbb{R}^{256}$$
+
+This vector is compressed to 64 dimensions through a linear layer with ReLU activation:
+
+$$z_{\text{match}} = \text{ReLU}(W_m m + b_m) \in \mathbb{R}^{64}$$
+
+The ReLU non-linearity enforces representational sparsity, pruning weakly correlated matching dimensions prior to head fusion.
+
+### 112-D Head and Soft Freshness Decay
+A separate contextual branch maps 48-D request and candidate tabular features (device type, request hour, user historical CTR, point-in-time publication delay) through a feature MLP into a 48-D context vector $f \in \mathbb{R}^{48}$. The fusion layer concatenates the 64-D match representation with the 48-D context:
+
+$$z = \text{LayerNorm}([z_{\text{match}} \,\|\, f]) \in \mathbb{R}^{112}$$
+
+The 112-D representation feeds into the final prediction MLP ($112 \to 128 \to 64 \to 1$) with dropout (0.2) to predict the uncalibrated click logit $\text{logit}(u, c)$.
+
+During full catalogue ranking, soft freshness decay counters popularity bias:
+
+$$s(u, c) = \text{logit}(u, c) - \lambda \ln(1 + \Delta t_{\text{hours}})$$
+
+where $\lambda = 2.0$ balances historical topic affinity with breaking publication recency across the 20,738 article candidate pool.
+
 ## Run the freshness continuation in Colab
 
 1. Open `2.2.2_freshness_run.ipynb` in a fresh **A100 GPU / High RAM** runtime.
@@ -23,7 +83,7 @@ validation requests and does not retrain or modify handoff files. Reports go to
 
 The new bundle preserves the original model and adds `model/score_recipe.json`, the freshness selection/trial history and all handoff artifacts. The working cutoff is 100; top 200 is the export buffer. Schema v5 exports a generic blended `score` without `click_probability`; recorded-slate diagnostics contain every original pair separately. The initial model uses the same generic-score export format with freshness weight zero.
 
-The initial notebook runs one path: **12 Optuna trials → apply the winning settings → fit all recorded training requests → restore the selected checkpoint → export every request → save and reload from shared Drive**.
+The initial notebook runs one path: **12 Optuna trials -> apply the winning settings -> fit all recorded training requests -> restore the selected checkpoint -> export every request -> save and reload from shared Drive**.
 
 Course connection: the implementation combines categorical embeddings, attention, feature interactions, dense networks and dropout/weight-decay regularisation. The complete HUIM-inspired architecture is an adaptation rather than a model taught as a whole in class.
 
@@ -33,7 +93,7 @@ Readers have several interests. Candidate-conditioned attention over individual 
 
 Training uses the supplied recorded candidates: clicked = 1 and shown-unclicked = 0. No catalogue negatives are created. Fixed histories are never augmented with later clicks. Slate size/rank, future popularity totals and current/subsequent reading outcomes are excluded. The feature audit in the notebook documents the permitted inputs.
 
-The business pipeline is **eligible catalogue → genuine Stage 1 top 200 → Stage 2 business reranking → final five**. Offline click recovery is an engagement proxy; it does not establish retention or profit.
+The business pipeline is **eligible catalogue -> genuine Stage 1 top 200 -> Stage 2 business reranking -> final five**. Offline click recovery is an engagement proxy; it does not establish retention or profit.
 
 ## Run in Colab
 
