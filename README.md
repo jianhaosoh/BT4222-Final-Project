@@ -80,7 +80,7 @@ The empirical explainability suite investigates how sequential neural networks a
 2. **Dynamic Candidate Filtering:** Candidate-queried attention in both recurrent (Target-Aware LSTM) and feed-forward (HUIM) architectures dynamically focuses on relevant past reading events while filtering out unrelated topical history. By conditioning historical event weights on the specific candidate article being evaluated, the model isolates thematic connections across disjoint reading sessions.
 3. **Global Ranking Drivers:** Tabular tree rankers (XGBoost and LightGBM) rely primarily on article publication recency, short-term category affinity (e.g. 72-hour preferences), and historical reading frequency to determine recommendation ranks. Tree SHAP attributions and split gains confirm that freshness constraints and recent topical momentum dominate ranking decisions.
 
-Readers interested in the exact unrolled gate distributions, correlation scatter plots, and Tree SHAP routines are directed to [`Experiments/explainability/`](Experiments/explainability/) and [`Experiments/explainability/gate_explainability_analysis.ipynb`](Experiments/explainability/gate_explainability_analysis.ipynb).
+Readers interested in the exact unrolled gate distributions, correlation scatter plots, and empirical gating analysis are directed to the model explainability notebooks: [Experiments/2.1_lstm/2.1.4_explainability.ipynb](Experiments/2.1_lstm/2.1.4_explainability.ipynb) for recurrent LSTM gate dynamics, and [Experiments/2.2_huim/2.2.3_explainability.ipynb](Experiments/2.2_huim/2.2.3_explainability.ipynb) for non-recurrent gating equivalents.
 
 ---
 
@@ -138,7 +138,6 @@ BT4222-Final-Project/
 │   ├── 3.4_finetuned_distilbert/     # Domain fine-tuned DistilBERT bi-encoder
 │   ├── 3.5_gemini_freshness/         # Gemini semantic similarity with freshness penalties
 │   ├── 3.6_bert_intro_freshness/     # DistilBERT intro similarity with freshness penalties
-│   ├── explainability/               # Gate dynamics and non-recurrent equivalent analysis
 │   └── README.md                     # Experiment standardization contracts and protocols
 ├── Cross Model Evaluation/           # Stage 1 ensembling and Stage 2 diversity reranking
 │   ├── Step 1 Ensemble/              # Weighted RRF generation and weight grid search

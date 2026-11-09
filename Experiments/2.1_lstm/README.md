@@ -27,7 +27,7 @@ For explainability, upload `lstm_explainability_helpers.zip` to a fresh Colab
 GPU / High RAM runtime and run `2.1.4_explainability.ipynb`. Original training
 helpers are loaded from the saved final bundle. Reports are written to the
 separate `2.1.4_explainability/<run_id>/` shared folder; evaluator exports remain
-unchanged. See the [shared explanation protocol](../explainability/README.md).
+unchanged. Findings are detailed in [2.1.4_explainability.ipynb](2.1.4_explainability.ipynb).
 
 The improved notebook follows one end-to-end path: load the shared SMALL
 catalogue, fit and select the model, export all splits, and reload the saved
@@ -88,6 +88,17 @@ To prevent historical popularity bias from promoting stale articles over breakin
 $$s(u, c) = \text{logit}(u, c) - \lambda \ln(1 + \Delta t_{\text{hours}}), \quad \lambda = 2.0$$
 
 where $\Delta t_{\text{hours}}$ denotes article age in hours from publication to request time. The decay weight $\lambda = 2.0$ was selected via grid search on 2,000 validation requests to maximize Recall@100 across the full 20,738 article candidate pool.
+
+### Empirical Gate Dynamics
+
+In the sequential Target-Aware LSTM (`nn.LSTM(128, 128)`), three sigmoid gates regulate how each chronological interaction updates and exposes the reader's state vector:
+
+- **Forget Gate ($f_t$):** Controls the proportion of prior cell memory $c_{t-1}$ retained. Reading dwell time correlates negatively with forget gate activation ($r = -0.375$). When readers spend longer exploring an article, earlier context is discounted more heavily to assimilate new preferences. Conversely, longer inactive gaps between reading sessions correlate positively with forget activations ($r = +0.285$), preserving baseline interests across session breaks. Across 8,579 verified history clicks in 200 validation requests, the mean forget gate activation is 0.3927.
+- **Input Gate ($i_t$):** Governs how strongly the current candidate interaction updates running memory. Dwell duration correlates positively with the effective memory write magnitude $|i_t \odot g_t|$ ($r = +0.294$). Across the validation requests, the mean input gate activation is 0.3332, with a step new-write share of 0.5443.
+- **Output Gate ($o_t$):** Regulates which cell memory dimensions are exposed in the hidden state $h_t$ (mean activation 0.3485), dictating what information is visible to candidate-aware attention keys and the ranking head.
+- **Numerical Parity:** Unrolling the saved weight matrices (`weight_ih_l0`, `weight_hh_l0`, `bias_ih_l0`, `bias_hh_l0`) matches the output of `adapter.model.encode_history` with numerical error below $10^{-5}$ (max absolute difference $4.07 \times 10^{-7}$).
+
+![LSTM Gate Dynamics](../../figures/lstm_gate_dynamics.png)
 
 ## Model and course connection
 

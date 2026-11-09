@@ -11,7 +11,7 @@ The initial all-request run `20261104_014752_seed42` and freshness continuation 
 For explainability, upload `huim_explainability_helpers.zip` to a fresh Colab
 GPU / High RAM runtime and run `2.2.3_explainability.ipynb`. It uses 200 shared
 validation requests and does not retrain or modify handoff files. Reports go to
-`2.2.3_explainability/<run_id>/`; see the [shared protocol](../explainability/README.md).
+`2.2.3_explainability/<run_id>/`; findings are detailed in [2.2.3_explainability.ipynb](2.2.3_explainability.ipynb).
 
 ## Neural Architecture and Formulation
 
@@ -72,6 +72,16 @@ During full catalogue ranking, soft freshness decay counters popularity bias:
 $$s(u, c) = \text{logit}(u, c) - \lambda \ln(1 + \Delta t_{\text{hours}})$$
 
 where $\lambda = 2.0$ balances historical topic affinity with breaking publication recency across the 20,738 article candidate pool.
+
+### Non-Recurrent Gating Equivalents
+
+The feed-forward HUIM network operates without recurrence or sequential cell states ($c_t$). While the architecture supports an optional sigmoid fusion gate when `fusion="gated"`, the validation-selected checkpoint (`20261104_234712_freshness_seed42`) selected `fusion="concat"` (`adapter.model.gate is None`). The model implements three analogous gating mechanisms audited across the 200 validation requests (8,579 history clicks and 1,724 explained candidate pairs):
+
+- **Temporal Decay via Recency Bins:** Rather than relying on exponential decay across recurrent steps, each past interaction is assigned a 10-bin request-relative recency embedding ($rc_j$). Attention weights decay predictably as interaction age increases.
+- **Engagement Gating via DIN Multiplicative Attention:** Reading duration and scroll depth embeddings modulate each event representation $x_j$. The candidate-interaction projection $P(x_j \odot c)$ functions as a multiplicative gate, contributing 27.8% of the total pre-activation attention magnitude.
+- **Output Filtering via ReLU Sparsity:** Post-attention matching projections apply ReLU activation gating before concatenating with the dense feature branch into the scoring head. This produces 75.5% activation sparsity (24.5% active units), filtering out inactive matching dimensions prior to final scoring. The history-match pathway drives 58.7% of the head input magnitude, with dense contextual features contributing the remaining 41.3%.
+
+![HUIM Gating Equivalents](../../figures/huim_gating_equivalents.png)
 
 ## Run the freshness continuation in Colab
 
