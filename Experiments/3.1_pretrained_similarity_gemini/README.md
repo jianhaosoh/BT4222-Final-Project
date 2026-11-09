@@ -7,7 +7,7 @@ The separate Stage 2 owner consumes the shortlist to produce the final five.
 
 ## Run
 
-1. Open `experiment.ipynb` in Colab and upload `catalogue_pipeline.py` when prompted.
+1. Open `gemini_experiment.ipynb` in Colab and upload `catalogue_pipeline.py` when prompted.
 2. Set your actual shared Drive path. Start with `RUN_PHASE = "audit"` to check
    input coverage and catalogue scoring/export costs.
 3. Switch to `RUN_PHASE = "run"` after the audit and continue through the notebook.
@@ -20,7 +20,8 @@ file so Colab requires only one Python upload.
 
 | File | Purpose |
 | --- | --- |
-| `experiment.ipynb` | Configuration, audit, validation, export and handoff |
+| `gemini_experiment.ipynb` | Configuration, audit, validation, export and handoff |
+| `gemini_individual_history.ipynb` | Individual-history similarity comparison and exports |
 | `catalogue_pipeline.py` | Loading, user profiles, cosine scoring and export checks |
 | `requirements.txt` | CPU dependencies |
 | `requirements-gpu.txt` | Optional PyTorch dependency for CUDA similarity |
@@ -157,7 +158,7 @@ embeddings remain reusable when their article sources and encoder are unchanged.
 
 ## Individual-history similarity experiment
 
-`experiment_individual_history.ipynb` compares these retrieval rules with the same
+`gemini_individual_history.ipynb` compares these retrieval rules with the same
 latest-10 history and request sample:
 
 | `history_aggregation` | Score |
