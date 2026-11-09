@@ -138,7 +138,8 @@ BT4222-Final-Project/
 │   ├── 3.4_finetuned_distilbert/     # Domain fine-tuned DistilBERT bi-encoder
 │   ├── 3.5_gemini_freshness/         # Gemini semantic similarity with freshness penalties
 │   ├── 3.6_bert_intro_freshness/     # DistilBERT intro similarity with freshness penalties
-│   └── README.md                     # Experiment standardization contracts and protocols
+│   ├── CONTRIBUTING.md               # Historical development standards and Optuna guidelines
+│   └── README.md                     # Stage 1 retrieval experiments navigation guide
 ├── Cross Model Evaluation/           # Stage 1 ensembling and Stage 2 diversity reranking
 │   ├── Step 1 Ensemble/              # Weighted RRF generation and weight grid search
 │   ├── Step 2 Evaluation/            # Unified cross-model evaluation notebook
@@ -153,3 +154,44 @@ BT4222-Final-Project/
     ├── lstm_gate_dynamics.png        # Unrolled LSTM gate correlation plots
     └── huim_gating_equivalents.png   # HUIM recency norms, DIN gates, and ReLU sparsity
 ```
+
+---
+
+## Google Drive Organization
+
+The shared Google Drive folder (`BT4222 Shared Final Folder`) hosts large binary datasets, precomputed feature tables, neural embeddings, trained model weights, checkpoints, predictions, and candidate shortlists that exceed Git repository limits. The contents are organized as follows:
+
+```
+BT4222 Shared Final Folder/
+├── train_val/                      # Raw EB-NeRD Small train and validation parquet splits
+├── test/                           # Holdout test split parquet files (strictly masked during training)
+├── feature_engineering/            # Engineered tabular matrices (raw, log, scaled) and text/image embeddings
+│   ├── log_variants/               # Log-transformed numerical interaction features
+│   ├── scaled_log_variants/        # Robust-scaled numerical features
+│   └── text_embedding_variants/    # 768-D Gemini text vectors and 1024-D ResNet image vectors
+├── Experiments/                    # Checkpoints, predictions, and top-200 shortlist exports per model
+│   ├── 1.1_lightgbm_ranker/        # LightGBM booster bundles and full-split submission rankings
+│   ├── 1.2_logistic_regression/    # Linear baseline weights and prediction files
+│   ├── 1.3_xgboost/                # XGBoost models, top-200 rankings, and Tree SHAP artifacts
+│   ├── 2.1_lstm/                   # Target-Aware LSTM weights, Optuna trials, and ranking exports
+│   ├── 2.2_huim/                   # HUIM DIN model states, freshness configs, and prediction files
+│   └── 3.x_pretrained_.../         # Gemini, DistilBERT, and freshness similarity score Parquets
+└── Evaluation/                     # Stage 1 ensembling and Stage 2 diversity reranking artifacts
+    ├── Stage 1/                    # Cross-model evaluation tables and metric summaries
+    ├── Stage 2 - Reranking/        # MMR diversity grid search tables and lambda parameter selections
+    └── ensemble/                   # Final fused 75:25 LSTM+XGBoost top-200 shortlist Parquets
+```
+
+### Google Colab Environment Setup
+
+All training, inference, and evaluation notebooks are designed to execute in Google Colab environments by mounting Google Drive. Notebooks locate shared data tables, precomputed embeddings, and model checkpoints by mounting the shared storage root:
+
+```python
+from google.colab import drive
+from pathlib import Path
+
+drive.mount('/content/drive')
+PROJECT_ROOT = Path('/content/drive/MyDrive/Colab Notebooks/BT4222 Shared Final Folder')
+```
+
+Relative paths inside the Drive folder directly parallel repository namespaces (`feature_engineering/` corresponds to `Preprocessing/`, `Experiments/` corresponds to `Experiments/`, and `Evaluation/` corresponds to `Cross Model Evaluation/`), ensuring modularity and reproducibility across execution environments.
