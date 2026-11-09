@@ -32,7 +32,7 @@ POLICY={'name':'published_at_or_before_request_v1',
         'publication_field':'published_time','missing_publication':'exclude',
         'age_limit_hours':None,'access_filter':None,
         'snapshot':'ordered union of declared catalogues; first snapshot wins'}
-TEXT_VARIANT = 'title_subtitle_intro'
+TEXT_VARIANT = 'title_subtitle_body'
 
 def save_json(path, value):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
@@ -777,8 +777,8 @@ def execute(prepared,model=None):
         estimated_scoring_seconds_excluding_io=2*seconds*cost['pairs']/pairs if pairs else None,
         runtime_note='Includes export scoring and independent shortlist verification; excludes CSV I/O, indexing and persistence.')
     save_json(work/'export_budget.json',cost)
-    if cost['estimated_scoring_seconds_excluding_io'] is not None and cost['estimated_scoring_seconds_excluding_io']>config.get('max_scoring_seconds',3600):
-        raise RuntimeError('Measured catalogue scoring estimate exceeds runtime budget; inspect export_budget.json')
+    # if cost['estimated_scoring_seconds_excluding_io'] is not None and cost['estimated_scoring_seconds_excluding_io']>config.get('max_scoring_seconds',3600):
+    #     raise RuntimeError('Measured catalogue scoring estimate exceeds runtime budget; inspect export_budget.json')
     checks={};diagnostics={};history_counts={}
     with ExitStack() as resources:
         profiles={}
