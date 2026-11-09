@@ -44,7 +44,7 @@ nDCG@100 is 0.3392; these are in-sample fit diagnostics. Rankings are saved unde
 
 The neural sequential ranker (`TargetAwareLSTMRanker` in `lstm_model.py`) models chronological reader consumption patterns and predicts candidate relevance through candidate-queried attention over user history states.
 
-![Target-Aware LSTM Architecture](../../figures/lstm_architecture.png)
+![Target-Aware LSTM Architecture](../../figures/final_lstm_architecture.svg)
 
 ### Multimodal Article Encoder (145-D to 128-D)
 The `ArticleEncoder` processes candidate articles and historical click items through parallel modality-specific projection layers:

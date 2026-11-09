@@ -148,7 +148,7 @@ BT4222-Final-Project/
 │   └── README.md                     # Reranking workflow documentation
 └── figures/                          # System architecture diagrams and visualisations
     ├── system_architecture.png       # Two-stage system architecture flow diagram (final submission model)
-    ├── lstm_architecture.png         # Target-Aware LSTM architecture schematic
+    ├── final_lstm_architecture.svg   # Target-Aware LSTM architecture schematic
     ├── huim_architecture.png         # DIN / HUIM architecture schematic
     ├── neural_architecture_diagrams.html # Interactive high-DPI canvas viewer
     ├── lstm_gate_dynamics.png        # Unrolled LSTM gate correlation plots
